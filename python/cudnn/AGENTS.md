@@ -941,6 +941,18 @@ proof covers every slot load. Numeric/racecheck success alone is not that proof.
 `test_moe_block_scale_mailbox_acknowledgements_order_prior_reads` in the existing
 `gemm/frost/test_template_epilogue_parity.py` pins this until such a proof exists.
 
+A TMA-store epilogue must not reuse an smem output buffer while a bulk store may
+still be reading it. After each `PipelineTmaStore.producer_commit()`, call
+`producer_acquire()` (`cp.async.bulk.wait_group.read num_stages - 1`) in the
+issuing thread, before the barrier that lets the epilogue warps write the next
+subtile. Another pipeline's acquire, such as the C store's, can mask a missing one,
+so check every compile-time configuration that drops that other store. Without
+the acquire, the block-scaled GLU kernels' D store silently corrupted D codes on SM107
+with `generate_c=False` (#2350). The race is intermittent on hardware, but the
+missing wait is deterministic in the PTX (`CUTE_DSL_KEEP=ptx`): every epilogue
+`cp.async.bulk.commit_group` must reach the next `bar.sync` through a
+`cp.async.bulk.wait_group.read`.
+
 Small-M block-scale planning uses `GemmFacts.shapes_fixed` to distinguish fixed
 graphs from override-enabled graphs. Only fixed shapes select token widths
 8/16/32 after swapAB; overrides keep width 64 and at most 48 weight tiles.
