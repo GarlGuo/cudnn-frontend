@@ -183,17 +183,6 @@ def _spin_while_layout_unset(ptr, deadline_ns: Int64) -> Int32:
     return Int32(value)
 
 
-def _ld_relaxed_gpu_i32(ptr) -> Int32:
-    """Relaxed gpu-scope load: L1 is bypassed, which is what it takes to see peers' writes."""
-    return cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
-
-
-def _st_relaxed_gpu_i32(ptr, value: Int32) -> None:
-    """Relaxed gpu-scope store, paired with the release on ``assigned_claim_count`` that
-    publishes it."""
-    cute.arch.store(ptr.llvm_ptr, value, sem="relaxed", scope="gpu")
-
-
 class MoEInputBlockSignalSchedulerParams:
     """Parameters for MoE tile scheduler, used on host (grid shape) and on device: expert_shape is
     (expert_cnt, intermediate, hidden), a GEMM (M=tokens_i, N=intermediate, K=hidden) per expert."""
@@ -455,13 +444,15 @@ class MoEStreamingInputBlockSignalTileScheduler:
     def _set_expert_consecutive_m_batch_record(self, m_tile_order: Int32, record: Tuple[Int32, Int32, Int32, Int32]) -> None:
         """Store ``record`` (first claim number, first M-tile's slot, M-tile count, expert end slot)."""
         record_ptr = self._expert_consecutive_m_batch_record_ptr(m_tile_order)
+        # Scheduler state is read and written at gpu scope (relaxed: L1 bypassed, so other SMs' writes are seen);
+        # the release on ``assigned_claim_count`` publishes these stores.
         for word, value in enumerate(record):
-            _st_relaxed_gpu_i32(record_ptr + word, value)
+            cute.arch.store((record_ptr + word).llvm_ptr, value, sem="relaxed", scope="gpu")
 
     def _get_expert_consecutive_m_batch_record(self, m_tile_order: Int32) -> Tuple[Int32, Int32, Int32, Int32]:
         """The record (first claim number, first M-tile's slot, M-tile count, expert end slot) at ``m_tile_order``."""
         record_ptr = self._expert_consecutive_m_batch_record_ptr(m_tile_order)
-        return tuple(_ld_relaxed_gpu_i32(record_ptr + word) for word in range(4))  # the record's 4 words
+        return tuple(cute.arch.load((record_ptr + word).llvm_ptr, Int32, sem="relaxed", scope="gpu") for word in range(4))
 
     @cute.jit
     def _expert_first_slot(self, expert: Int32) -> Int32:
@@ -504,9 +495,10 @@ class MoEStreamingInputBlockSignalTileScheduler:
         if expert < const_expr(self.params.expert_cnt):
             slots_per_m_tile = const_expr(self.slots_per_m_tile)
             expert_end_slot = self.expert_freq_offsets[expert] // const_expr(self.slot_rows)
-            first_unassigned_slot = self._expert_first_slot(expert) + slots_per_m_tile * _ld_relaxed_gpu_i32(
-                self._state_ptr("expert_assigned_m_tiles") + expert
-            )
+            expert_first_slot = self._expert_first_slot(expert)
+            assigned_m_tiles_ptr = self._state_ptr("expert_assigned_m_tiles") + expert
+            assigned_m_tiles = cute.arch.load(assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+            first_unassigned_slot = expert_first_slot + slots_per_m_tile * assigned_m_tiles
             signal = signal_ptr(self._dynamic_state.counter_ptr)
             # Every candidate slot's flag in one round of independent loads, off the batch opener's critical path; a
             # slot past the expert's end reads its last slot instead, in bounds and ignored.
@@ -514,7 +506,12 @@ class MoEStreamingInputBlockSignalTileScheduler:
             flags = None
             if const_expr(self.hoist_slot_flags):
                 flags = [
-                    [_ld_relaxed_gpu_i32(signal + cutlass.min(first_unassigned_slot + j * slots_per_m_tile + k, last_slot)) for k in range(slots_per_m_tile)]
+                    [
+                        cute.arch.load(
+                            (signal + cutlass.min(first_unassigned_slot + j * slots_per_m_tile + k, last_slot)).llvm_ptr, Int32, sem="relaxed", scope="gpu"
+                        )
+                        for k in range(slots_per_m_tile)
+                    ]
                     for j in range(EXPERT_BATCH_MAX_M_TILES)
                 ]
             for j in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
@@ -525,7 +522,10 @@ class MoEStreamingInputBlockSignalTileScheduler:
                     for k in cutlass.range_constexpr(slots_per_m_tile):
                         # Slot 0 is the expert's, by the test above; a tail M-tile has fewer slots.
                         if const_expr(k == 0) or m_tile_slot + k < expert_end_slot:
-                            flag = flags[j][k] if const_expr(self.hoist_slot_flags) else _ld_relaxed_gpu_i32(signal + (m_tile_slot + k))
+                            if const_expr(self.hoist_slot_flags):
+                                flag = flags[j][k]
+                            else:
+                                flag = cute.arch.load((signal + (m_tile_slot + k)).llvm_ptr, Int32, sem="relaxed", scope="gpu")
                             if flag < 0:
                                 m_tile_ready = Boolean(False)
                     if m_tile_ready:
@@ -555,12 +555,13 @@ class MoEStreamingInputBlockSignalTileScheduler:
                 ready_m_tile_count = self._expert_ready_m_tiles(expert_of_lane)
                 score = ready_m_tile_count
                 if ready_m_tile_count > 0:
-                    last_batch = _ld_relaxed_gpu_i32(expert_last_batch_ptr + expert_of_lane)
+                    last_batch = cute.arch.load((expert_last_batch_ptr + expert_of_lane).llvm_ptr, Int32, sem="relaxed", scope="gpu")
                     # Only a run that ends the expert or fills the batch cap: a shorter one (its rows still arriving)
                     # would open a small batch and cannot spare the expert another pass over its weights.
-                    run_end_slot = self._expert_first_slot(expert_of_lane) + const_expr(self.slots_per_m_tile) * (
-                        _ld_relaxed_gpu_i32(self._state_ptr("expert_assigned_m_tiles") + expert_of_lane) + ready_m_tile_count
-                    )
+                    expert_first_slot = self._expert_first_slot(expert_of_lane)
+                    assigned_m_tiles_ptr = self._state_ptr("expert_assigned_m_tiles") + expert_of_lane
+                    assigned_m_tiles = cute.arch.load(assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+                    run_end_slot = expert_first_slot + const_expr(self.slots_per_m_tile) * (assigned_m_tiles + ready_m_tile_count)
                     run_is_whole = ready_m_tile_count == const_expr(EXPERT_BATCH_MAX_M_TILES) or (
                         run_end_slot >= self.expert_freq_offsets[expert_of_lane] // const_expr(self.slot_rows)
                     )
@@ -585,12 +586,12 @@ class MoEStreamingInputBlockSignalTileScheduler:
 
         with cute.arch.elect_one():
             expert_assigned_m_tiles_ptr = self._state_ptr("expert_assigned_m_tiles") + expert
-            already_assigned_m_tiles = _ld_relaxed_gpu_i32(expert_assigned_m_tiles_ptr)
+            already_assigned_m_tiles = cute.arch.load(expert_assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
             first_slot = self._expert_first_slot(expert) + already_assigned_m_tiles * const_expr(self.slots_per_m_tile)
             expert_end_slot = self.expert_freq_offsets[expert] // const_expr(self.slot_rows)
-            _st_relaxed_gpu_i32(expert_assigned_m_tiles_ptr, already_assigned_m_tiles + m_tile_count)
+            cute.arch.store(expert_assigned_m_tiles_ptr.llvm_ptr, already_assigned_m_tiles + m_tile_count, sem="relaxed", scope="gpu")
             record_m_tile_count, record_last = m_tile_count, expert_end_slot
-            _st_relaxed_gpu_i32(expert_last_batch_ptr + expert, claim_number + 1)
+            cute.arch.store((expert_last_batch_ptr + expert).llvm_ptr, claim_number + 1, sem="relaxed", scope="gpu")
             if const_expr(self.fused_tail_max_rows > 0):
                 # Fused only when the batch's M-tiles reach the expert's end: its tail's rows are ready now.
                 if self._batch_fuses_tail(self._expert_first_slot(expert), expert_end_slot, already_assigned_m_tiles, m_tile_count):
