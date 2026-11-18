@@ -78,7 +78,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         Needs ``use_dynamic_sched``.
     :param device_layout: With ``streaming_signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
         and the scheduler waits for them. ``padded_offsets`` must then be ``layout[1:E+1]`` of an ``E + 1`` int32
-        buffer that the caller sets to ``INT32_MAX`` before the producer starts (``layout[0]`` is read too).
+        buffer that the caller sets to -1 before the producer starts (``layout[0]`` is read too).
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
         for that grid before it exits.
     :param launch_dependents_at_slots_ready: With ``streaming_signal_capacity``: one extra warp per CTA lets this kernel's

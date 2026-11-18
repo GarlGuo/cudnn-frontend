@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """MoE 2Dx3D grouped GEMM scheduler fed by nccl-ep dispatch (``signal[t]`` = -1 until row slot ``t`` is complete):
-ready M-tiles run in expert-consecutive batches; ``device_layout`` waits (gpu-scope acquire, traps on timeout) on it."""
+ready M-tiles run in expert-consecutive batches; ``device_layout`` first waits (gpu-scope acquire) for the expert offsets."""
 
 from typing import List, Tuple
 import cutlass
@@ -10,7 +10,6 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,
-    Int64,
     T,
     extract_mlir_values,
     new_from_mlir_values,
@@ -148,39 +147,6 @@ def wait_count_reached(count, target: Int32) -> None:
 
 #: A claim number that carries no work unit (a fused batch's last ones); the claimer takes another.
 NO_WORK_SLOT = -1
-#: Every layout word the caller resets before a device-layout dispatch holds this until the dispatch writes it.
-LAYOUT_UNSET = 0x7FFFFFFF
-#: The layout wait traps once it has waited this long (%globaltimer ns): far past a dispatch, host skew or a peer's JIT.
-LAYOUT_WAIT_TIMEOUT_NS = 30_000_000_000
-
-
-@cute.jit
-def _spin_while_layout_unset(ptr, deadline_ns: Int64) -> Int32:
-    """Block while ``*ptr == LAYOUT_UNSET`` (gpu-scope acquire loads: L2, then this SM's L1 invalidated) and return the
-    value; trap once %globaltimer passes ``deadline_ns``. One opaque ``asm``, as ``_spin_until_at_least``."""
-    address = llvm.ptrtoint(T.i64(), ptr.llvm_ptr)
-    value = llvm.inline_asm(
-        res=T.i32(),
-        operands_=[address, Int32(LAYOUT_UNSET).ir_value(), Int64(deadline_ns).ir_value()],
-        asm_string="""{{
-            .reg .pred P_ls;
-            .reg .u64 T_ls;
-        LAYOUT_${:uid}:
-            ld.acquire.gpu.global.b32 $0, [$1];
-            setp.ne.s32 P_ls, $0, $2;
-            @P_ls bra LAYOUT_DONE_${:uid};
-            mov.u64 T_ls, %globaltimer;
-            setp.gt.u64 P_ls, T_ls, $3;
-            @P_ls trap;
-            bra LAYOUT_${:uid};
-        LAYOUT_DONE_${:uid}:
-        }}""",
-        constraints="=&r,l,r,l",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return Int32(value)
 
 
 class MoEInputBlockSignalSchedulerParams:
@@ -410,16 +376,15 @@ class MoEStreamingInputBlockSignalTileScheduler:
 
     @cute.jit
     def _wait_for_dispatch_layout(self) -> None:
-        """Each lane waits for its layout_words[0:E+1] (word w on lane w % 32) to leave ``LAYOUT_UNSET``, in every CTA
+        """Each lane waits for its layout_words[0:E+1] (word w on lane w % 32) to leave the reset value -1, in every CTA
         (each SM drops stale L1); extra lanes re-wait the last word (a branch makes ptxas emulate warp collectives)."""
         lane_idx = cute.arch.lane_idx()
-        deadline_ns = cute.arch.globaltimer() + Int64(LAYOUT_WAIT_TIMEOUT_NS)
         word_count = const_expr(self.params.expert_cnt + 1)
         # layout_words[0] (expert 0's offset) sits one word before expert_freq_offsets = layout_words[1:E+1].
         layout_words = self.expert_freq_offsets.iterator + (-1)
         for j in cutlass.range_constexpr(ceil_div(word_count, cute.arch.WARP_SIZE)):
             word = cutlass.min(lane_idx + j * cute.arch.WARP_SIZE, word_count - 1)
-            _spin_while_layout_unset(layout_words + word, deadline_ns)
+            _spin_until_at_least(layout_words + word, 0)
         cute.arch.sync_warp()
 
     def _state_ptr(self, piece: cutlass.Constexpr):

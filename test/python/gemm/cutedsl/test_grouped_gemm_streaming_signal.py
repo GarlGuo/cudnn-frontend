@@ -62,7 +62,7 @@ def make_problem(tokens_per_expert, n, k, seed=0):
     offsets = layout[1:]
     alpha = torch.rand(EXPERTS, generator=generator, device="cuda") + 0.5
     prob = torch.rand(rows, 1, 1, generator=generator, device="cuda")
-    return {"a": a, "b": b, "offsets": offsets, "alpha": alpha, "prob": prob, "rows": rows, "n": n, "k": k}
+    return {"a": a, "b": b, "layout": layout, "offsets": offsets, "alpha": alpha, "prob": prob, "rows": rows, "n": n, "k": k}
 
 
 def as_mkl(x):
@@ -230,6 +230,56 @@ def test_signal_consumer_waits_for_producer():
             rows_of_tile = slice(tile * ROWS_ALIGNMENT, (tile + 1) * ROWS_ALIGNMENT)
             problem["a"][rows_of_tile].copy_(final_a[rows_of_tile])
             holder["signal"][tile].fill_(tile)
+    launch()
+    torch.cuda.synchronize()
+    valid = valid_rows(problem)
+    assert torch.equal(c[:valid], stock_c[:valid])
+    assert torch.equal(d[:valid], stock_d[:valid])
+
+
+@pytest.mark.parametrize("glu", [False, True], ids=["plain", "glu"])
+def test_device_layout_waits_for_producer(glu):
+    """The GEMM starts while the layout reads -1, every slot reads not-ready and A holds NaN; a later kernel on
+    another stream writes the layout, then A one M tile at a time with its slot.  The GLU also triggers at slots ready."""
+    require_sm100()
+    n = 2 * FFN if glu else FFN
+    problem = make_problem([700, 300, 256, 513], n, HIDDEN, seed=11)
+    capacity = problem["rows"] // ROWS_ALIGNMENT
+    final_a, final_layout = problem["a"].clone(), problem["layout"].clone()
+    options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity, device_layout=True)
+    if glu:
+        options["launch_dependents_at_slots_ready"] = True
+    kernel = make_kernel(glu, **options)
+    stock_c, stock_d, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
+    torch.cuda.synchronize()
+
+    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_signal_workspace, streaming_signal_workspace_offsets
+
+    gemm_stream, producer_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    c, d, workspace, launch = run(kernel, problem, glu, max_active_clusters=4, stream=gemm_stream, defer_launch=True)
+    # One launch with the layout written and every slot ready loads the module (lazy loading waits for running work).
+    with torch.cuda.stream(gemm_stream):
+        reset_signal_workspace(workspace, kernel, all_complete=True)
+    launch()
+    torch.cuda.synchronize()
+    signal_word = streaming_signal_workspace_offsets(kernel)["signal"] // 4
+    signal = workspace.view(torch.int32)[signal_word : signal_word + capacity]
+    c.fill_(float("nan"))
+    d.fill_(float("nan"))
+    problem["a"].fill_(float("nan"))
+    problem["layout"].fill_(-1)
+    gemm_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(gemm_stream):
+        reset_signal_workspace(workspace, kernel)
+    producer_stream.wait_stream(gemm_stream)
+    # Producer launches go before the GEMM's; the sleep makes the GEMM wait on the layout first.
+    with torch.cuda.stream(producer_stream):
+        torch.cuda._sleep(50_000_000)
+        problem["layout"].copy_(final_layout)
+        for tile in range(capacity):
+            rows_of_tile = slice(tile * ROWS_ALIGNMENT, (tile + 1) * ROWS_ALIGNMENT)
+            problem["a"][rows_of_tile].copy_(final_a[rows_of_tile])
+            signal[tile].fill_(tile)
     launch()
     torch.cuda.synchronize()
     valid = valid_rows(problem)
