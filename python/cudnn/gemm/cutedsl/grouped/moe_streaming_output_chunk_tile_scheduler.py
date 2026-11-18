@@ -349,7 +349,7 @@ class OutputStoreNotifier:
             # The bulk-store issuer need not be lane 0: order every lane's completed stores before lane 0's add.
             cute.arch.sync_warp()
             lane_idx = cute.arch.lane_idx()
-            # An incomplete chunk's word is -1 - (tiles counted): never the ``n_chunk`` nccl-ep waits for.
+            # An incomplete chunk's word is -1 - (tiles counted): never the ``n_chunk`` the consumer waits for.
             signal_before = Int32(0)
             if lane_idx == 0:
                 signal_before = cute.arch.atomic_add(self.n_chunk_signal_ptr + n_chunk, -pending_tile_count, sem="acq_rel", scope="gpu")

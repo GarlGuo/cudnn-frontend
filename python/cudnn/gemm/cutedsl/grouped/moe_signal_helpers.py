@@ -8,7 +8,7 @@ from typing import Dict
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Boolean, Int32, const_expr, dsl_user_op
+from cutlass.cutlass_dsl import Boolean, Int32, dsl_user_op
 from cutlass.cute.typing import AddressSpace
 from cutlass._mlir.dialects import llvm, nvvm
 
@@ -59,26 +59,20 @@ def mbarrier_try_wait_parity_acquire_cluster(mbar_ptr, phase: Int32, *, loc=None
     )
 
 
-# ---- The signal workspace byte map: nccl-ep's producer and this consumer's contract ----
+# ---- The signal workspace byte map: the producer's and this consumer's contract ----
 
 
-def _ceil_div(x: int, y: int) -> int:
-    return -(-x // y)
-
-
-def streaming_scheduler_state_offset(streaming_signal_capacity):
+def streaming_scheduler_state_offset(streaming_signal_capacity: int) -> int:
     """Bytes from the claim counter to the scheduler state: past ``signal[]``, rounded up to 128 so the producer-written
-    flags and the scheduler's own words share no 128-byte line.  An int capacity folds; an Int32 is the launch's."""
-    if isinstance(streaming_signal_capacity, int):
-        return const_expr(_ceil_div(SIGNAL_OFFSET + 4 * streaming_signal_capacity, 128) * 128)
-    return (SIGNAL_OFFSET + 4 * streaming_signal_capacity + 127) & -128
+    flags and the scheduler's own words share no 128-byte line."""
+    return -(-(SIGNAL_OFFSET + 4 * streaming_signal_capacity) // 128) * 128
 
 
 def streaming_signal_workspace_offsets(kernel) -> Dict[str, int]:
     """Byte offsets ``counter``/``signal``/``state`` plus ``streaming_signal_capacity`` and ``total_bytes``,
     for one signal-scheduler kernel INSTANCE."""
     desc_workspace_bytes = kernel.get_desc_workspace_bytes()
-    capacity = const_expr(kernel.streaming_signal_capacity)
+    capacity = kernel.streaming_signal_capacity
     # The state must hold a word per expert, assigned_claim_count and a 4-word record per M-tile: a kernel that sized
     # it otherwise overruns the workspace, and the scheduler hangs or faults.
     state_bytes = kernel.get_workspace_bytes() - (desc_workspace_bytes + streaming_scheduler_state_offset(capacity))
@@ -95,14 +89,6 @@ def streaming_signal_workspace_offsets(kernel) -> Dict[str, int]:
         "streaming_signal_capacity": capacity,
         "total_bytes": kernel.get_workspace_bytes(),
     }
-
-
-def signal_launch_kwargs(kernel) -> Dict[str, Int32]:
-    """``kernel``'s keyword arguments at compile and at every launch: ``streaming_signal_capacity`` for a signal consumer that
-    takes it at launch (SIGNAL_CAPACITY_AT_LAUNCH), else none."""
-    if getattr(kernel, "SIGNAL_CAPACITY_AT_LAUNCH", False) and kernel.use_streaming_signal_sched:
-        return {"streaming_signal_capacity": Int32(kernel.streaming_signal_capacity)}
-    return {}
 
 
 def reset_signal_workspace(workspace, kernel, all_complete: bool = False) -> None:
