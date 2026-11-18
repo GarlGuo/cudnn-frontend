@@ -14,7 +14,7 @@ from cutlass.cutlass_dsl import Int32, const_expr, dsl_user_op, extract_mlir_val
 from cutlass.cute.typing import AddressSpace
 from cutlass._mlir import ir
 
-from .moe_persistent_scheduler import MoEPersistentTileScheduler, MoEWorkTileInfo, atomic_add_i32, store_i32_to_peer_cluster_smem_async
+from .moe_persistent_scheduler import MoEPersistentTileScheduler, MoEWorkTileInfo, atomic_add_i32
 from .moe_tail_tiles import CLUSTER_TILE_M, cluster_m_tile_count, expert_m_units
 from .moe_utils import ceil_div, compute_expert_token_range
 
@@ -114,7 +114,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
                 # SM100/107: cluster (2,1) 2-CTA or (1,1) only; this exit has no cluster barrier (check_dynamic_sched_cluster_shape).
                 atomic_idx = Int32(2**31 - 1)  # past every tile: invalid, so the cluster exits
             if lane_idx < cluster_size:
-                store_i32_to_peer_cluster_smem_async(ds.broadcast_ptr, atomic_idx, full_barrier_ptr, lane_idx, loc=loc, ip=ip)
+                cute.arch.store_async_dsmem(ds.broadcast_ptr, atomic_idx, full_barrier_ptr, lane_idx, loc=loc, ip=ip)
             self._cluster_producer_commit(loc=loc, ip=ip)
         ds.producer_state.advance()
         self.cluster_pipeline.consumer_wait(ds.consumer_state)

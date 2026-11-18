@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Helpers for the dispatch-signal MoE scheduler.  Device side: inline-PTX fences and cluster
-mbarrier ops.  Host side: the workspace byte map and its reset."""
+"""Helpers for the streaming signal MoE schedulers.  Device side: cluster fences and mbarrier ops.
+Host side: the workspace byte map and its reset."""
 
 from typing import Dict
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cutlass_dsl import Boolean, Int32, T, const_expr, dsl_user_op
+from cutlass.cutlass_dsl import Boolean, Int32, const_expr, dsl_user_op
 from cutlass.cute.typing import AddressSpace
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
 
 #: Bytes from the claim counter to ``signal[]``.  ``streaming_signal_workspace_offsets`` is the host's
 #: view of the same map.
@@ -30,76 +30,33 @@ def signal_ptr(counter_ptr, *, loc=None, ip=None):
 
 
 @dsl_user_op
-def mbarrier_arrive_expect_tx_on_peer_relaxed_cluster(
-    mbar_ptr,
-    tx_count: Int32,
-    cta_rank_in_cluster: cutlass.Constexpr,
-    *,
-    loc=None,
-    ip=None,
-) -> None:
-    """Arrive+expect_tx on a peer CTA mbarrier, ``.relaxed.cluster``: without it the opcode is
-    ``.release.cta``, since ``.shared::cluster`` names the state space, not the scope."""
-    mbar_addr = llvm.ptrtoint(T.i32(), mbar_ptr.llvm_ptr)
-    llvm.inline_asm(
-        res=None,
-        operands_=[
-            mbar_addr,
-            Int32(cta_rank_in_cluster).ir_value(),
-            tx_count.ir_value(),
-        ],
-        asm_string="""{{
-            .reg .u32 remote_mbar;
-            mapa.shared::cluster.u32 remote_mbar, $0, $1;
-            mbarrier.arrive.expect_tx.relaxed.cluster.shared::cluster.b64 _, [remote_mbar], $2;
-        }}""",
-        constraints="r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
+def mbarrier_arrive_expect_tx_on_peer_relaxed_cluster(mbar_ptr, tx_count: Int32, cta_rank_in_cluster: cutlass.Constexpr, *, loc=None, ip=None) -> None:
+    """Arrive + expect_tx on a peer CTA's mbarrier, ``.relaxed.cluster`` (the default would be ``.release.cta``)."""
+    cute.arch.mbarrier_arrive_and_expect_tx(
+        mbar_ptr, tx_count, peer_cta_rank_in_cluster=cta_rank_in_cluster, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER, loc=loc, ip=ip
     )
 
 
 @dsl_user_op
 def fence_release_cluster(*, loc=None, ip=None) -> None:
-    """``fence.release.cluster`` via inline PTX; ``cute.arch`` exposes only ``acq_rel``, whose
-    acquire half is a dead ``CCTL.IVALL``.  Assembles at PTX ISA 8.6+; ISA Table 20 omits it."""
-    llvm.inline_asm(
-        res=None,
-        operands_=[],
-        asm_string="fence.release.cluster;",
-        constraints="",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
+    """``fence.release.cluster``: orders this CTA's earlier stores before a peer observes the next arrive."""
+    llvm.fence(llvm.AtomicOrdering.release, syncscope="cluster", loc=loc, ip=ip)
 
 
 @dsl_user_op
 def mbarrier_try_wait_parity_acquire_cluster(mbar_ptr, phase: Int32, *, loc=None, ip=None) -> Boolean:
-    """``mbarrier.try_wait.parity.acquire.cluster`` via inline PTX: the DSL has no sem/scope knob
-    and its default ``.acquire.cta`` is not morally strong with a peer's arrive, fence or not."""
-    mbar_addr = llvm.ptrtoint(T.i32(), mbar_ptr.llvm_ptr)
-    wait_result = llvm.inline_asm(
-        res=T.i32(),
-        operands_=[mbar_addr, Int32(phase).ir_value()],
-        asm_string="""{{
-            .reg .pred P_ht;
-            mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 P_ht, [$1], $2;
-            selp.b32 $0, 1, 0, P_ht;
-        }}""",
-        constraints="=r,r,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
+    """``mbarrier.try_wait.parity.acquire.cluster``: the default ``.acquire.cta`` does not synchronize with a peer's arrive."""
+    return Boolean(
+        nvvm.mbarrier_wait_parity(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            nvvm.MBarrierWaitKind.TRY,
+            scope=nvvm.MemScopeKind.CLUSTER,
+            order=nvvm.MemOrderKind.ACQUIRE,
+            loc=loc,
+            ip=ip,
+        )
     )
-    return Int32(wait_result) != Int32(0)
 
 
 # ---- The signal workspace byte map: nccl-ep's producer and this consumer's contract ----

@@ -10,14 +10,12 @@ import cutlass.cute as cute
 from cutlass.cutlass_dsl import (
     Boolean,
     Int32,
-    T,
     extract_mlir_values,
     new_from_mlir_values,
     const_expr,
 )
 from cutlass.cute.typing import AddressSpace
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineUserType, make_pipeline_state
 from .moe_signal_helpers import (
@@ -31,7 +29,6 @@ from .moe_utils import ceil_div
 from .moe_tail_tiles import FUSED_UNIT, cluster_m_tile_count, fused_tail_chunks, fused_tail_first_row, fused_tail_rows
 from .moe_persistent_scheduler import (
     atomic_add_i32,
-    store_i32_to_peer_cluster_smem_async,
     MoEWorkTileInfo,
     _DynamicSchedState,
 )
@@ -81,48 +78,21 @@ def signal_workspace_bytes_after_counter(streaming_signal_capacity: int, expert_
 
 @cute.jit
 def _spin_until_at_least(ptr, floor: Int32) -> Int32:
-    """Block, without bound, until ``*ptr >= floor`` and return it, acquiring the writer's earlier
-    stores.  One opaque ``asm``: an IR loop cost +34% instructions and +6 registers per thread."""
-    address = llvm.ptrtoint(T.i64(), ptr.llvm_ptr)
-    value = llvm.inline_asm(
-        res=T.i32(),
-        operands_=[address, Int32(floor).ir_value()],
-        asm_string="""{{
-            .reg .pred P_sp;
-        SPIN_${:uid}:
-            ld.acquire.gpu.global.b32 $0, [$1];
-            setp.lt.s32 P_sp, $0, $2;
-            @P_sp bra SPIN_${:uid};
-        }}""",
-        constraints="=&r,l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-    return Int32(value)
+    """Block, without bound, until ``*ptr >= floor`` and return it, acquiring the writer's earlier stores.
+    One load point in the loop: a load ahead of it would make the compiler duplicate the loop."""
+    value = Int32(floor - 1)
+    while value < floor:
+        value = cute.arch.load(ptr.llvm_ptr, Int32, sem="acquire", scope="gpu")
+    return value
 
 
 @cute.jit
 def _poll_until_at_least(ptr, floor: cutlass.Constexpr) -> None:
     """Block, without bound, until ``*ptr >= floor``.  Relaxed gpu-scope loads (no L1 invalidation per poll): the
     caller reads nothing the writer published, so it needs no acquire."""
-    address = llvm.ptrtoint(T.i64(), ptr.llvm_ptr)
-    llvm.inline_asm(
-        res=None,
-        operands_=[address, Int32(floor).ir_value()],
-        asm_string="""{
-            .reg .pred P_pl;
-            .reg .b32 V_pl;
-        POLL_${:uid}:
-            ld.relaxed.gpu.global.b32 V_pl, [$0];
-            setp.lt.s32 P_pl, V_pl, $1;
-            @P_pl bra POLL_${:uid};
-        }""",
-        constraints="l,r",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    value = Int32(floor - 1)
+    while value < floor:
+        value = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
 
 
 @cute.jit
@@ -652,7 +622,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
                 while work_slot == NO_WORK_SLOT:
                     work_slot = self._claim_work_slot(n_tiles_per_m_tile, lane_idx)
             if lane_idx < cluster_size:
-                store_i32_to_peer_cluster_smem_async(ds.broadcast_ptr, work_slot, full_barrier_ptr, lane_idx)
+                cute.arch.store_async_dsmem(ds.broadcast_ptr, work_slot, full_barrier_ptr, lane_idx)
             # Fan out one arrive per CTA to the full barrier.
             with cute.arch.elect_one():
                 fence_release_cluster()
