@@ -42,7 +42,7 @@ from typing import Tuple, Union
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.typing import Pointer
-from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
+from cutlass.cutlass_dsl import Int32, Int64, extract_mlir_values, new_from_mlir_values
 
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
@@ -56,6 +56,14 @@ from .moe_utils import (
     rewrite_tensor_shape,
 )
 from .moe_persistent_scheduler import MoEWorkTileInfo
+
+
+def offset_expert_rows(token_offset, gmem_tensor_in_moe_view):
+    """Offset ``gmem_tensor_in_moe_view`` (total_padded_M, N, L) along M to an expert's first row. Memory tensors take
+    a 64-bit offset, since token_offset * row stride can pass 2^31; TMA coordinate tensors keep Int32."""
+    if isinstance(gmem_tensor_in_moe_view.iterator, Pointer):
+        return cute.domain_offset((Int64(token_offset), 0, 0), gmem_tensor_in_moe_view)
+    return cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
 
 
 class MoESchedExtension(ABC):
@@ -165,7 +173,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
 
         if cutlass.const_expr(tensor_name == "a"):
             # A: (total_padded_M, K, 1) → offset M by token_offset, global desc
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 
@@ -188,7 +196,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
 
         elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "d_srelu", "prob", "dprob")):
             # C/D/D_col/prob: contiguous M, offset by token_offset, global desc
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 
@@ -196,7 +204,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
             # SFA/SFD: contiguous with tile_atom_to_shape_SF layout,
             # offset in GEMM-element units (NOT SF units),
             # because tile_atom_to_shape_SF layout's M stride is per-element.
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             per_expert_shape = (tokens_i, shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             stride = gmem_tensor_in_moe_view.stride
@@ -206,7 +214,7 @@ class DiscreteWeightScaledGemmSchedExtension(MoESchedExtension):
         elif cutlass.const_expr(tensor_name in ("sfd_col", "sfd_col_d_srelu")):
             # SFD Col with BlockScaledBasicChunk layout (non-atom):
             # domain_offset + rebuild with tile_to_shape using per-expert M
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             per_expert_shape = (tokens_i, shape[1], c1)
             sfd_col_layout = cute.tile_to_shape(
                 blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.MN).layout,
@@ -288,7 +296,7 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
         c1 = cutlass.Int32(1)
 
         if cutlass.const_expr(tensor_name == "a"):
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 
@@ -310,12 +318,12 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             return (real, None)
 
         elif cutlass.const_expr(tensor_name in ("c", "d", "d_col", "d_srelu", "prob", "dprob")):
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 
         elif cutlass.const_expr(tensor_name in ("sfa", "sfd")):
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             per_expert_shape = (tokens_i, shape[1], c1)
             sf_layout = tile_atom_to_shape_SF(per_expert_shape, self.sf_vec_size)
             stride = gmem_tensor_in_moe_view.stride
@@ -323,7 +331,7 @@ class ContiguousAndConsistentGroupedGemmSchedExtension(MoESchedExtension):
             return (real, None)
 
         elif cutlass.const_expr(tensor_name in ("sfd_col", "sfd_col_d_srelu")):
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             per_expert_shape = (tokens_i, shape[1], c1)
             sfd_col_layout = cute.tile_to_shape(
                 blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.MN).layout,
@@ -472,7 +480,7 @@ class DiscreteWeightGroupedGemmSchedExtension(MoESchedExtension):
         c1 = cutlass.Int32(1)
 
         if cutlass.const_expr(tensor_name == "a"):
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 
@@ -487,7 +495,7 @@ class DiscreteWeightGroupedGemmSchedExtension(MoESchedExtension):
             return (real, None)
 
         else:
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 
@@ -541,7 +549,7 @@ class ContiguousGroupedGemmSchedExtension(MoESchedExtension):
         c1 = cutlass.Int32(1)
 
         if cutlass.const_expr(tensor_name == "a"):
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 
@@ -556,7 +564,7 @@ class ContiguousGroupedGemmSchedExtension(MoESchedExtension):
             return (real, None)
 
         else:
-            real = cute.domain_offset((token_offset, 0, 0), gmem_tensor_in_moe_view)
+            real = offset_expert_rows(token_offset, gmem_tensor_in_moe_view)
             real = rewrite_tensor_shape(real, (tokens_i, shape[1], c1))
             return (real, None)
 

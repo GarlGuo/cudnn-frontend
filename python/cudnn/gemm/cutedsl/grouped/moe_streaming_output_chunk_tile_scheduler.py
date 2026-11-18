@@ -1,0 +1,373 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""FC2 GEMM || combine overlap: the N-chunk tile order, and the output notifier.  ``signal[n_chunk]``
+counts the chunk's finished CTA tiles as a negative number, and is ``n_chunk`` once the chunk is complete."""
+
+import copy
+from typing import Dict, List, Optional, Tuple
+
+import cuda.bindings.driver as cuda
+import cutlass
+import cutlass.cute as cute
+from cutlass.cutlass_dsl import Int32, const_expr, dsl_user_op, extract_mlir_values, new_from_mlir_values
+from cutlass.cute.typing import AddressSpace
+from cutlass._mlir import ir
+
+from .moe_persistent_scheduler import MoEPersistentTileScheduler, MoEWorkTileInfo, atomic_add_i32, store_i32_to_peer_cluster_smem_async
+from .moe_tail_tiles import CLUSTER_TILE_M, cluster_m_tile_count, expert_m_units
+from .moe_utils import ceil_div, compute_expert_token_range
+
+
+class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
+    """Runs a stock scheduler N chunk -> every M tile -> the chunk's N tiles so a chunk finishes early; odd chunks walk
+    M backward to reuse the A rows still in L2.  ``rows_aligned``: rows are cluster-tile multiples, else tail tiles."""
+
+    def __init__(
+        self,
+        stock: MoEPersistentTileScheduler,
+        n_chunk_size: int,
+        clusters_beside_combine: int,
+        total_expert_cnt: int,
+        rows_aligned: bool = True,
+        fused_tail_max_rows: int = 0,
+    ):
+        assert (
+            n_chunk_size > 0 and n_chunk_size % stock.cluster_tile_n == 0
+        ), f"N chunk {n_chunk_size} must be a positive multiple of N_TILE_SIZE {stock.cluster_tile_n}"
+        assert stock.use_dynamic_sched, "the extra clusters stop through the dynamic scheduler's claims"
+        self.__dict__.update(stock.__dict__)
+        self.n_chunk_size = n_chunk_size
+        self.clusters_beside_combine = clusters_beside_combine
+        # The stock ``expert_cnt`` is a kernel argument; this is the same count at trace time.
+        self.total_expert_cnt = total_expert_cnt
+        self.rows_aligned = rows_aligned
+        self.fused_tail_max_rows = fused_tail_max_rows
+        self.expert_freq_offsets = stock.offs
+        # The current expert's M-tile range.  The stock walk state, which counts tiles
+        # in the stock order, carries it across dynamic regions.
+        self.expert_m_tile_start = stock.expert_tile_start
+        self.expert_m_tile_end = stock.expert_tile_end
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        self.expert_tile_start, self.expert_tile_end = self.expert_m_tile_start, self.expert_m_tile_end
+        return super().__extract_mlir_values__()
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "MoEStreamingOutputChunkSignalTileScheduler":
+        return MoEStreamingOutputChunkSignalTileScheduler(
+            super().__new_from_mlir_values__(values),
+            self.n_chunk_size,
+            self.clusters_beside_combine,
+            self.total_expert_cnt,
+            self.rows_aligned,
+            self.fused_tail_max_rows,
+        )
+
+    @cute.jit
+    def _total_m_tiles(self) -> Int32:
+        """Cluster M tiles (M units with fused tails) over every expert.  Warp-collective."""
+        return cluster_m_tile_count(
+            self.expert_freq_offsets,
+            const_expr(self.total_expert_cnt),
+            const_expr(self.cluster_tile_m),
+            const_expr(self.rows_aligned),
+            const_expr(self.fused_tail_max_rows),
+        )
+
+    @cute.jit
+    def _expert_m_tiles(self, expert_idx: Int32) -> Int32:
+        """Cluster M tiles (M units with fused tails) of one expert."""
+        _, tokens_i = compute_expert_token_range(self.expert_freq_offsets, expert_idx)
+        if const_expr(self.cluster_tile_m == CLUSTER_TILE_M):
+            return expert_m_units(tokens_i, const_expr(self.fused_tail_max_rows))
+        return (tokens_i + (self.cluster_tile_m - 1)) // self.cluster_tile_m
+
+    @dsl_user_op
+    @cute.jit
+    def _fetch_next_cluster_idx(self, *, loc=None, ip=None) -> Int32:
+        """The stock fetch, but an extra cluster (rank >= ``clusters_beside_combine``) whose last claim is at or past
+        N chunk 0's last wave adds 0 and broadcasts an index past every tile; the leader decides for the cluster."""
+        ds = self._dynamic_state
+        broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
+        if ds.is_leader_cta:
+            self.cluster_pipeline.producer_acquire(ds.producer_state)
+            full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip)
+            lane_idx = cute.arch.lane_idx()
+            cluster_size = const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
+            # The grid is (cluster shape, clusters), so bidz is this cluster's rank among them.
+            _, _, cluster_rank = cute.arch.block_idx(loc=loc, ip=ip)
+            # N chunk 0's tiles, as ``_get_work_tile_for_linear_idx`` orders them: every M tile times its N tiles.
+            N_TILE_SIZE = const_expr(self.cluster_tile_n)
+            total_M_tiles = self._total_m_tiles()
+            first_n_chunk_tiles = total_M_tiles * cutlass.min(const_expr(self.n_chunk_size // N_TILE_SIZE), ceil_div(self.intermediate, N_TILE_SIZE))
+            # Never below 0: every cluster claims its first tile.
+            stop_at = cutlass.max(first_n_chunk_tiles - self.num_persistent_clusters, 0)
+            stop = Int32(0)
+            if cluster_rank >= const_expr(self.clusters_beside_combine):
+                if self._current_work_linear_idx >= stop_at:
+                    stop = Int32(1)
+            atomic_idx = Int32(0)
+            if lane_idx == 0:
+                atomic_idx = atomic_add_i32(ds.counter_ptr.llvm_ptr, 1 - stop, loc=loc, ip=ip)
+            atomic_idx = cute.arch.shuffle_sync(atomic_idx, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
+            if stop == 1:
+                # SM100/107: cluster (2,1) 2-CTA or (1,1) only; this exit has no cluster barrier (check_dynamic_sched_cluster_shape).
+                atomic_idx = Int32(2**31 - 1)  # past every tile: invalid, so the cluster exits
+            if lane_idx < cluster_size:
+                store_i32_to_peer_cluster_smem_async(ds.broadcast_ptr, atomic_idx, full_barrier_ptr, lane_idx, loc=loc, ip=ip)
+            self._cluster_producer_commit(loc=loc, ip=ip)
+        ds.producer_state.advance()
+        self.cluster_pipeline.consumer_wait(ds.consumer_state)
+        return broadcast_tensor[0]
+
+    @dsl_user_op
+    @cute.jit
+    def _get_work_tile_for_linear_idx(self, cluster_linear_idx: Int32, *, loc=None, ip=None) -> MoEWorkTileInfo:
+        """The work tile at an index of the N-chunk order; invalid (expert -1) past the last tile."""
+        N_TILE_SIZE = const_expr(self.cluster_tile_n)
+        last_expert_idx = const_expr(self.total_expert_cnt - 1)
+        N_tiles_per_M_tile = ceil_div(self.intermediate, N_TILE_SIZE)
+        total_M_tiles = self._total_m_tiles()
+        work_tile_info = MoEWorkTileInfo(expert_idx=Int32(-1), tile_m_idx=Int32(0), tile_n_idx=Int32(0), k_tile_cnt=Int32(0))
+        if cluster_linear_idx < total_M_tiles * N_tiles_per_M_tile:
+            # Every M-tile runs the N-tiles of one N chunk before the next chunk starts; the last
+            # chunk can be partial.
+            N_tiles_per_N_chunk = const_expr(self.n_chunk_size // N_TILE_SIZE)
+            N_chunk_idx = cluster_linear_idx // (total_M_tiles * N_tiles_per_N_chunk)
+            idx_in_N_chunk = cluster_linear_idx - N_chunk_idx * (total_M_tiles * N_tiles_per_N_chunk)
+            N_tiles_in_N_chunk = cutlass.min(N_tiles_per_N_chunk, N_tiles_per_M_tile - N_chunk_idx * N_tiles_per_N_chunk)
+            M_tile_idx = idx_in_N_chunk // N_tiles_in_N_chunk
+            N_tile_idx = N_chunk_idx * N_tiles_per_N_chunk + idx_in_N_chunk - M_tile_idx * N_tiles_in_N_chunk
+            if N_chunk_idx % 2 == 1:
+                M_tile_idx = total_M_tiles - 1 - M_tile_idx
+            # Walk the expert range to M_tile_idx, back or forward.
+            if self.expert_m_tile_end == 0:
+                self.current_expert_idx = Int32(0)
+                self.expert_m_tile_start = Int32(0)
+                self.expert_m_tile_end = self._expert_m_tiles(Int32(0))
+            while M_tile_idx < self.expert_m_tile_start and self.current_expert_idx > 0:
+                self.current_expert_idx = self.current_expert_idx - 1
+                self.expert_m_tile_end = self.expert_m_tile_start
+                self.expert_m_tile_start = self.expert_m_tile_start - self._expert_m_tiles(self.current_expert_idx)
+            while M_tile_idx >= self.expert_m_tile_end and self.current_expert_idx < last_expert_idx:
+                self.current_expert_idx = self.current_expert_idx + 1
+                self.expert_m_tile_start = self.expert_m_tile_end
+                self.expert_m_tile_end = self.expert_m_tile_end + self._expert_m_tiles(self.current_expert_idx)
+            work_tile_info = MoEWorkTileInfo(
+                expert_idx=self.current_expert_idx,
+                tile_m_idx=(M_tile_idx - self.expert_m_tile_start) * const_expr(self.cluster_shape_mn[0]) + self.cta_id_in_cluster[0],
+                tile_n_idx=N_tile_idx * const_expr(self.cluster_shape_mn[1]) + self.cta_id_in_cluster[1],
+                k_tile_cnt=self._compute_k_tile_cnt(self.current_expert_idx, loc=loc, ip=ip),
+            )
+        return work_tile_info
+
+
+#: Threads of the one-block reset of ``signal[]``.
+RESET_BLOCK_THREADS = 256
+
+
+class OutputNotifyMode:
+    NONE = 0
+    N_CHUNK = 1
+
+
+def output_notify_capacity(n_chunk_size: int, output_cols: int) -> int:
+    """The ``n_chunk_capacity`` for ``output_cols`` D columns: the N chunks that cover them."""
+    return -(-output_cols // n_chunk_size)  # host-side: moe_utils.ceil_div is @cute.jit
+
+
+class _NotifyState:
+    """The N chunk the D-store warp is in, and its tiles of that chunk not yet counted in ``signal[]``.
+    Empty when notification is off."""
+
+    def __init__(self, current_n_chunk: Optional[Int32] = None, pending_tile_count: Optional[Int32] = None):
+        self.current_n_chunk, self.pending_tile_count = current_n_chunk, pending_tile_count
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        if self.current_n_chunk is None:
+            return []
+        return extract_mlir_values(self.current_n_chunk) + extract_mlir_values(self.pending_tile_count)
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "_NotifyState":
+        if self.current_n_chunk is None:
+            return _NotifyState()
+        return _NotifyState(new_from_mlir_values(self.current_n_chunk, values[:1]), new_from_mlir_values(self.pending_tile_count, values[1:]))
+
+
+class OutputNotifyConfig:
+    """Trace-time notification settings; the default notifies nothing and costs nothing.  ``caller_reset``: the
+    caller runs ``reset`` ahead of each GEMM.  N_CHUNK: grid clusters from ``clusters_beside_combine`` on are extras."""
+
+    def __init__(
+        self, mode: int = OutputNotifyMode.NONE, n_chunk_size: int = 0, n_chunk_capacity: int = 0, caller_reset: bool = False, clusters_beside_combine: int = 0
+    ):
+        assert mode == OutputNotifyMode.NONE or clusters_beside_combine >= 1, f"N_CHUNK needs clusters_beside_combine >= 1, got {clusters_beside_combine}"
+        assert mode == OutputNotifyMode.NONE or n_chunk_size > 0, f"N_CHUNK needs n_chunk_size > 0, got {n_chunk_size}"
+        self.mode, self.n_chunk_size, self.n_chunk_capacity = mode, n_chunk_size, n_chunk_capacity
+        self.caller_reset = caller_reset
+        self.clusters_beside_combine = clusters_beside_combine
+        self.enabled = mode != OutputNotifyMode.NONE
+        # ``signal[n_chunk_capacity]``, int32, at the end of the kernel's workspace.
+        self.workspace_bytes = 4 * n_chunk_capacity if self.enabled else 0
+
+    def bind(
+        self, cta_tile_mn: Tuple[int, int], expert_cnt: int, use_signal_sched: bool, tail_rows_alignment: Optional[int] = None, fused_tail_max_rows: int = 0
+    ) -> "OutputNotifyConfig":
+        """A copy tied to one kernel's CTA tile and expert count; ``tail_rows_alignment``: expert row alignment when
+        below the 2-CTA tile M (last M tile may be a tail); ``fused_tail_max_rows``: count M units."""
+        assert not (use_signal_sched and self.enabled), "output notification is an FC2 feature; the signal scheduler is FC1's"
+        assert not self.enabled or self.n_chunk_size % cta_tile_mn[1] == 0, f"N chunk {self.n_chunk_size} must be a multiple of CTA tile N {cta_tile_mn[1]}"
+        bound = copy.copy(self)
+        bound.cta_tile_m, bound.cta_tile_n = cta_tile_mn
+        bound.expert_cnt = expert_cnt
+        bound.rows_aligned = tail_rows_alignment is None or tail_rows_alignment >= CLUSTER_TILE_M
+        bound.fused_tail_max_rows = fused_tail_max_rows
+        return bound
+
+    def check_output_cols(self, output_cols) -> None:
+        """Host side, before launch: ``signal[]`` must hold every N chunk of the GEMM's ``output_cols`` D columns, else
+        the notifier writes past it; N must be build-time to check."""
+        if self.enabled:
+            assert isinstance(output_cols, int), f"N_CHUNK needs a build-time N (dense B), not {output_cols}"
+            required_capacity = output_notify_capacity(self.n_chunk_size, output_cols)
+            assert self.n_chunk_capacity >= required_capacity, (
+                f"n_chunk_capacity {self.n_chunk_capacity} < {required_capacity} N chunks of {self.n_chunk_size} in "
+                f"N = {output_cols}: size it with output_notify_capacity"
+            )
+
+    def tile_order(self, scheduler):
+        """The scheduler the kernel runs: the stock one as created when off, else in N-chunk order."""
+        if not self.enabled:
+            return scheduler
+        return MoEStreamingOutputChunkSignalTileScheduler(
+            scheduler, self.n_chunk_size, self.clusters_beside_combine, self.expert_cnt, self.rows_aligned, self.fused_tail_max_rows
+        )
+
+    def _n_chunk_signal_ptr(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: int) -> cute.Pointer:
+        """``signal[]``, which ends the kernel's workspace."""
+        byte_offset = kernel_workspace_bytes - self.workspace_bytes
+        return cute.make_ptr(Int32, workspace_ptr.toint() + byte_offset, AddressSpace.gmem, assumed_align=4)
+
+    @cute.kernel
+    def reset_kernel(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: cutlass.Constexpr):
+        """``signal[] = -1``, no tile counted: one block, one N chunk per thread and step."""
+        thread_idx, _, _ = cute.arch.thread_idx()
+        n_chunk_capacity = const_expr(self.n_chunk_capacity)
+        n_chunk_signal = cute.make_tensor(self._n_chunk_signal_ptr(workspace_ptr, kernel_workspace_bytes), cute.make_layout(n_chunk_capacity))
+        for step in cutlass.range_constexpr(ceil_div(n_chunk_capacity, RESET_BLOCK_THREADS)):
+            n_chunk = step * RESET_BLOCK_THREADS + thread_idx
+            if n_chunk < n_chunk_capacity:
+                n_chunk_signal[n_chunk] = -1
+
+    @cute.jit
+    def reset(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: cutlass.Constexpr, stream: cuda.CUstream) -> None:
+        """Enqueue the reset on ``stream``; ``kernel_workspace_bytes`` is ``get_workspace_bytes()``.
+        A ``caller_reset`` caller compiles this once and runs it ahead of each GEMM."""
+        self.reset_kernel(workspace_ptr, kernel_workspace_bytes).launch(grid=(1, 1, 1), block=(RESET_BLOCK_THREADS, 1, 1), stream=stream)
+
+    def launch_reset(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: int, stream) -> None:
+        """The GEMM call's own reset, ahead of it on its stream; none when off or caller-owned."""
+        if const_expr(self.enabled and not self.caller_reset):
+            self.reset(workspace_ptr, kernel_workspace_bytes, stream)
+
+    def make_notifier(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: int, output_cols: Int32) -> "OutputStoreNotifier":
+        """The device notifier over this kernel's ``signal[]``; ``output_cols`` is the GEMM N (D columns)."""
+        if const_expr(not self.enabled):
+            return OutputStoreNotifier(self)
+        return OutputStoreNotifier(self, self._n_chunk_signal_ptr(workspace_ptr, kernel_workspace_bytes), output_cols)
+
+
+class OutputStoreNotifier:
+    """The D-store warp's hooks, no-ops when notification is off: ``begin_tile`` before a tile's
+    D stores, ``end_tile`` after them, ``finalize`` before ``d_pipeline.producer_tail()``."""
+
+    def __init__(self, config: OutputNotifyConfig, n_chunk_signal_ptr: Optional[cute.Pointer] = None, output_cols: Optional[Int32] = None):
+        self.config = config
+        self.n_chunk_signal_ptr, self.output_cols = n_chunk_signal_ptr, output_cols
+
+    def _device_fields(self) -> list:
+        return [self.n_chunk_signal_ptr, self.output_cols] if self.config.enabled else []
+
+    def __extract_mlir_values__(self) -> List[ir.Value]:
+        return [value for field in self._device_fields() for value in extract_mlir_values(field)]
+
+    def __new_from_mlir_values__(self, values: List[ir.Value]) -> "OutputStoreNotifier":
+        rebuilt_fields = []
+        for field in self._device_fields():
+            field_value_count = len(extract_mlir_values(field))
+            rebuilt_fields.append(new_from_mlir_values(field, values[:field_value_count]))
+            values = values[field_value_count:]
+        return OutputStoreNotifier(self.config, *rebuilt_fields)
+
+    def make_state(self) -> _NotifyState:
+        if const_expr(not self.config.enabled):
+            return _NotifyState()
+        return _NotifyState(Int32(-1), Int32(0))
+
+    @cute.jit
+    def begin_tile(self, state: _NotifyState, work_tile: MoEWorkTileInfo, padded_offsets: cute.Tensor) -> _NotifyState:
+        """Before a tile's D stores: when it opens a new N chunk, count the previous chunk's pending tiles."""
+        config = self.config
+        if const_expr(config.enabled):
+            if work_tile.tile_n_idx * const_expr(config.cta_tile_n) < self.output_cols:
+                n_chunk = work_tile.tile_n_idx // const_expr(config.n_chunk_size // config.cta_tile_n)
+                if n_chunk != state.current_n_chunk:
+                    self.count_pending_tiles_and_publish_n_chunk(state, padded_offsets)
+                    state = _NotifyState(n_chunk, Int32(0))
+            else:
+                # A tile wholly past N (cluster N rounds the N tiles up) stores nothing: cancel
+                # the count ``end_tile`` adds for it.
+                state = _NotifyState(state.current_n_chunk, state.pending_tile_count - 1)
+        return state
+
+    def end_tile(self, state: _NotifyState) -> _NotifyState:
+        """After a tile's last D store is issued: one more pending tile."""
+        if const_expr(not self.config.enabled):
+            return state
+        return _NotifyState(state.current_n_chunk, state.pending_tile_count + 1)
+
+    @cute.jit
+    def finalize(self, state: _NotifyState, padded_offsets: cute.Tensor) -> None:
+        """Count the last N chunk's pending tiles; before ``d_pipeline.producer_tail()``."""
+        if const_expr(self.config.enabled):
+            self.count_pending_tiles_and_publish_n_chunk(state, padded_offsets)
+
+    @cute.jit
+    def count_pending_tiles_and_publish_n_chunk(self, state: _NotifyState, padded_offsets: cute.Tensor) -> None:
+        """Count the pending tiles in ``signal[n_chunk]`` once their D stores are in global memory, and
+        publish the chunk if that completes it.  The acq_rel add acquires every earlier add's stores."""
+        config = self.config
+        n_chunk, pending_tile_count = state.current_n_chunk, state.pending_tile_count
+        if pending_tile_count > 0:
+            # Not ``PipelineTmaStore``'s ``.read`` wait, which only frees the source SMEM.
+            cute.arch.cp_async_bulk_wait_group(0, read=False)
+            # The bulk-store issuer need not be lane 0: order every lane's completed stores before lane 0's add.
+            cute.arch.sync_warp()
+            lane_idx = cute.arch.lane_idx()
+            # An incomplete chunk's word is -1 - (tiles counted): never the ``n_chunk`` nccl-ep waits for.
+            signal_before = Int32(0)
+            if lane_idx == 0:
+                signal_before = cute.arch.atomic_add(self.n_chunk_signal_ptr + n_chunk, -pending_tile_count, sem="acq_rel", scope="gpu")
+            # The other lanes hold 0, so the OR hands every lane lane 0's word.
+            counted_tile_count = pending_tile_count - 1 - cute.arch.warp_redux_sync(signal_before, "or")
+            # CTA tiles of the chunk: every M tile times the N tiles of this possibly partial chunk.
+            n_chunk_cols = cutlass.min(const_expr(config.n_chunk_size), self.output_cols - n_chunk * const_expr(config.n_chunk_size))
+            if const_expr(config.rows_aligned):
+                total_rows = padded_offsets[const_expr(config.expert_cnt - 1)]
+                n_chunk_tile_count = total_rows // const_expr(config.cta_tile_m) * ceil_div(n_chunk_cols, const_expr(config.cta_tile_n))
+            else:
+                # Tails exist only with 2-CTA tiles: two CTA tiles per cluster M tile (M unit).
+                total_m_tiles = cluster_m_tile_count(
+                    padded_offsets, const_expr(config.expert_cnt), CLUSTER_TILE_M, False, const_expr(config.fused_tail_max_rows)
+                )
+                n_chunk_tile_count = total_m_tiles * const_expr(CLUSTER_TILE_M // config.cta_tile_m) * ceil_div(n_chunk_cols, const_expr(config.cta_tile_n))
+            if counted_tile_count == n_chunk_tile_count:
+                # Lane 0 holds the acquire; elect.sync's leader is not specified to be lane 0.
+                if lane_idx == 0:
+                    cute.arch.store(self.n_chunk_signal_ptr + n_chunk, n_chunk, sem="release", scope="gpu")
+
+
+def output_notify_offsets(kernel) -> Dict[str, int]:
+    """The byte offset of ``signal[]`` inside ``kernel``'s workspace, and its capacity."""
+    config = kernel.output_notify
+    return {"signal": kernel.get_workspace_bytes() - config.workspace_bytes, "capacity": config.n_chunk_capacity, "total_bytes": kernel.get_workspace_bytes()}

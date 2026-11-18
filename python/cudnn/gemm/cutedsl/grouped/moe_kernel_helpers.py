@@ -635,6 +635,24 @@ def is_valid_layouts(
     return is_valid
 
 
+def is_valid_dynamic_sched_cluster_shape(use_2cta_instrs: bool, cluster_shape_mn: Tuple[int, int]) -> bool:
+    """Cluster shapes the dynamic claim path can exit safely from on SM100: (2, 1) with 2-CTA MMA, or (1, 1).
+
+    Each non-leader CTA releases the broadcast slot with a remote arrive into the leader's shared memory; only the
+    2-CTA TMEM dealloc handshake (or having no peer) keeps the leader resident until that arrive lands.
+    """
+    return tuple(cluster_shape_mn) == ((2, 1) if use_2cta_instrs else (1, 1))
+
+
+def check_dynamic_sched_cluster_shape(use_2cta_instrs: bool, cluster_shape_mn: Tuple[int, int]) -> None:
+    """Raise unless ``is_valid_dynamic_sched_cluster_shape``; the streaming signal schedulers call it."""
+    if not is_valid_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn):
+        raise ValueError(
+            f"dynamic tile scheduler: cluster {tuple(cluster_shape_mn)} with {2 if use_2cta_instrs else 1}-CTA MMA could exit "
+            "while a peer CTA still arrives on the leader's shared memory; supported: (2, 1) with 2-CTA MMA, (1, 1) with 1-CTA MMA"
+        )
+
+
 def is_valid_mma_tiler_and_cluster_shape(
     use_2cta_instrs: bool,
     mma_tiler_mn: Tuple[int, int],

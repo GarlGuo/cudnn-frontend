@@ -43,9 +43,16 @@ from ..moe_sched_extension import (
 )
 from ..moe_kernel_helpers import (
     can_implement_bf16_grouped_gemm,
+    check_dynamic_sched_cluster_shape,
     compute_grid,
     epilog_gmem_copy_and_partition,
 )
+from ..moe_streaming_input_block_tile_scheduler import (
+    MoEInputBlockSignalSchedulerParams,
+    MoEStreamingInputBlockSignalTileScheduler,
+    signal_workspace_bytes_after_counter,
+)
+from ..moe_streaming_output_chunk_tile_scheduler import OutputNotifyConfig
 
 
 class MoEGroupedGemmBf16Kernel:
@@ -65,9 +72,21 @@ class MoEGroupedGemmBf16Kernel:
     :param expert_cnt: Number of experts.
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
+    :param signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
+        runs ``MoEStreamingInputBlockSignalTileScheduler`` and starts each M tile once the producer marks it ready.
+        Needs ``use_dynamic_sched``.
+    :param output_notify: ``OutputNotifyConfig``; ``N_CHUNK`` publishes each finished chunk of D columns to a
+        streaming consumer (``MoEStreamingOutputChunkSignalTileScheduler``). Not combined with ``signal_capacity``.
+    :param device_layout: With ``signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
+        and the scheduler waits for them.
+    :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
+        for that grid before it exits.
+    :param launch_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
     FIX_PAD_SIZE = 256
+    #: Where a signal-scheduled base kernel lets its programmatic dependent launch: False, at its entry.
+    FC1_TAIL_AT_SLOTS_READY = False
 
     @staticmethod
     def can_implement(
@@ -120,6 +139,11 @@ class MoEGroupedGemmBf16Kernel:
         expert_cnt: int,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
+        signal_capacity: Optional[int] = None,
+        output_notify: Optional[OutputNotifyConfig] = None,
+        device_layout: bool = False,
+        use_pdl: bool = False,
+        launch_dependents_at_entry: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -180,6 +204,23 @@ class MoEGroupedGemmBf16Kernel:
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
         self.num_epilog_warps = len(self.epilog_warp_id)
+
+        self.signal_capacity = signal_capacity
+        self.use_signal_sched = signal_capacity is not None
+        if self.use_signal_sched and not use_dynamic_sched:
+            raise ValueError("signal_capacity requires use_dynamic_sched=True")
+        if device_layout and not self.use_signal_sched:
+            raise ValueError("device_layout requires signal_capacity")
+        self.device_layout = device_layout
+        self.use_pdl = use_pdl
+        self.launch_dependents_at_entry = launch_dependents_at_entry
+        self.output_notify = (output_notify or OutputNotifyConfig()).bind(
+            (mma_tiler_mn[0] // (2 if use_2cta_instrs else 1), mma_tiler_mn[1]), expert_cnt, self.use_signal_sched
+        )
+        if self.output_notify.enabled and not use_dynamic_sched:
+            raise ValueError("output_notify requires use_dynamic_sched=True")
+        if self.use_signal_sched or self.output_notify.enabled:
+            check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
 
     # ------------------------------------------------------------------
     # _setup_attributes
@@ -337,7 +378,8 @@ class MoEGroupedGemmBf16Kernel:
     def get_workspace_bytes(self) -> int:
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        return desc_workspace_bytes + dynamic_sched_bytes
+        signal_workspace_bytes = signal_workspace_bytes_after_counter(self.signal_capacity, self.expert_cnt) if self.use_signal_sched else 0
+        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes + self.output_notify.workspace_bytes
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -411,7 +453,8 @@ class MoEGroupedGemmBf16Kernel:
             workspace = TensormapWorkspace(workspace_ptr, ["b"])
             store_tma_desc(tma_atom_b, workspace.get_ptr("b", expert_idx))
 
-        if cutlass.const_expr(self.use_dynamic_sched):
+        # The signal scheduler's counter is reset by the caller together with signal[].
+        if cutlass.const_expr(self.use_dynamic_sched and not self.use_signal_sched):
             if expert_idx == cutlass.Int32(0):
                 sched_counter = cute.make_tensor(
                     self._get_sched_counter_ptr(workspace_ptr),
@@ -546,7 +589,7 @@ class MoEGroupedGemmBf16Kernel:
         )
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or self.use_dynamic_sched)
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_signal_sched))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -566,6 +609,7 @@ class MoEGroupedGemmBf16Kernel:
                 stream=stream,
                 min_blocks_per_mp=1,
             )
+        self.output_notify.launch_reset(workspace_ptr, self.get_workspace_bytes(), stream)
 
         # ---- Grid computation via MoE scheduler ----
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
@@ -573,14 +617,22 @@ class MoEGroupedGemmBf16Kernel:
             sched_expert_shape = (self.expert_cnt, b_n, b_k)
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
+        self.output_notify.check_output_cols(sched_expert_shape[1])
 
-        sched_params = MoESchedulerParams(
-            scenario="2Dx3D",
-            expert_shape=sched_expert_shape,
-            cta_tile_shape_mnk=self.cta_tile_shape_mnk,
-            cluster_shape_mn=self.cluster_shape_mn,
-            use_dynamic_sched=self.use_dynamic_sched,
-        )
+        if cutlass.const_expr(self.use_signal_sched):
+            sched_params = MoEInputBlockSignalSchedulerParams(
+                expert_shape=sched_expert_shape,
+                cta_tile_shape_mnk=self.cta_tile_shape_mnk,
+                cluster_shape_mn=self.cluster_shape_mn,
+            )
+        else:
+            sched_params = MoESchedulerParams(
+                scenario="2Dx3D",
+                expert_shape=sched_expert_shape,
+                cta_tile_shape_mnk=self.cta_tile_shape_mnk,
+                cluster_shape_mn=self.cluster_shape_mn,
+                use_dynamic_sched=self.use_dynamic_sched,
+            )
         self.sched_params, grid = compute_grid(sched_params, max_active_clusters, self.use_2cta_instrs)
         self.buffer_align_bytes = 1024
 
@@ -653,6 +705,7 @@ class MoEGroupedGemmBf16Kernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -740,7 +793,7 @@ class MoEGroupedGemmBf16Kernel:
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         bias_smem_layout_staged: Optional[cute.Layout],
         epi_tile: cute.Tile,
-        sched_params: MoESchedulerParams,
+        sched_params: Union[MoESchedulerParams, MoEInputBlockSignalSchedulerParams],
         epilogue_op: cutlass.Constexpr,
     ):
         del epilogue_op
@@ -764,6 +817,8 @@ class MoEGroupedGemmBf16Kernel:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
+        if cutlass.const_expr(self.launch_dependents_at_entry):
+            cute.arch.griddepcontrol_launch_dependents()
 
         smem = SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -817,14 +872,25 @@ class MoEGroupedGemmBf16Kernel:
             sBias = storage.sBias.get_tensor(bias_smem_layout_staged)
 
         # ---- Scheduler and TMEM allocator ----
-        scheduler = MoEPersistentTileScheduler.create(
-            sched_params,
-            padded_offsets,
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-            counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
-            sched_storage=sched_storage,
-        )
+        if cutlass.const_expr(self.use_signal_sched):
+            scheduler = MoEStreamingInputBlockSignalTileScheduler.create(
+                sched_params,
+                padded_offsets,
+                counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
+                sched_storage=sched_storage,
+                signal_capacity=self.signal_capacity,
+                device_layout=self.device_layout,
+            )
+        else:
+            scheduler = MoEPersistentTileScheduler.create(
+                sched_params,
+                padded_offsets,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
+                sched_storage=sched_storage,
+            )
+        scheduler = self.output_notify.tile_order(scheduler)
         scheduler.internal_init()
 
         tmem = TmemAllocator(
@@ -863,7 +929,8 @@ class MoEGroupedGemmBf16Kernel:
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
-        if total_token <= 0:
+        # device_layout: total_token may predate the producer's layout write, so no CTA exits early here.
+        if not self.device_layout and total_token <= 0:
             cute.arch.nvvm.exit()
 
         # ==============================================================
@@ -1023,6 +1090,10 @@ class MoEGroupedGemmBf16Kernel:
                 tAgA_slice = tAgA[(None, mma_tile_coord_m, None, 0)]
                 tBgB_slice = tBgB[(None, mma_tile_coord_n, None, 0)]
 
+                # The producer wrote A through the generic proxy: order it before this tile's TMA loads.
+                if cutlass.const_expr(self.use_signal_sched):
+                    cute.arch.fence_proxy("async.global")
+
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
                 if ab_producer_state.count < k_tile_cnt:
@@ -1125,7 +1196,7 @@ class MoEGroupedGemmBf16Kernel:
         # ==============================================================
         # Epilogue warps
         # ==============================================================
-        if warp_idx < self.mma_warp_id and total_token > 0:
+        if warp_idx < self.mma_warp_id and (self.device_layout or total_token > 0):
             tmem.allocate(self.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1180,6 +1251,8 @@ class MoEGroupedGemmBf16Kernel:
                 bias_s2r_tom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.bias_dtype, num_bits_per_copy=128)
                 tTR_rBias = cute.make_rmem_tensor(cute.make_layout(self.epi_tile[1]), self.bias_dtype)
 
+            output_notifier = self.output_notify.make_notifier(workspace_ptr, self.get_workspace_bytes(), sched_params.intermediate)
+            notify_state = output_notifier.make_state()
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 epi_work_tile_info = MoEWorkTileInfo(
@@ -1239,6 +1312,8 @@ class MoEGroupedGemmBf16Kernel:
                 acc_stage_index = acc_consumer_state.index
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                if warp_idx == self.epilog_warp_id[0]:
+                    notify_state = output_notifier.begin_tile(notify_state, epi_work_tile_info, padded_offsets)
                 acc_pipeline.consumer_wait(acc_consumer_state)
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
@@ -1327,6 +1402,8 @@ class MoEGroupedGemmBf16Kernel:
                         d_pipeline.producer_commit()
                         d_pipeline.producer_acquire()
                     self.epilog_sync_barrier.arrive_and_wait()
+                if warp_idx == self.epilog_warp_id[0]:
+                    notify_state = output_notifier.end_tile(notify_state)
 
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
@@ -1347,9 +1424,18 @@ class MoEGroupedGemmBf16Kernel:
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
+            if warp_idx == self.epilog_warp_id[0]:
+                output_notifier.finalize(notify_state, padded_offsets)
             if cutlass.const_expr(self.generate_c):
                 c_pipeline.producer_tail()
             d_pipeline.producer_tail()
+
+        # The signal scheduler's last cluster handoff writes into a peer's shared memory: all threads wait here.
+        if cutlass.const_expr(self.use_signal_sched):
+            scheduler.internal_finalize()
+        # Work after this kernel on the stream must also follow the grid this launch overlapped.
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 
