@@ -187,7 +187,7 @@ def test_signal_consumer_with_no_rows_exits(device_layout):
 
 
 def test_signal_consumer_waits_for_producer():
-    """The GEMM starts while every slot reads not-ready and A holds NaN; a later kernel on another stream writes A one
+    """The GEMM starts while every signal slot reads not-ready and A holds NaN; a later kernel on another stream writes A one
     M tile at a time and then marks it ready.  Reading any tile early would carry NaN into D."""
     require_sm100()
     problem = make_problem([700, 300, 256, 513], FFN, HIDDEN, seed=7)
@@ -211,7 +211,7 @@ def test_signal_consumer_waits_for_producer():
 
     # A few clusters only, so the producer kernels find free SMs while the GEMM waits.
     c, d, workspace, launch = run(kernel, problem, False, max_active_clusters=4, stream=gemm_stream, defer_launch=True)
-    # One launch with every slot ready loads the GEMM's module: under lazy loading a first launch waits for running work.
+    # One launch with every signal slot ready loads the GEMM's module: under lazy loading a first launch waits for running work.
     with torch.cuda.stream(gemm_stream):
         reset_signal_workspace(workspace, kernel, all_complete=True)
     launch()
@@ -239,8 +239,8 @@ def test_signal_consumer_waits_for_producer():
 
 @pytest.mark.parametrize("glu", [False, True], ids=["plain", "glu"])
 def test_device_layout_waits_for_producer(glu):
-    """The GEMM starts while the layout reads -1, every slot reads not-ready and A holds NaN; a later kernel on
-    another stream writes the layout, then A one M tile at a time with its slot.  The GLU also triggers at slots ready."""
+    """The GEMM starts while the layout reads -1, every signal slot reads not-ready and A holds NaN; a later kernel on
+    another stream writes the layout, then A one M tile at a time with its signal slot.  The GLU also triggers once every signal slot is ready."""
     require_sm100()
     n = 2 * FFN if glu else FFN
     problem = make_problem([700, 300, 256, 513], n, HIDDEN, seed=11)
@@ -257,7 +257,7 @@ def test_device_layout_waits_for_producer(glu):
 
     gemm_stream, producer_stream = torch.cuda.Stream(), torch.cuda.Stream()
     c, d, workspace, launch = run(kernel, problem, glu, max_active_clusters=4, stream=gemm_stream, defer_launch=True)
-    # One launch with the layout written and every slot ready loads the module (lazy loading waits for running work).
+    # One launch with the layout written and every signal slot ready loads the module (lazy loading waits for running work).
     with torch.cuda.stream(gemm_stream):
         reset_signal_workspace(workspace, kernel, all_complete=True)
     launch()

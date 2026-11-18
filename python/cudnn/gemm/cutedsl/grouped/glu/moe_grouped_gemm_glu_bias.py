@@ -87,7 +87,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
     FIX_PAD_SIZE = 256
-    #: Where a signal-scheduled base kernel lets its programmatic dependent launch: True, once every slot is ready.
+    #: Where a signal-scheduled base kernel lets its programmatic dependent launch: True, once every signal slot is ready.
     FC1_TAIL_AT_SLOTS_READY = True
 
     @staticmethod
@@ -187,7 +187,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         if enable_bias:
             all_warps.append(self.bias_load_warp_id)
             warps_wo_sched.append(self.bias_load_warp_id)
-        # launch_dependents_at_slots_ready: one more warp, which only waits for every slot and then triggers.
+        # launch_dependents_at_slots_ready: one more warp, which only waits for every signal slot and then triggers.
         self.trigger_warp_id = len(all_warps) if launch_dependents_at_slots_ready else None
         if launch_dependents_at_slots_ready:
             all_warps.append(self.trigger_warp_id)
@@ -1174,7 +1174,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
 
         if cutlass.const_expr(self.launch_dependents_at_slots_ready):
             if warp_idx == self.trigger_warp_id:
-                scheduler.wait_all_slots_ready()
+                scheduler.wait_all_signal_slots_ready()
                 cute.arch.griddepcontrol_launch_dependents()
 
         #
