@@ -26,7 +26,7 @@ FUSED_TAIL_CHUNKS = 2
 #: blocks are L2 hits behind them, and two longer units at the end of each N tile's run cost more than they save.
 FUSED_TAIL_CHUNKED_MAX_EXPERT_ROWS = 9 * CLUSTER_TILE_M
 #: The FC1 signal scheduler fuses a tail only when its rows are ready as its batch opens, and marks each unit that
-#: runs a tail chunk with this bit, in its broadcast work slot and its work tile's k_tile_cnt.
+#: runs a tail chunk with this bit, in its broadcast linear tile index and its work tile's k_tile_cnt.
 FUSED_UNIT = 1 << 30
 
 

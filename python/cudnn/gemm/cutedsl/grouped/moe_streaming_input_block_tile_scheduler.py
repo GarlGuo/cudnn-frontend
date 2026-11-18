@@ -44,7 +44,7 @@ def _state_words(streaming_signal_capacity: int, expert_cnt: int) -> dict:
     capacity = streaming_signal_capacity
     # Indexed by expert, and a capacity can be below expert_cnt: fewer routed rows than experts.
     expert_table_words = max(capacity, expert_cnt)
-    # A batch record is 4 words per M-tile; then, per expert, 1 + the first claim number of its last batch (0: none).
+    # A batch record is 4 words per M-tile; then, per expert, 1 + the first claim index of its last batch (0: none).
     expert_last_batch = expert_table_words + 1 + 4 * capacity
     return {
         "expert_assigned_m_tiles": 0,
@@ -55,16 +55,16 @@ def _state_words(streaming_signal_capacity: int, expert_cnt: int) -> dict:
     }
 
 
-def check_work_slot_range(intermediate, cluster_tile_n: int, streaming_signal_capacity, fused_tail_max_rows: int) -> None:
-    """Build-time bounds on a work slot (slot * Q_N + N tile): N > 0, and every slot, END included, below the flag bit
+def check_linear_tile_idx_range(intermediate, cluster_tile_n: int, streaming_signal_capacity, fused_tail_max_rows: int) -> None:
+    """Build-time bounds on a linear tile index (slot * Q_N + N tile): N > 0, and every slot, END included, below the flag bit
     ``FUSED_UNIT`` with fused tails, else 2^31."""
     assert isinstance(intermediate, int), f"the signal scheduler needs a build-time N (dense B), not {intermediate}"
-    assert intermediate > 0, f"the signal scheduler needs N > 0 (a work slot // Q_N), got N = {intermediate}"
+    assert intermediate > 0, f"the signal scheduler needs N > 0 (a linear tile index // Q_N), got N = {intermediate}"
     assert isinstance(streaming_signal_capacity, int), f"streaming_signal_capacity must be a build-time int, not {streaming_signal_capacity}"
     n_tiles_per_m_tile = -(-intermediate // cluster_tile_n)  # host-side: moe_utils.ceil_div is @cute.jit
-    work_slot_limit = FUSED_UNIT if fused_tail_max_rows else 2**31
-    assert streaming_signal_capacity * n_tiles_per_m_tile < work_slot_limit, (
-        f"streaming_signal_capacity {streaming_signal_capacity} x Q_N {n_tiles_per_m_tile} work slots reach {work_slot_limit:#x}"
+    linear_tile_idx_limit = FUSED_UNIT if fused_tail_max_rows else 2**31
+    assert streaming_signal_capacity * n_tiles_per_m_tile < linear_tile_idx_limit, (
+        f"streaming_signal_capacity {streaming_signal_capacity} x Q_N {n_tiles_per_m_tile} linear tile indices reach {linear_tile_idx_limit:#x}"
         f"{' (FUSED_UNIT, fused tails on)' if fused_tail_max_rows else ''}"
     )
 
@@ -94,8 +94,8 @@ def _poll_until_at_least(ptr, floor: cutlass.Constexpr) -> None:
         value = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
 
 
-#: A claim number that carries no work unit (a fused batch's last ones); the claimer takes another.
-NO_WORK_SLOT = -1
+#: A claim index that carries no tile (a fused batch's last ones); the claimer takes another.
+NO_TILE = -1
 
 
 class MoEInputBlockSignalSchedulerParams:
@@ -148,7 +148,7 @@ class MoEInputBlockSignalSchedulerParams:
 
 
 class MoEStreamingInputBlockSignalTileScheduler:
-    """Persistent tile scheduler for the MoE grouped GEMM: tile iteration only (claim a work slot,
+    """Persistent tile scheduler for the MoE grouped GEMM: tile iteration only (claim a linear tile index,
     broadcast it to the cluster).  MoESchedExtension converts domains and picks TMA descriptors."""
 
     def internal_init(self):
@@ -202,7 +202,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         assert (
             not fused_tail_max_rows or self.slot_rows <= fused_tail_max_rows
         ), f"fused tails of {fused_tail_max_rows} rows need slots of at most as many rows, not {self.slot_rows}"
-        check_work_slot_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity, fused_tail_max_rows)
+        check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity, fused_tail_max_rows)
         # mapa.shared::cluster at one CTA is an illegal peer store.  This assert is the only
         # guard: no kernel checks its cluster shape for the signal scheduler.
         assert const_expr(
@@ -286,7 +286,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
 
     @cute.jit
     def advance_to_next_work(self) -> MoEWorkTileInfo:
-        """Claim the cluster's next work slot and return its work tile, invalid past the last."""
+        """Claim the cluster's next linear tile index and return its work tile, invalid past the last."""
         work_tile_info = self._get_work_tile_for_linear_idx(self._claim_slot_via_cluster_broadcast())
         # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier.
         self.cluster_pipeline.sync_object_empty.arrive(self._dynamic_state.consumer_state.index, 0)
@@ -342,12 +342,12 @@ class MoEStreamingInputBlockSignalTileScheduler:
         )
 
     def _expert_consecutive_m_batch_record_ptr(self, m_tile_order: Int32):
-        """Batch record of the k-th M-tile put in a batch (read by claims [k * Q_N, (k + 1) * Q_N)): first claim number,
+        """Batch record of the k-th M-tile put in a batch (read by claims [k * Q_N, (k + 1) * Q_N)): first claim index,
         first M-tile slot, M-tile count (| ``FUSED_UNIT``), the expert's end slot (fused tails: the expert)."""
         return self._state_ptr("expert_consecutive_m_batch_record") + 4 * m_tile_order
 
     def _set_expert_consecutive_m_batch_record(self, m_tile_order: Int32, record: Tuple[Int32, Int32, Int32, Int32]) -> None:
-        """Store ``record`` (first claim number, first M-tile's slot, M-tile count, expert end slot)."""
+        """Store ``record`` (first claim index, first M-tile's slot, M-tile count, expert end slot)."""
         record_ptr = self._expert_consecutive_m_batch_record_ptr(m_tile_order)
         # Scheduler state is read and written at gpu scope (relaxed: L1 bypassed, so other SMs' writes are seen);
         # the release on ``assigned_claim_count`` publishes these stores.
@@ -355,7 +355,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
             cute.arch.store((record_ptr + word).llvm_ptr, value, sem="relaxed", scope="gpu")
 
     def _get_expert_consecutive_m_batch_record(self, m_tile_order: Int32) -> Tuple[Int32, Int32, Int32, Int32]:
-        """The record (first claim number, first M-tile's slot, M-tile count, expert end slot) at ``m_tile_order``."""
+        """The record (first claim index, first M-tile's slot, M-tile count, expert end slot) at ``m_tile_order``."""
         record_ptr = self._expert_consecutive_m_batch_record_ptr(m_tile_order)
         return tuple(cute.arch.load((record_ptr + word).llvm_ptr, Int32, sem="relaxed", scope="gpu") for word in range(4))
 
@@ -432,8 +432,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
         return ready_m_tile_count
 
     @cute.jit
-    def _open_expert_consecutive_m_batch(self, claim_number: Int32, n_tiles_per_m_tile: Int32, lane_idx: Int32) -> None:
-        """Open and publish the batch at ``claim_number`` (only the ``assigned_claim_count`` warp: no atomics): prefer
+    def _open_expert_consecutive_m_batch(self, claim_idx: Int32, n_tiles_per_m_tile: Int32, lane_idx: Int32) -> None:
+        """Open and publish the batch at ``claim_idx`` (only the ``assigned_claim_count`` warp: no atomics): prefer
         the expert opened last whose ready run ends it or fills the cap (weights in L2), else the most ready M-tiles."""
         expert_cnt = const_expr(self.params.expert_cnt)
         assigned_claim_count_ptr = self._state_ptr("assigned_claim_count")
@@ -441,7 +441,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
 
         m_tile_count = Int32(0)
         expert = Int32(0)
-        # No ready M-tile: look again.  ``claim_number`` exists, so one is still unassigned, and
+        # No ready M-tile: look again.  ``claim_idx`` exists, so one is still unassigned, and
         # the producer does not wait on this consumer, so it does get published.
         while m_tile_count == 0:
             # Score: 0 with no ready M-tile; an expert that had a batch scores past any ready count, by how recently
@@ -490,52 +490,52 @@ class MoEStreamingInputBlockSignalTileScheduler:
             expert_end_slot = self.expert_freq_offsets[expert] // const_expr(self.slot_rows)
             cute.arch.store(expert_assigned_m_tiles_ptr.llvm_ptr, already_assigned_m_tiles + m_tile_count, sem="relaxed", scope="gpu")
             record_m_tile_count, record_last = m_tile_count, expert_end_slot
-            cute.arch.store((expert_last_batch_ptr + expert).llvm_ptr, claim_number + 1, sem="relaxed", scope="gpu")
+            cute.arch.store((expert_last_batch_ptr + expert).llvm_ptr, claim_idx + 1, sem="relaxed", scope="gpu")
             if const_expr(self.fused_tail_max_rows > 0):
                 # Fused only when the batch's M-tiles reach the expert's end: its tail's rows are ready now.
                 if self._batch_fuses_tail(self._expert_first_slot(expert), expert_end_slot, already_assigned_m_tiles, m_tile_count):
                     record_m_tile_count = m_tile_count | FUSED_UNIT
                 record_last = expert
             # The batch takes the next ``m_tile_count`` M-tile orders: the same record in each.
-            first_m_tile_order = claim_number // n_tiles_per_m_tile
+            first_m_tile_order = claim_idx // n_tiles_per_m_tile
             for j in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
                 if j < m_tile_count:
-                    self._set_expert_consecutive_m_batch_record(first_m_tile_order + j, (claim_number, first_slot, record_m_tile_count, record_last))
+                    self._set_expert_consecutive_m_batch_record(first_m_tile_order + j, (claim_idx, first_slot, record_m_tile_count, record_last))
             # Published LAST, and that order is load-bearing: the release is what hands the
             # records to the claimers and ``expert_assigned_m_tiles[]`` to the next opener.
-            cute.arch.store(assigned_claim_count_ptr.llvm_ptr, claim_number + m_tile_count * n_tiles_per_m_tile, sem="release", scope="gpu")
-        # ``assigned_claim_count`` is past ``claim_number`` now, so this returns at once.  It is
+            cute.arch.store(assigned_claim_count_ptr.llvm_ptr, claim_idx + m_tile_count * n_tiles_per_m_tile, sem="release", scope="gpu")
+        # ``assigned_claim_count`` is past ``claim_idx`` now, so this returns at once.  It is
         # here for its acquire: one lane wrote the records, and every lane is about to read them.
-        _spin_until_at_least(assigned_claim_count_ptr, claim_number + 1)
+        _spin_until_at_least(assigned_claim_count_ptr, claim_idx + 1)
 
     @cute.jit
-    def _claim_work_slot(self, n_tiles_per_m_tile: Int32, lane_idx: Int32) -> Int32:
+    def _claim_linear_tile_idx(self, n_tiles_per_m_tile: Int32, lane_idx: Int32) -> Int32:
         """Claim a number (one atomic add), wait for every earlier one to have a batch, open one if it has none, and
-        return its work slot: END past the last, ``NO_WORK_SLOT`` for fused spares, ``FUSED_UNIT`` on tail units."""
+        return its linear tile index: END past the last, ``NO_TILE`` for fused spares, ``FUSED_UNIT`` on tail units."""
         ds = self._dynamic_state
-        claim_number = 0
+        claim_idx = 0
         if lane_idx == 0:
-            claim_number = atomic_add_i32(ds.counter_ptr.llvm_ptr, Int32(1))
+            claim_idx = atomic_add_i32(ds.counter_ptr.llvm_ptr, Int32(1))
         # The other lanes hold 0, so the OR hands every lane lane 0's number.
-        claim_number = cute.arch.warp_redux_sync(claim_number, "or")
+        claim_idx = cute.arch.warp_redux_sync(claim_idx, "or")
         # Past the last slot, which is what an END claim broadcasts.  The offsets are
         # inclusive ends padded to the slot, so the last one is the slot total.
         total_slots = self.expert_freq_offsets[const_expr(self.params.expert_cnt - 1)] // const_expr(self.slot_rows)
-        work_slot = total_slots * n_tiles_per_m_tile
-        total_claims = (
+        linear_tile_idx = total_slots * n_tiles_per_m_tile
+        claim_count = (
             cluster_m_tile_count(
                 self.expert_freq_offsets, const_expr(self.params.expert_cnt), const_expr(self.params.cluster_tile_m), const_expr(self.slots_per_m_tile == 1)
             )
             * n_tiles_per_m_tile
         )
-        if claim_number < total_claims:
+        if claim_idx < claim_count:
             # Every lane lands on the same side of this test: once ``assigned_claim_count``
-            # is ``claim_number`` it stays there until this very warp moves it.
-            if _spin_until_at_least(self._state_ptr("assigned_claim_count"), claim_number) == claim_number:
-                self._open_expert_consecutive_m_batch(claim_number, n_tiles_per_m_tile, lane_idx)
-            # ``assigned_claim_count`` is past ``claim_number`` and every lane has acquired
-            # it, so the record at this claim number's M-tile order is written and visible.
-            first_claim_number, first_slot, m_tile_count, expert_end_slot = self._get_expert_consecutive_m_batch_record(claim_number // n_tiles_per_m_tile)
+            # is ``claim_idx`` it stays there until this very warp moves it.
+            if _spin_until_at_least(self._state_ptr("assigned_claim_count"), claim_idx) == claim_idx:
+                self._open_expert_consecutive_m_batch(claim_idx, n_tiles_per_m_tile, lane_idx)
+            # ``assigned_claim_count`` is past ``claim_idx`` and every lane has acquired
+            # it, so the record at this claim index's M-tile order is written and visible.
+            first_claim_idx, first_slot, m_tile_count, expert_end_slot = self._get_expert_consecutive_m_batch_record(claim_idx // n_tiles_per_m_tile)
             if const_expr(self.fused_tail_max_rows > 0):
                 # The record's last word is the expert; its offsets, as every offset here, are read after the layout
                 # wait.  A fused batch has one M unit fewer per N-tile: its tail M-tile rides in the units before it.
@@ -544,19 +544,19 @@ class MoEStreamingInputBlockSignalTileScheduler:
                 expert = expert_end_slot
                 expert_first_slot = self._expert_first_slot(expert)
                 expert_end_slot = self.expert_freq_offsets[expert] // const_expr(self.slot_rows)
-            claim_in_batch = claim_number - first_claim_number
-            n_tile = claim_in_batch // m_tile_count
-            m_tile_slot = first_slot + claim_in_batch % m_tile_count * const_expr(self.slots_per_m_tile)
+            claim_idx_in_batch = claim_idx - first_claim_idx
+            n_tile = claim_idx_in_batch // m_tile_count
+            m_tile_slot = first_slot + claim_idx_in_batch % m_tile_count * const_expr(self.slots_per_m_tile)
             # A batch holds only ready M-tiles, so these return at once.  They are here for their
             # acquire, which pairs the producer's release and makes the M-tile's rows visible.
             for k in cutlass.range_constexpr(self.slots_per_m_tile):
                 if const_expr(k == 0) or m_tile_slot + k < expert_end_slot:
                     _spin_until_at_least(signal_ptr(ds.counter_ptr) + (m_tile_slot + k), 0)
-            work_slot = m_tile_slot * n_tiles_per_m_tile + n_tile
+            linear_tile_idx = m_tile_slot * n_tiles_per_m_tile + n_tile
             if const_expr(self.fused_tail_max_rows > 0):
                 if n_tile >= n_tiles_per_m_tile:
-                    # The claim numbers the fused batch's tail M-tile would have taken.
-                    work_slot = Int32(NO_WORK_SLOT)
+                    # The claim indices the fused batch's tail M-tile would have taken.
+                    linear_tile_idx = Int32(NO_TILE)
                 else:
                     if fused_batch != 0:
                         tail_first_slot = self._fused_tail_first_slot(expert_first_slot, expert_end_slot, m_tile_slot)
@@ -565,13 +565,13 @@ class MoEStreamingInputBlockSignalTileScheduler:
                             for k in cutlass.range_constexpr(self.fused_tail_slots):
                                 if tail_first_slot + k < expert_end_slot:
                                     _spin_until_at_least(signal_ptr(ds.counter_ptr) + (tail_first_slot + k), 0)
-                            work_slot = work_slot | FUSED_UNIT
-        return work_slot
+                            linear_tile_idx = linear_tile_idx | FUSED_UNIT
+        return linear_tile_idx
 
     @cute.jit
     def _claim_slot_via_cluster_broadcast(self) -> Int32:
         """Claim a number with one atomic add, wait until every earlier one has a batch, open
-        one if it has none, and broadcast its work slot (END past the last) to the cluster."""
+        one if it has none, and broadcast its linear tile index (END past the last) to the cluster."""
         ds = self._dynamic_state
         broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
         if ds.is_leader_cta:
@@ -579,14 +579,14 @@ class MoEStreamingInputBlockSignalTileScheduler:
             full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index)
             lane_idx = cute.arch.lane_idx()
             cluster_size = const_expr(self.params.cluster_shape_mn[0] * self.params.cluster_shape_mn[1])
-            # Q_N: every M-tile is this many N-tiles, and so this many claim numbers.
+            # Q_N: every M-tile is this many N-tiles, and so this many claim indices.
             n_tiles_per_m_tile = ceil_div(self.params.intermediate, const_expr(self.params.cluster_tile_n))
-            work_slot = self._claim_work_slot(n_tiles_per_m_tile, lane_idx)
+            linear_tile_idx = self._claim_linear_tile_idx(n_tiles_per_m_tile, lane_idx)
             if const_expr(self.fused_tail_max_rows > 0):
-                while work_slot == NO_WORK_SLOT:
-                    work_slot = self._claim_work_slot(n_tiles_per_m_tile, lane_idx)
+                while linear_tile_idx == NO_TILE:
+                    linear_tile_idx = self._claim_linear_tile_idx(n_tiles_per_m_tile, lane_idx)
             if lane_idx < cluster_size:
-                cute.arch.store_async_dsmem(ds.broadcast_ptr, work_slot, full_barrier_ptr, lane_idx)
+                cute.arch.store_async_dsmem(ds.broadcast_ptr, linear_tile_idx, full_barrier_ptr, lane_idx)
             # Fan out one arrive per CTA to the full barrier.
             with cute.arch.elect_one():
                 fence_release_cluster()
@@ -600,17 +600,17 @@ class MoEStreamingInputBlockSignalTileScheduler:
         return broadcast_tensor[0]
 
     @cute.jit
-    def _get_work_tile_for_linear_idx(self, work_slot: Int32) -> MoEWorkTileInfo:
-        """The work tile of ``work_slot = m_tile_slot * Q_N + n_tile`` (``m_tile_slot``: the M-tile's first slot);
+    def _get_work_tile_for_linear_idx(self, linear_tile_idx: Int32) -> MoEWorkTileInfo:
+        """The work tile of ``linear_tile_idx = m_tile_slot * Q_N + n_tile`` (``m_tile_slot``: the M-tile's first slot);
         END, past every expert's last slot, gives an invalid tile."""
         total_expert_cnt = const_expr(self.params.expert_cnt)
         n_tiles_per_m_tile = ceil_div(self.params.intermediate, const_expr(self.params.cluster_tile_n))
         if const_expr(self.fused_tail_max_rows > 0):
             # A fused unit keeps the mark in its k_tile_cnt.
-            fused_unit = work_slot & FUSED_UNIT
-            work_slot = work_slot - fused_unit
-        m_tile_slot = work_slot // n_tiles_per_m_tile
-        n_tile = work_slot % n_tiles_per_m_tile
+            fused_unit = linear_tile_idx & FUSED_UNIT
+            linear_tile_idx = linear_tile_idx - fused_unit
+        m_tile_slot = linear_tile_idx // n_tiles_per_m_tile
+        n_tile = linear_tile_idx % n_tiles_per_m_tile
         # The warp finds the first expert whose end slot is past the M-tile in one round of loads (lane l reads experts
         # l, l + 32, ...) and a min-reduction; a walk from expert 0 costs one dependent L2 load per expert per claim.
         lane_idx = cute.arch.lane_idx()
