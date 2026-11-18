@@ -12,7 +12,7 @@ from cutlass.cutlass_dsl import Boolean, Int32, T, const_expr, dsl_user_op
 from cutlass.cute.typing import AddressSpace
 from cutlass._mlir.dialects import llvm
 
-#: Bytes from the claim counter to ``signal[]``.  ``signal_workspace_offsets`` is the host's
+#: Bytes from the claim counter to ``signal[]``.  ``streaming_signal_workspace_offsets`` is the host's
 #: view of the same map.
 SIGNAL_OFFSET = 4
 
@@ -109,22 +109,22 @@ def _ceil_div(x: int, y: int) -> int:
     return -(-x // y)
 
 
-def scheduler_state_offset(signal_capacity):
+def streaming_scheduler_state_offset(streaming_signal_capacity):
     """Bytes from the claim counter to the scheduler state: past ``signal[]``, rounded up to 128 so the producer-written
     flags and the scheduler's own words share no 128-byte line.  An int capacity folds; an Int32 is the launch's."""
-    if isinstance(signal_capacity, int):
-        return const_expr(_ceil_div(SIGNAL_OFFSET + 4 * signal_capacity, 128) * 128)
-    return (SIGNAL_OFFSET + 4 * signal_capacity + 127) & -128
+    if isinstance(streaming_signal_capacity, int):
+        return const_expr(_ceil_div(SIGNAL_OFFSET + 4 * streaming_signal_capacity, 128) * 128)
+    return (SIGNAL_OFFSET + 4 * streaming_signal_capacity + 127) & -128
 
 
-def signal_workspace_offsets(kernel) -> Dict[str, int]:
-    """Byte offsets ``counter``/``signal``/``state`` plus ``signal_capacity`` and ``total_bytes``,
+def streaming_signal_workspace_offsets(kernel) -> Dict[str, int]:
+    """Byte offsets ``counter``/``signal``/``state`` plus ``streaming_signal_capacity`` and ``total_bytes``,
     for one signal-scheduler kernel INSTANCE."""
     desc_workspace_bytes = kernel.get_desc_workspace_bytes()
-    capacity = const_expr(kernel.signal_capacity)
+    capacity = const_expr(kernel.streaming_signal_capacity)
     # The state must hold a word per expert, assigned_claim_count and a 4-word record per M-tile: a kernel that sized
     # it otherwise overruns the workspace, and the scheduler hangs or faults.
-    state_bytes = kernel.get_workspace_bytes() - (desc_workspace_bytes + scheduler_state_offset(capacity))
+    state_bytes = kernel.get_workspace_bytes() - (desc_workspace_bytes + streaming_scheduler_state_offset(capacity))
     assert state_bytes >= 4 * (
         kernel.expert_cnt + 1 + 4 * capacity
     ), f"state of {state_bytes} bytes: {kernel.expert_cnt} experts, capacity {capacity} do not fit"
@@ -134,35 +134,18 @@ def signal_workspace_offsets(kernel) -> Dict[str, int]:
         # One ready flag per tile: signal[t] is t once tile t is complete.  signal_ptr()
         # names this same address on the device.
         "signal": desc_workspace_bytes + SIGNAL_OFFSET,
-        "state": desc_workspace_bytes + scheduler_state_offset(capacity),
-        "signal_capacity": capacity,
+        "state": desc_workspace_bytes + streaming_scheduler_state_offset(capacity),
+        "streaming_signal_capacity": capacity,
         "total_bytes": kernel.get_workspace_bytes(),
     }
 
 
 def signal_launch_kwargs(kernel) -> Dict[str, Int32]:
-    """``kernel``'s keyword arguments at compile and at every launch: ``signal_capacity`` for a signal consumer that
+    """``kernel``'s keyword arguments at compile and at every launch: ``streaming_signal_capacity`` for a signal consumer that
     takes it at launch (SIGNAL_CAPACITY_AT_LAUNCH), else none."""
-    if getattr(kernel, "SIGNAL_CAPACITY_AT_LAUNCH", False) and kernel.use_signal_sched:
-        return {"signal_capacity": Int32(kernel.signal_capacity)}
+    if getattr(kernel, "SIGNAL_CAPACITY_AT_LAUNCH", False) and kernel.use_streaming_signal_sched:
+        return {"streaming_signal_capacity": Int32(kernel.streaming_signal_capacity)}
     return {}
-
-
-def signal_workspace_words(workspace, kernel) -> Dict:
-    """``workspace``'s int32 words a reset writes: the claim ``counter``, the scheduler ``state`` and
-    ``signal[]`` (``signal_workspace_offsets``)."""
-    import torch
-
-    offsets = signal_workspace_offsets(kernel)
-    # view() on the byte buffer keeps a single allocation and a single pointer; the
-    # offsets are 4-byte aligned because get_desc_workspace_bytes() is.
-    int32_words = workspace.view(torch.int32)
-    capacity = const_expr(offsets["signal_capacity"])
-    return {
-        "counter": int32_words[offsets["counter"] // 4 : offsets["counter"] // 4 + 1],
-        "state": int32_words[offsets["state"] // 4 : offsets["total_bytes"] // 4],
-        "signal": int32_words[offsets["signal"] // 4 : offsets["signal"] // 4 + capacity],
-    }
 
 
 def reset_signal_workspace(workspace, kernel, all_complete: bool = False) -> None:
@@ -170,10 +153,13 @@ def reset_signal_workspace(workspace, kernel, all_complete: bool = False) -> Non
     -1, or ``signal[t] = t`` with ``all_complete`` (every tile ready, as with no producer)."""
     import torch
 
-    words = signal_workspace_words(workspace, kernel)
-    words["counter"].fill_(0)
-    words["state"].fill_(0)
-    signal = words["signal"]
+    offsets = streaming_signal_workspace_offsets(kernel)
+    # A view of the byte buffer: the offsets are 4-byte aligned because get_desc_workspace_bytes() is.
+    int32_words = workspace.view(torch.int32)
+    counter_word, signal_word = offsets["counter"] // 4, offsets["signal"] // 4
+    int32_words[counter_word : counter_word + 1].fill_(0)
+    int32_words[offsets["state"] // 4 : offsets["total_bytes"] // 4].fill_(0)
+    signal = int32_words[signal_word : signal_word + offsets["streaming_signal_capacity"]]
     # Never zero-fill signal[]: any value >= 0 reads as complete.
     if all_complete:
         signal.copy_(torch.arange(signal.numel(), dtype=torch.int32, device=workspace.device))

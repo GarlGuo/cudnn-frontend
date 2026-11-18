@@ -22,7 +22,7 @@ from cutlass._mlir.dialects import llvm
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineUserType, make_pipeline_state
 from .moe_signal_helpers import (
-    scheduler_state_offset,
+    streaming_scheduler_state_offset,
     signal_ptr,
     mbarrier_arrive_expect_tx_on_peer_relaxed_cluster,
     fence_release_cluster,
@@ -42,10 +42,10 @@ from .moe_persistent_scheduler import (
 EXPERT_BATCH_MAX_M_TILES = 16
 
 
-def _state_words(signal_capacity, expert_cnt: int) -> dict:
+def _state_words(streaming_signal_capacity, expert_cnt: int) -> dict:
     """Int32 word offset of each piece of the scheduler state, and the total (an Int32 capacity: the launch's).  The
     reset is all zero; a batch record needs none, being written before ``assigned_claim_count`` exposes it."""
-    capacity = signal_capacity
+    capacity = streaming_signal_capacity
     # Indexed by expert, and a capacity can be below expert_cnt: fewer routed rows than experts.
     expert_table_words = max(capacity, expert_cnt) if isinstance(capacity, int) else cutlass.max(capacity, Int32(expert_cnt))
     # A batch record is 4 words per M-tile; then, per expert, 1 + the first claim number of its last batch (0: none).
@@ -59,25 +59,25 @@ def _state_words(signal_capacity, expert_cnt: int) -> dict:
     }
 
 
-def check_work_slot_range(intermediate, cluster_tile_n: int, signal_capacity, fused_tail_max_rows: int) -> None:
+def check_work_slot_range(intermediate, cluster_tile_n: int, streaming_signal_capacity, fused_tail_max_rows: int) -> None:
     """Build-time bounds on a work slot (slot * Q_N + N tile): N > 0, and every slot, END included, below the flag bit
     ``FUSED_UNIT`` with fused tails, else 2^31."""
     assert isinstance(intermediate, int), f"the signal scheduler needs a build-time N (dense B), not {intermediate}"
     assert intermediate > 0, f"the signal scheduler needs N > 0 (a work slot // Q_N), got N = {intermediate}"
-    assert isinstance(signal_capacity, int) or not fused_tail_max_rows, "fused tails need a build-time signal_capacity"
-    if isinstance(signal_capacity, int):
+    assert isinstance(streaming_signal_capacity, int) or not fused_tail_max_rows, "fused tails need a build-time streaming_signal_capacity"
+    if isinstance(streaming_signal_capacity, int):
         n_tiles_per_m_tile = -(-intermediate // cluster_tile_n)  # host-side: moe_utils.ceil_div is @cute.jit
         work_slot_limit = FUSED_UNIT if fused_tail_max_rows else 2**31
-        assert signal_capacity * n_tiles_per_m_tile < work_slot_limit, (
-            f"signal_capacity {signal_capacity} x Q_N {n_tiles_per_m_tile} work slots reach {work_slot_limit:#x}"
+        assert streaming_signal_capacity * n_tiles_per_m_tile < work_slot_limit, (
+            f"streaming_signal_capacity {streaming_signal_capacity} x Q_N {n_tiles_per_m_tile} work slots reach {work_slot_limit:#x}"
             f"{' (FUSED_UNIT, fused tails on)' if fused_tail_max_rows else ''}"
         )
 
 
-def signal_workspace_bytes_after_counter(signal_capacity: int, expert_cnt: int) -> int:
+def signal_workspace_bytes_after_counter(streaming_signal_capacity: int, expert_cnt: int) -> int:
     """Workspace bytes past the 4-byte claim counter: ``signal[]``, the padding to a 128-byte
     line, then the scheduler state (see ``_state_words``)."""
-    return const_expr(scheduler_state_offset(signal_capacity) - 4 + 4 * _state_words(signal_capacity, expert_cnt)["total"])
+    return const_expr(streaming_scheduler_state_offset(streaming_signal_capacity) - 4 + 4 * _state_words(streaming_signal_capacity, expert_cnt)["total"])
 
 
 @cute.jit
@@ -280,7 +280,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         dynamic_state: _DynamicSchedState,
         sched_storage,
         cluster_pipeline,
-        signal_capacity: int | Int32,
+        streaming_signal_capacity: int | Int32,
         device_layout: bool,
         slot_rows: int = None,
         fused_tail_max_rows: int = 0,
@@ -294,7 +294,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         self.cluster_pipeline = cluster_pipeline
         # Never serialized: it only places the scheduler state, whose pointer is derived from it.  An int folds into
         # the build; an Int32 is the launch's (a kernel parameter, so it needs no register of its own).
-        self.signal_capacity = signal_capacity
+        self.streaming_signal_capacity = streaming_signal_capacity
         self.device_layout = device_layout
         # Rows per ``signal[]`` slot, codegen-time; an M-tile spans ``slots_per_m_tile`` slots.
         self.slot_rows = slot_rows or params.cluster_tile_m
@@ -310,7 +310,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         assert (
             not fused_tail_max_rows or self.slot_rows <= fused_tail_max_rows
         ), f"fused tails of {fused_tail_max_rows} rows need slots of at most as many rows, not {self.slot_rows}"
-        check_work_slot_range(params.intermediate, params.cluster_tile_n, signal_capacity, fused_tail_max_rows)
+        check_work_slot_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity, fused_tail_max_rows)
         # mapa.shared::cluster at one CTA is an illegal peer store.  This assert is the only
         # guard: no kernel checks its cluster shape for the signal scheduler.
         assert const_expr(
@@ -341,7 +341,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
             dynamic_state=take(self._dynamic_state),
             sched_storage=self._sched_storage,
             cluster_pipeline=self.cluster_pipeline,
-            signal_capacity=self.signal_capacity,
+            streaming_signal_capacity=self.streaming_signal_capacity,
             device_layout=const_expr(self.device_layout),
             slot_rows=const_expr(self.slot_rows),
             fused_tail_max_rows=const_expr(self.fused_tail_max_rows),
@@ -355,7 +355,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         counter_ptr: cute.Pointer,
         sched_storage,
         *,
-        signal_capacity: int | Int32,
+        streaming_signal_capacity: int | Int32,
         device_layout: bool = False,
         slot_rows: int = None,
         fused_tail_max_rows: int = 0,
@@ -389,7 +389,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
             dynamic_state=dynamic_state,
             sched_storage=sched_storage,
             cluster_pipeline=None,
-            signal_capacity=signal_capacity,
+            streaming_signal_capacity=streaming_signal_capacity,
             device_layout=device_layout,
             slot_rows=slot_rows,
             fused_tail_max_rows=fused_tail_max_rows,
@@ -446,7 +446,10 @@ class MoEStreamingInputBlockSignalTileScheduler:
         return cute.make_ptr(
             Int32,
             self._dynamic_state.counter_ptr.toint()
-            + (scheduler_state_offset(self.signal_capacity) + 4 * _state_words(self.signal_capacity, self.params.expert_cnt)[piece]),
+            + (
+                streaming_scheduler_state_offset(self.streaming_signal_capacity)
+                + 4 * _state_words(self.streaming_signal_capacity, self.params.expert_cnt)[piece]
+            ),
             AddressSpace.gmem,
             assumed_align=4,
         )

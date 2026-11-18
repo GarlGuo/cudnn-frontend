@@ -211,11 +211,16 @@ class OutputNotifyConfig:
         self.workspace_bytes = 4 * n_chunk_capacity if self.enabled else 0
 
     def bind(
-        self, cta_tile_mn: Tuple[int, int], expert_cnt: int, use_signal_sched: bool, tail_rows_alignment: Optional[int] = None, fused_tail_max_rows: int = 0
+        self,
+        cta_tile_mn: Tuple[int, int],
+        expert_cnt: int,
+        use_streaming_signal_sched: bool,
+        tail_rows_alignment: Optional[int] = None,
+        fused_tail_max_rows: int = 0,
     ) -> "OutputNotifyConfig":
         """A copy tied to one kernel's CTA tile and expert count; ``tail_rows_alignment``: expert row alignment when
         below the 2-CTA tile M (last M tile may be a tail); ``fused_tail_max_rows``: count M units."""
-        assert not (use_signal_sched and self.enabled), "output notification is an FC2 feature; the signal scheduler is FC1's"
+        assert not (use_streaming_signal_sched and self.enabled), "output notification is an FC2 feature; the signal scheduler is FC1's"
         assert not self.enabled or self.n_chunk_size % cta_tile_mn[1] == 0, f"N chunk {self.n_chunk_size} must be a multiple of CTA tile N {cta_tile_mn[1]}"
         bound = copy.copy(self)
         bound.cta_tile_m, bound.cta_tile_n = cta_tile_mn

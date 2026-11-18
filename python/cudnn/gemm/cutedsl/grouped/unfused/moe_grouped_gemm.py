@@ -72,13 +72,14 @@ class MoEGroupedGemmBf16Kernel:
     :param expert_cnt: Number of experts.
     :param weight_mode: ``MoEWeightMode.DENSE`` or ``MoEWeightMode.DISCRETE``.
     :param use_dynamic_sched: Enable dynamic tile scheduling.
-    :param signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
+    :param streaming_signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
         runs ``MoEStreamingInputBlockSignalTileScheduler`` and starts each M tile once the producer marks it ready.
         Needs ``use_dynamic_sched``.
     :param output_notify: ``OutputNotifyConfig``; ``N_CHUNK`` publishes each finished chunk of D columns to a
-        streaming consumer (``MoEStreamingOutputChunkSignalTileScheduler``). Not combined with ``signal_capacity``.
-    :param device_layout: With ``signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
-        and the scheduler waits for them.
+        streaming consumer (``MoEStreamingOutputChunkSignalTileScheduler``). Not combined with ``streaming_signal_capacity``.
+    :param device_layout: With ``streaming_signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
+        and the scheduler waits for them. ``padded_offsets`` must then be ``layout[1:E+1]`` of an ``E + 1`` int32
+        buffer that the caller sets to ``INT32_MAX`` before the producer starts (``layout[0]`` is read too).
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
         for that grid before it exits.
     :param launch_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
@@ -139,7 +140,7 @@ class MoEGroupedGemmBf16Kernel:
         expert_cnt: int,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
-        signal_capacity: Optional[int] = None,
+        streaming_signal_capacity: Optional[int] = None,
         output_notify: Optional[OutputNotifyConfig] = None,
         device_layout: bool = False,
         use_pdl: bool = False,
@@ -205,21 +206,21 @@ class MoEGroupedGemmBf16Kernel:
         self.use_dynamic_sched = use_dynamic_sched
         self.num_epilog_warps = len(self.epilog_warp_id)
 
-        self.signal_capacity = signal_capacity
-        self.use_signal_sched = signal_capacity is not None
-        if self.use_signal_sched and not use_dynamic_sched:
-            raise ValueError("signal_capacity requires use_dynamic_sched=True")
-        if device_layout and not self.use_signal_sched:
-            raise ValueError("device_layout requires signal_capacity")
+        self.streaming_signal_capacity = streaming_signal_capacity
+        self.use_streaming_signal_sched = streaming_signal_capacity is not None
+        if self.use_streaming_signal_sched and not use_dynamic_sched:
+            raise ValueError("streaming_signal_capacity requires use_dynamic_sched=True")
+        if device_layout and not self.use_streaming_signal_sched:
+            raise ValueError("device_layout requires streaming_signal_capacity")
         self.device_layout = device_layout
         self.use_pdl = use_pdl
         self.launch_dependents_at_entry = launch_dependents_at_entry
         self.output_notify = (output_notify or OutputNotifyConfig()).bind(
-            (mma_tiler_mn[0] // (2 if use_2cta_instrs else 1), mma_tiler_mn[1]), expert_cnt, self.use_signal_sched
+            (mma_tiler_mn[0] // (2 if use_2cta_instrs else 1), mma_tiler_mn[1]), expert_cnt, self.use_streaming_signal_sched
         )
         if self.output_notify.enabled and not use_dynamic_sched:
             raise ValueError("output_notify requires use_dynamic_sched=True")
-        if self.use_signal_sched or self.output_notify.enabled:
+        if self.use_streaming_signal_sched or self.output_notify.enabled:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
 
     # ------------------------------------------------------------------
@@ -378,7 +379,7 @@ class MoEGroupedGemmBf16Kernel:
     def get_workspace_bytes(self) -> int:
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        signal_workspace_bytes = signal_workspace_bytes_after_counter(self.signal_capacity, self.expert_cnt) if self.use_signal_sched else 0
+        signal_workspace_bytes = signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
         return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes + self.output_notify.workspace_bytes
 
     @cute.jit
@@ -454,7 +455,7 @@ class MoEGroupedGemmBf16Kernel:
             store_tma_desc(tma_atom_b, workspace.get_ptr("b", expert_idx))
 
         # The signal scheduler's counter is reset by the caller together with signal[].
-        if cutlass.const_expr(self.use_dynamic_sched and not self.use_signal_sched):
+        if cutlass.const_expr(self.use_dynamic_sched and not self.use_streaming_signal_sched):
             if expert_idx == cutlass.Int32(0):
                 sched_counter = cute.make_tensor(
                     self._get_sched_counter_ptr(workspace_ptr),
@@ -589,7 +590,7 @@ class MoEGroupedGemmBf16Kernel:
         )
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_signal_sched))
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_streaming_signal_sched))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -619,7 +620,7 @@ class MoEGroupedGemmBf16Kernel:
             sched_expert_shape = (self.expert_cnt, n, k)
         self.output_notify.check_output_cols(sched_expert_shape[1])
 
-        if cutlass.const_expr(self.use_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched):
             sched_params = MoEInputBlockSignalSchedulerParams(
                 expert_shape=sched_expert_shape,
                 cta_tile_shape_mnk=self.cta_tile_shape_mnk,
@@ -872,13 +873,13 @@ class MoEGroupedGemmBf16Kernel:
             sBias = storage.sBias.get_tensor(bias_smem_layout_staged)
 
         # ---- Scheduler and TMEM allocator ----
-        if cutlass.const_expr(self.use_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched):
             scheduler = MoEStreamingInputBlockSignalTileScheduler.create(
                 sched_params,
                 padded_offsets,
                 counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
                 sched_storage=sched_storage,
-                signal_capacity=self.signal_capacity,
+                streaming_signal_capacity=self.streaming_signal_capacity,
                 device_layout=self.device_layout,
             )
         else:
@@ -1091,7 +1092,7 @@ class MoEGroupedGemmBf16Kernel:
                 tBgB_slice = tBgB[(None, mma_tile_coord_n, None, 0)]
 
                 # The producer wrote A through the generic proxy: order it before this tile's TMA loads.
-                if cutlass.const_expr(self.use_signal_sched):
+                if cutlass.const_expr(self.use_streaming_signal_sched):
                     cute.arch.fence_proxy("async.global")
 
                 ab_producer_state.reset_count()
@@ -1431,7 +1432,7 @@ class MoEGroupedGemmBf16Kernel:
             d_pipeline.producer_tail()
 
         # The signal scheduler's last cluster handoff writes into a peer's shared memory: all threads wait here.
-        if cutlass.const_expr(self.use_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched):
             scheduler.internal_finalize()
         # Work after this kernel on the stream must also follow the grid this launch overlapped.
         if cutlass.const_expr(self.use_pdl):

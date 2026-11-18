@@ -73,14 +73,15 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         - m_aligned parameter in create_mask() MUST equal FIX_PAD_SIZE (256)
         - Each padded_offsets[i] will be a multiple of FIX_PAD_SIZE (guaranteed by m_aligned == FIX_PAD_SIZE)
 
-    :param signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
+    :param streaming_signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
         runs ``MoEStreamingInputBlockSignalTileScheduler`` and starts each M tile once the producer marks it ready.
         Needs ``use_dynamic_sched``.
-    :param device_layout: With ``signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
-        and the scheduler waits for them.
+    :param device_layout: With ``streaming_signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
+        and the scheduler waits for them. ``padded_offsets`` must then be ``layout[1:E+1]`` of an ``E + 1`` int32
+        buffer that the caller sets to ``INT32_MAX`` before the producer starts (``layout[0]`` is read too).
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
         for that grid before it exits.
-    :param launch_dependents_at_slots_ready: With ``signal_capacity``: one extra warp per CTA lets this kernel's
+    :param launch_dependents_at_slots_ready: With ``streaming_signal_capacity``: one extra warp per CTA lets this kernel's
         programmatic dependent launch once it has seen every ``signal[]`` slot ready.
     """
 
@@ -139,7 +140,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         act_func: str = "swiglu",
         enable_bias: bool = False,
         generate_c: bool = False,
-        signal_capacity: Optional[int] = None,
+        streaming_signal_capacity: Optional[int] = None,
         device_layout: bool = False,
         use_pdl: bool = False,
         launch_dependents_at_slots_ready: bool = False,
@@ -220,15 +221,15 @@ class MoEGroupedGemmGluBiasBf16Kernel:
 
         self.act_func = act_func
 
-        self.signal_capacity = signal_capacity
-        self.use_signal_sched = signal_capacity is not None
-        if self.use_signal_sched and not use_dynamic_sched:
-            raise ValueError("signal_capacity requires use_dynamic_sched=True")
-        if device_layout and not self.use_signal_sched:
-            raise ValueError("device_layout requires signal_capacity")
-        if launch_dependents_at_slots_ready and not self.use_signal_sched:
-            raise ValueError("launch_dependents_at_slots_ready requires signal_capacity")
-        if self.use_signal_sched:
+        self.streaming_signal_capacity = streaming_signal_capacity
+        self.use_streaming_signal_sched = streaming_signal_capacity is not None
+        if self.use_streaming_signal_sched and not use_dynamic_sched:
+            raise ValueError("streaming_signal_capacity requires use_dynamic_sched=True")
+        if device_layout and not self.use_streaming_signal_sched:
+            raise ValueError("device_layout requires streaming_signal_capacity")
+        if launch_dependents_at_slots_ready and not self.use_streaming_signal_sched:
+            raise ValueError("launch_dependents_at_slots_ready requires streaming_signal_capacity")
+        if self.use_streaming_signal_sched:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
         self.device_layout = device_layout
         self.use_pdl = use_pdl
@@ -429,7 +430,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         """Return descriptor workspace plus optional dynamic scheduler state."""
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        signal_workspace_bytes = signal_workspace_bytes_after_counter(self.signal_capacity, self.expert_cnt) if self.use_signal_sched else 0
+        signal_workspace_bytes = signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
         return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes
 
     @cute.jit
@@ -504,7 +505,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             store_tma_desc(tma_atom_b, workspace.get_ptr("b", expert_idx))
 
         # The signal scheduler's counter is reset by the caller together with signal[].
-        if cutlass.const_expr(self.use_dynamic_sched and not self.use_signal_sched):
+        if cutlass.const_expr(self.use_dynamic_sched and not self.use_streaming_signal_sched):
             if expert_idx == cutlass.Int32(0):
                 sched_counter = cute.make_tensor(
                     self._get_sched_counter_ptr(workspace_ptr),
@@ -640,7 +641,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             self.epi_tile,
         )
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_signal_sched))
+        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_streaming_signal_sched))
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -668,7 +669,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
 
-        if cutlass.const_expr(self.use_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched):
             sched_params = MoEInputBlockSignalSchedulerParams(
                 expert_shape=sched_expert_shape,
                 cta_tile_shape_mnk=self.cta_tile_shape_mnk,
@@ -1071,13 +1072,13 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             consumer_group=tile_info_pipeline_consumer_group,
         )
 
-        if cutlass.const_expr(self.use_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched):
             scheduler = MoEStreamingInputBlockSignalTileScheduler.create(
                 sched_params,
                 padded_offsets,
                 counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
                 sched_storage=sched_storage,
-                signal_capacity=self.signal_capacity,
+                streaming_signal_capacity=self.streaming_signal_capacity,
                 device_layout=self.device_layout,
             )
         else:
@@ -1295,7 +1296,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
                 tBgB_slice = tBgB[(None, mma_tile_coord_n, None, 0)]
 
                 # The producer wrote A through the generic proxy: order it before this tile's TMA loads.
-                if cutlass.const_expr(self.use_signal_sched):
+                if cutlass.const_expr(self.use_streaming_signal_sched):
                     cute.arch.fence_proxy("async.global")
 
                 # Peek (try_wait) AB buffer empty
@@ -1891,7 +1892,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             d_pipeline.producer_tail()
 
         # The signal scheduler's last cluster handoff writes into a peer's shared memory: all threads wait here.
-        if cutlass.const_expr(self.use_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched):
             scheduler.internal_finalize()
         # Work after this kernel on the stream must also follow the grid this launch overlapped.
         if cutlass.const_expr(self.use_pdl):
