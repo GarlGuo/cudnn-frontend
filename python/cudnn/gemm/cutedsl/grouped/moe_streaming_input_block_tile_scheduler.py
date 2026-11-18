@@ -103,29 +103,22 @@ def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     return Int32(value)
 
 
-#: Pause between two polls of an incomplete slot in ``_poll_until_at_least`` (nanosleep; the sleep may be longer).
-SLOT_POLL_SLEEP_NS = 256
-
-
 @cute.jit
 def _poll_until_at_least(ptr, floor: cutlass.Constexpr) -> None:
-    """Block, without bound, until ``*ptr >= floor``: relaxed gpu-scope loads (no L1 invalidation), a short nanosleep
-    between them.  It acquires nothing: for a caller that reads nothing the writer published."""
+    """Block, without bound, until ``*ptr >= floor``.  Relaxed gpu-scope loads (no L1 invalidation per poll): the
+    caller reads nothing the writer published, so it needs no acquire."""
     address = llvm.ptrtoint(T.i64(), ptr.llvm_ptr)
     llvm.inline_asm(
         res=None,
         operands_=[address, Int32(floor).ir_value()],
-        asm_string=f"""{{
+        asm_string="""{
             .reg .pred P_pl;
             .reg .b32 V_pl;
-        POLL_${{:uid}}:
+        POLL_${:uid}:
             ld.relaxed.gpu.global.b32 V_pl, [$0];
-            setp.ge.s32 P_pl, V_pl, $1;
-            @P_pl bra POLL_DONE_${{:uid}};
-            nanosleep.u32 {SLOT_POLL_SLEEP_NS};
-            bra POLL_${{:uid}};
-        POLL_DONE_${{:uid}}:
-        }}""",
+            setp.lt.s32 P_pl, V_pl, $1;
+            @P_pl bra POLL_${:uid};
+        }""",
         constraints="l,r",
         has_side_effects=True,
         is_align_stack=False,
