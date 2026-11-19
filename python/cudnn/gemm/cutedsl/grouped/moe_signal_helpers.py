@@ -14,16 +14,16 @@ from cutlass._mlir.dialects import llvm, nvvm
 
 #: Bytes from the claim counter to ``signal[]``.  ``streaming_signal_workspace_offsets`` is the host's
 #: view of the same map.
-SIGNAL_OFFSET = 4
+STREAMING_SIGNAL_OFFSET = 4
 
 
 @dsl_user_op
-def signal_ptr(counter_ptr, *, loc=None, ip=None):
+def streaming_signal_ptr(counter_ptr, *, loc=None, ip=None):
     """Base of ``signal[]`` as an ``Int32`` pointer (``+ t`` advances ``4 * t`` bytes), derived
     from the claim counter's pointer so the scheduler serializes no second one."""
     return cute.make_ptr(
         Int32,
-        counter_ptr.toint() + SIGNAL_OFFSET,
+        counter_ptr.toint() + STREAMING_SIGNAL_OFFSET,
         AddressSpace.gmem,
         assumed_align=4,
     )
@@ -65,7 +65,7 @@ def mbarrier_try_wait_parity_acquire_cluster(mbar_ptr, phase: Int32, *, loc=None
 def streaming_scheduler_state_offset(streaming_signal_capacity: int) -> int:
     """Bytes from the claim counter to the scheduler state: past ``signal[]``, rounded up to 128 so the producer-written
     flags and the scheduler's own words share no 128-byte line."""
-    return -(-(SIGNAL_OFFSET + 4 * streaming_signal_capacity) // 128) * 128
+    return -(-(STREAMING_SIGNAL_OFFSET + 4 * streaming_signal_capacity) // 128) * 128
 
 
 def streaming_signal_workspace_offsets(kernel) -> Dict[str, int]:
@@ -82,16 +82,16 @@ def streaming_signal_workspace_offsets(kernel) -> Dict[str, int]:
     return {
         # The claim counter is the stock dynamic scheduler's own counter word.
         "counter": desc_workspace_bytes,
-        # One ready flag per tile: signal[t] is t once tile t is complete.  signal_ptr()
+        # One ready flag per tile: signal[t] is t once tile t is complete.  streaming_signal_ptr()
         # names this same address on the device.
-        "signal": desc_workspace_bytes + SIGNAL_OFFSET,
+        "signal": desc_workspace_bytes + STREAMING_SIGNAL_OFFSET,
         "state": desc_workspace_bytes + streaming_scheduler_state_offset(capacity),
         "streaming_signal_capacity": capacity,
         "total_bytes": kernel.get_workspace_bytes(),
     }
 
 
-def reset_signal_workspace(workspace, kernel, all_complete: bool = False) -> None:
+def reset_streaming_signal_workspace(workspace, kernel, all_complete: bool = False) -> None:
     """Make ``workspace`` ready for one launch: claim counter and scheduler state 0, ``signal[]``
     -1, or ``signal[t] = t`` with ``all_complete`` (every tile ready, as with no producer)."""
     import torch

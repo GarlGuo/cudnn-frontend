@@ -50,9 +50,9 @@ from ..moe_kernel_helpers import (
 from ..moe_streaming_input_block_tile_scheduler import (
     MoEInputBlockSignalSchedulerParams,
     MoEStreamingInputBlockSignalTileScheduler,
-    signal_workspace_bytes_after_counter,
+    streaming_signal_workspace_bytes_after_counter,
 )
-from ..moe_streaming_output_chunk_tile_scheduler import OutputNotifyConfig
+from ..moe_streaming_output_chunk_tile_scheduler import StreamingOutputNotifyConfig
 
 
 class MoEGroupedGemmBf16Kernel:
@@ -75,7 +75,7 @@ class MoEGroupedGemmBf16Kernel:
     :param streaming_signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
         runs ``MoEStreamingInputBlockSignalTileScheduler`` and starts each M tile once the producer marks it ready.
         Needs ``use_dynamic_sched``.
-    :param output_notify: ``OutputNotifyConfig``; ``N_CHUNK`` publishes each finished chunk of D columns to a
+    :param streaming_output_notify: ``StreamingOutputNotifyConfig``; ``N_CHUNK`` publishes each finished chunk of D columns to a
         streaming consumer (``MoEStreamingOutputChunkSignalTileScheduler``). Not combined with ``streaming_signal_capacity``.
     :param device_layout: With ``streaming_signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
         and the scheduler waits for them. ``padded_offsets`` must then be ``layout[1:E+1]`` of an ``E + 1`` int32
@@ -139,7 +139,7 @@ class MoEGroupedGemmBf16Kernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = False,
         streaming_signal_capacity: Optional[int] = None,
-        output_notify: Optional[OutputNotifyConfig] = None,
+        streaming_output_notify: Optional[StreamingOutputNotifyConfig] = None,
         device_layout: bool = False,
         use_pdl: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
@@ -213,12 +213,12 @@ class MoEGroupedGemmBf16Kernel:
         self.device_layout = device_layout
         self.use_pdl = use_pdl
         self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
-        self.output_notify = (output_notify or OutputNotifyConfig()).bind(
+        self.streaming_output_notify = (streaming_output_notify or StreamingOutputNotifyConfig()).bind(
             (mma_tiler_mn[0] // (2 if use_2cta_instrs else 1), mma_tiler_mn[1]), expert_cnt, self.use_streaming_signal_sched
         )
-        if self.output_notify.enabled and not use_dynamic_sched:
-            raise ValueError("output_notify requires use_dynamic_sched=True")
-        if self.use_streaming_signal_sched or self.output_notify.enabled:
+        if self.streaming_output_notify.enabled and not use_dynamic_sched:
+            raise ValueError("streaming_output_notify requires use_dynamic_sched=True")
+        if self.use_streaming_signal_sched or self.streaming_output_notify.enabled:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
 
     # ------------------------------------------------------------------
@@ -377,8 +377,10 @@ class MoEGroupedGemmBf16Kernel:
     def get_workspace_bytes(self) -> int:
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        signal_workspace_bytes = signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
-        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes + self.output_notify.workspace_bytes
+        signal_workspace_bytes = (
+            streaming_signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
+        )
+        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes + self.streaming_output_notify.workspace_bytes
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -608,7 +610,7 @@ class MoEGroupedGemmBf16Kernel:
                 stream=stream,
                 min_blocks_per_mp=1,
             )
-        self.output_notify.launch_reset(workspace_ptr, self.get_workspace_bytes(), stream)
+        self.streaming_output_notify.launch_reset(workspace_ptr, self.get_workspace_bytes(), stream)
 
         # ---- Grid computation via MoE scheduler ----
         if cutlass.const_expr(self.weight_mode == MoEWeightMode.DENSE):
@@ -616,7 +618,7 @@ class MoEGroupedGemmBf16Kernel:
             sched_expert_shape = (self.expert_cnt, b_n, b_k)
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
-        self.output_notify.check_output_cols(sched_expert_shape[1])
+        self.streaming_output_notify.check_output_cols(sched_expert_shape[1])
 
         if cutlass.const_expr(self.use_streaming_signal_sched):
             sched_params = MoEInputBlockSignalSchedulerParams(
@@ -889,7 +891,7 @@ class MoEGroupedGemmBf16Kernel:
                 counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
                 sched_storage=sched_storage,
             )
-        scheduler = self.output_notify.tile_order(scheduler)
+        scheduler = self.streaming_output_notify.tile_order(scheduler)
         scheduler.internal_init()
 
         tmem = TmemAllocator(
@@ -1250,8 +1252,8 @@ class MoEGroupedGemmBf16Kernel:
                 bias_s2r_tom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.bias_dtype, num_bits_per_copy=128)
                 tTR_rBias = cute.make_rmem_tensor(cute.make_layout(self.epi_tile[1]), self.bias_dtype)
 
-            output_notifier = self.output_notify.make_notifier(workspace_ptr, self.get_workspace_bytes(), sched_params.intermediate)
-            notify_state = output_notifier.make_state()
+            streaming_output_notifier = self.streaming_output_notify.make_notifier(workspace_ptr, self.get_workspace_bytes(), sched_params.intermediate)
+            streaming_output_notify_state = streaming_output_notifier.make_state()
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
                 epi_work_tile_info = MoEWorkTileInfo(
@@ -1312,7 +1314,7 @@ class MoEGroupedGemmBf16Kernel:
                 tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_stage_index)]
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
                 if warp_idx == self.epilog_warp_id[0]:
-                    notify_state = output_notifier.begin_tile(notify_state, epi_work_tile_info, padded_offsets)
+                    streaming_output_notify_state = streaming_output_notifier.begin_tile(streaming_output_notify_state, epi_work_tile_info, padded_offsets)
                 acc_pipeline.consumer_wait(acc_consumer_state)
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
 
@@ -1402,7 +1404,7 @@ class MoEGroupedGemmBf16Kernel:
                         d_pipeline.producer_acquire()
                     self.epilog_sync_barrier.arrive_and_wait()
                 if warp_idx == self.epilog_warp_id[0]:
-                    notify_state = output_notifier.end_tile(notify_state)
+                    streaming_output_notify_state = streaming_output_notifier.end_tile(streaming_output_notify_state)
 
                 with cute.arch.elect_one():
                     acc_pipeline.consumer_release(acc_consumer_state)
@@ -1424,7 +1426,7 @@ class MoEGroupedGemmBf16Kernel:
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
             if warp_idx == self.epilog_warp_id[0]:
-                output_notifier.finalize(notify_state, padded_offsets)
+                streaming_output_notifier.finalize(streaming_output_notify_state, padded_offsets)
             if cutlass.const_expr(self.generate_c):
                 c_pipeline.producer_tail()
             d_pipeline.producer_tail()

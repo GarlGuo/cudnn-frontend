@@ -53,7 +53,7 @@ from ..moe_kernel_helpers import (
 from ..moe_streaming_input_block_tile_scheduler import (
     MoEInputBlockSignalSchedulerParams,
     MoEStreamingInputBlockSignalTileScheduler,
-    signal_workspace_bytes_after_counter,
+    streaming_signal_workspace_bytes_after_counter,
 )
 
 
@@ -428,7 +428,9 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         """Return descriptor workspace plus optional dynamic scheduler state."""
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        signal_workspace_bytes = signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
+        signal_workspace_bytes = (
+            streaming_signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
+        )
         return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes
 
     @cute.jit

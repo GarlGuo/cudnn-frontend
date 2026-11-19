@@ -136,9 +136,9 @@ def plain_reference(problem):
 
 
 def signal_ready(kernel):
-    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_signal_workspace
+    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_streaming_signal_workspace
 
-    return lambda workspace: reset_signal_workspace(workspace, kernel, all_complete=True)
+    return lambda workspace: reset_streaming_signal_workspace(workspace, kernel, all_complete=True)
 
 
 def valid_rows(problem):
@@ -199,13 +199,13 @@ def test_signal_consumer_waits_for_producer():
     stock_c, stock_d, _ = run(make_kernel(False, use_dynamic_sched=True), dict(problem, a=final_a), False)
     torch.cuda.synchronize()
 
-    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_signal_workspace, streaming_signal_workspace_offsets
+    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
 
     gemm_stream, producer_stream = torch.cuda.Stream(), torch.cuda.Stream()
     holder = {}
 
     def prepare(workspace):
-        reset_signal_workspace(workspace, kernel)
+        reset_streaming_signal_workspace(workspace, kernel)
         signal_word = streaming_signal_workspace_offsets(kernel)["signal"] // 4
         holder["signal"] = workspace.view(torch.int32)[signal_word : signal_word + capacity]
 
@@ -213,7 +213,7 @@ def test_signal_consumer_waits_for_producer():
     c, d, workspace, launch = run(kernel, problem, False, max_active_clusters=4, stream=gemm_stream, defer_launch=True)
     # One launch with every signal slot ready loads the GEMM's module: under lazy loading a first launch waits for running work.
     with torch.cuda.stream(gemm_stream):
-        reset_signal_workspace(workspace, kernel, all_complete=True)
+        reset_streaming_signal_workspace(workspace, kernel, all_complete=True)
     launch()
     torch.cuda.synchronize()
     c.fill_(float("nan"))
@@ -253,13 +253,13 @@ def test_device_layout_waits_for_producer(glu):
     stock_c, stock_d, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
     torch.cuda.synchronize()
 
-    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_signal_workspace, streaming_signal_workspace_offsets
+    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
 
     gemm_stream, producer_stream = torch.cuda.Stream(), torch.cuda.Stream()
     c, d, workspace, launch = run(kernel, problem, glu, max_active_clusters=4, stream=gemm_stream, defer_launch=True)
     # One launch with the layout written and every signal slot ready loads the module (lazy loading waits for running work).
     with torch.cuda.stream(gemm_stream):
-        reset_signal_workspace(workspace, kernel, all_complete=True)
+        reset_streaming_signal_workspace(workspace, kernel, all_complete=True)
     launch()
     torch.cuda.synchronize()
     signal_word = streaming_signal_workspace_offsets(kernel)["signal"] // 4
@@ -270,7 +270,7 @@ def test_device_layout_waits_for_producer(glu):
     problem["layout"].fill_(-1)
     gemm_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(gemm_stream):
-        reset_signal_workspace(workspace, kernel)
+        reset_streaming_signal_workspace(workspace, kernel)
     producer_stream.wait_stream(gemm_stream)
     # Producer launches go before the GEMM's; the sleep makes the GEMM wait on the layout first.
     with torch.cuda.stream(producer_stream):
@@ -291,30 +291,30 @@ def test_device_layout_waits_for_producer(glu):
 def test_output_notify_publishes_every_chunk(clusters_beside_consumer):
     require_sm100()
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import (
-        OutputNotifyConfig,
-        OutputNotifyMode,
-        output_notify_capacity,
-        output_notify_offsets,
+        StreamingOutputNotifyConfig,
+        StreamingOutputNotifyMode,
+        streaming_output_notify_capacity,
+        streaming_output_notify_offsets,
     )
 
     n, chunk = 2 * HIDDEN, 256
     problem = make_problem([700, 0, 256, 1], n, FFN, seed=3)
-    capacity = output_notify_capacity(chunk, n)
-    notify = OutputNotifyConfig(OutputNotifyMode.N_CHUNK, chunk, capacity, clusters_beside_consumer=clusters_beside_consumer)
+    capacity = streaming_output_notify_capacity(chunk, n)
+    notify = StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, chunk, capacity, clusters_beside_consumer=clusters_beside_consumer)
     stock_c, stock_d, _ = run(make_kernel(False, use_dynamic_sched=True), problem, False)
-    kernel = make_kernel(False, use_dynamic_sched=True, output_notify=notify, launch_pdl_dependents_at_entry=True)
+    kernel = make_kernel(False, use_dynamic_sched=True, streaming_output_notify=notify, launch_pdl_dependents_at_entry=True)
     c, d, workspace = run(kernel, problem, False)
     torch.cuda.synchronize()
     valid = valid_rows(problem)
     assert torch.equal(c[:valid], stock_c[:valid])
     assert torch.equal(d[:valid], stock_d[:valid])
-    offset = output_notify_offsets(kernel)["signal"]
+    offset = streaming_output_notify_offsets(kernel)["signal"]
     signal = workspace[offset : offset + 4 * capacity].view(torch.int32)
     assert signal.tolist() == list(range(capacity))
 
 
 def test_streaming_options_reject_invalid():
-    from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import OutputNotifyConfig, OutputNotifyMode
+    from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import StreamingOutputNotifyConfig, StreamingOutputNotifyMode
 
     with pytest.raises(ValueError, match="use_dynamic_sched"):
         make_kernel(False, streaming_signal_capacity=4)
@@ -322,11 +322,11 @@ def test_streaming_options_reject_invalid():
         make_kernel(False, use_dynamic_sched=True, device_layout=True)
     with pytest.raises(ValueError, match="launch_pdl_dependents_at_all_streaming_signal_slots_ready"):
         make_kernel(True, use_dynamic_sched=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
-    notify = OutputNotifyConfig(OutputNotifyMode.N_CHUNK, 256, 4, clusters_beside_consumer=1)
+    notify = StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, 256, 4, clusters_beside_consumer=1)
     with pytest.raises(ValueError, match="use_dynamic_sched"):
-        make_kernel(False, output_notify=notify)
+        make_kernel(False, streaming_output_notify=notify)
     with pytest.raises(AssertionError):
-        make_kernel(False, use_dynamic_sched=True, streaming_signal_capacity=4, output_notify=notify)
+        make_kernel(False, use_dynamic_sched=True, streaming_signal_capacity=4, streaming_output_notify=notify)
     import cutlass
 
     plain_class, _ = kernel_classes()
