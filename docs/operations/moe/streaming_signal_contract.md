@@ -19,7 +19,7 @@ default; with the defaults the generated code is the same as without this featur
 ### Workspace layout
 
 The kernel's workspace (`get_workspace_bytes()`) holds the signal entries. Hand `signal[]` to the producer as a view
-of that workspace (zero-copy). Offsets come from `moe_signal_helpers.streaming_signal_workspace_offsets(kernel)`.
+of that workspace (zero-copy). Offsets come from `moe_kernel_helpers.streaming_signal_workspace_offsets(kernel)`.
 
 | Byte offset | Contents | Written by | Read by |
 |---|---|---|---|
@@ -73,7 +73,7 @@ producer does not need a proxy fence of its own.
 ### Reset and termination
 
 - **Who resets:** the caller, before every launch, ordered before both the producer and the GEMM. Use
-  `moe_signal_helpers.reset_streaming_signal_workspace(workspace, kernel)`: counter and state 0, `signal[]` -1. With
+  `moe_kernel_helpers.reset_streaming_signal_workspace(workspace, kernel)`: counter and state 0, `signal[]` -1. With
   `all_complete=True` it sets `signal[t] = t`, which runs the GEMM with no producer (tests, warm-up).
 - **No GEMM-side reset:** the GEMM never resets the signal workspace, and on this path its helper kernel does not reset
   the claim counter either.

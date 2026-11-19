@@ -51,7 +51,7 @@ from cutlass.cute.typing import AddressSpace
 from cutlass._mlir import ir
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineUserType, make_pipeline_state
-from .moe_signal_helpers import (
+from .moe_kernel_helpers import (
     streaming_scheduler_state_offset,
     streaming_signal_ptr,
     mbarrier_arrive_expect_tx_on_peer_relaxed_cluster,

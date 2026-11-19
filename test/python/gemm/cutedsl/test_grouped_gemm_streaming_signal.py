@@ -136,7 +136,7 @@ def plain_reference(problem):
 
 
 def signal_ready(kernel):
-    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_streaming_signal_workspace
+    from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
 
     return lambda workspace: reset_streaming_signal_workspace(workspace, kernel, all_complete=True)
 
@@ -199,7 +199,7 @@ def test_signal_consumer_waits_for_producer():
     stock_c, stock_d, _ = run(make_kernel(False, use_dynamic_sched=True), dict(problem, a=final_a), False)
     torch.cuda.synchronize()
 
-    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
+    from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
 
     gemm_stream, producer_stream = torch.cuda.Stream(), torch.cuda.Stream()
     holder = {}
@@ -253,7 +253,7 @@ def test_device_layout_waits_for_producer(glu):
     stock_c, stock_d, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
     torch.cuda.synchronize()
 
-    from cudnn.gemm.cutedsl.grouped.moe_signal_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
+    from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
 
     gemm_stream, producer_stream = torch.cuda.Stream(), torch.cuda.Stream()
     c, d, workspace, launch = run(kernel, problem, glu, max_active_clusters=4, stream=gemm_stream, defer_launch=True)
