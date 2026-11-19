@@ -40,3 +40,26 @@ modules in `python/cudnn/`:
 
 Thank you also to the broader CUTLASS/CuTe DSL and infrastructure teams who
 supported the original kernel development.
+
+## Streaming signal grouped GEMM scheduling
+
+The streaming input-block and output-chunk tile schedulers let the MoE grouped GEMMs run concurrently with the
+kernels that produce their inputs and consume their outputs, connected only by device-side readiness signals.
+We gratefully acknowledge the contributors who designed, developed, and validated this work.
+
+Contributors include:
+
+- Wentao Guo
+- Phuong Nguyen
+- Zhongbo Zhu
+- Subhadeep Bhattacharya
+- Fei Wu
+- Jimmy Zhang
+
+This acknowledgement covers these modules in `python/cudnn/`:
+
+- `gemm/cutedsl/grouped/moe_streaming_input_block_tile_scheduler.py`
+- `gemm/cutedsl/grouped/moe_streaming_output_chunk_tile_scheduler.py`
+- `gemm/cutedsl/grouped/moe_signal_helpers.py`
+- `gemm/cutedsl/grouped/moe_tail_tiles.py`
+- the streaming signal options of `gemm/cutedsl/grouped/unfused` and `gemm/cutedsl/grouped/glu`

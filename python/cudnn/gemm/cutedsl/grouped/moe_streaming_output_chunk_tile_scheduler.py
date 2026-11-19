@@ -1,8 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileContributor: Wentao Guo, Phuong Nguyen, Zhongbo Zhu, Subhadeep Bhattacharya, Fei Wu, Jimmy Zhang
 # SPDX-License-Identifier: Apache-2.0
 
-"""FC2 GEMM || combine overlap: the N-chunk tile order, and the output notifier.  ``signal[n_chunk]``
-counts the chunk's finished CTA tiles as a negative number, and is ``n_chunk`` once the chunk is complete."""
+"""Streaming output-chunk tile scheduler and notifier for the MoE grouped GEMMs (2Dx3D).
+
+With ``StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, ...)`` the GEMM runs its tiles one N chunk of
+``C = n_chunk_size`` columns at a time. ``signal[]`` is int32, one entry per N chunk ``u`` in ``[0, ceil(N / C))``,
+at most ``n_chunk_capacity`` (size it with ``streaming_output_notify_capacity``). It is reset to -1 and stays negative
+(``-1 - tiles counted``) until the GEMM stores ``signal[u] = u`` with a gpu-scope release, once D's columns
+``[u * C, min((u + 1) * C, N))`` are in global memory for every row. A consumer kernel, such as an expert-parallel
+combine, sends each chunk while the GEMM is still running. Consumer contract: docs/operations/moe/streaming_signal_contract.md.
+
+Assumes N <= (2^31 - 1) * n_chunk_size.
+"""
 
 import copy
 from typing import Dict, List, Optional, Tuple

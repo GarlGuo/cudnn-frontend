@@ -1,8 +1,19 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileContributor: Wentao Guo, Phuong Nguyen, Zhongbo Zhu, Subhadeep Bhattacharya, Fei Wu, Jimmy Zhang
 # SPDX-License-Identifier: Apache-2.0
 
-"""MoE 2Dx3D grouped GEMM scheduler fed by a streaming producer (``signal[t]`` = -1 until signal slot ``t`` is complete):
-ready M-tiles run in expert-consecutive batches; ``device_layout`` first waits (gpu-scope acquire) for the expert offsets."""
+"""Streaming input-block tile scheduler for the MoE grouped GEMMs (2Dx3D).
+
+``signal[]`` is int32, one entry per signal slot of ``signal_slot_rows`` rows of A (default the cluster tile M, which
+it must divide). Slot ``t`` covers A rows ``[t * signal_slot_rows, (t + 1) * signal_slot_rows)`` of the padded expert
+layout, for ``t`` in ``[0, padded_offsets[E - 1] / signal_slot_rows)``, at most ``streaming_signal_capacity`` slots.
+Before launch ``signal[]`` is reset to -1 (never 0: any value >= 0 reads as ready). A producer kernel, such as an
+expert-parallel dispatch, stores ``signal[t] = t`` with a gpu-scope release once slot ``t`` of A is in memory.
+The GEMM claims ready M tiles in expert-consecutive batches and starts each one as soon as it is ready, so it runs
+beside the producer instead of after it. Producer contract: docs/operations/moe/streaming_signal_contract.md.
+
+Assumes A rows <= (2^31 - 1) * signal_slot_rows.
+"""
 
 from typing import List, Tuple
 import cutlass
