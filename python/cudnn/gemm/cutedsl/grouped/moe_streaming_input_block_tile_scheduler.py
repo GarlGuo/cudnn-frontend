@@ -89,8 +89,8 @@ def _state_region_offsets(streaming_signal_capacity: int, local_expert_count: in
 
 
 def check_linear_tile_idx_range(intermediate, cluster_tile_n: int, streaming_signal_capacity) -> None:
-    """Build-time bounds on a linear tile index (signal slot * Q_N + N tile): N > 0, and every signal slot, END included,
-    below 2^31."""
+    """Build-time bounds on a linear tile index (signal slot * Q_N + N tile): N > 0, and every signal slot, END
+    included, below 2^31."""
     assert isinstance(intermediate, int), f"the signal scheduler needs a build-time N (dense B), not {intermediate}"
     assert intermediate > 0, f"the signal scheduler needs N > 0 (a linear tile index // Q_N), got N = {intermediate}"
     assert isinstance(streaming_signal_capacity, int), f"streaming_signal_capacity must be a build-time int, not {streaming_signal_capacity}"
