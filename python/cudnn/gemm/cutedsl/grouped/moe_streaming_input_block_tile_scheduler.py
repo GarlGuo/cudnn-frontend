@@ -176,7 +176,8 @@ class MoEInputBlockSignalSchedulerParams:
 
 class MoEStreamingInputBlockSignalTileScheduler:
     """Persistent tile scheduler for the MoE grouped GEMM: tile iteration only (claim a linear tile index,
-    broadcast it to the cluster).  MoESchedExtension converts domains and picks TMA descriptors."""
+    broadcast it to the cluster).  MoESchedExtension converts domains and picks TMA descriptors.
+    Cluster (2, 1) with the 2-CTA MMA only: a (1, 1) cluster is not supported (``__init__`` asserts two CTAs)."""
 
     def internal_init(self):
         """Create the internal cluster broadcast pipeline (dynamic mode only)."""
@@ -224,8 +225,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
         ), f"signal slot of {self.signal_slot_rows} rows must divide the cluster tile M {params.cluster_tile_m}"
         self.signal_slots_per_m_tile = params.cluster_tile_m // self.signal_slot_rows
         check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity)
-        # mapa.shared::cluster at one CTA is an illegal peer store; the kernels raise ValueError
-        # first (check_streaming_signal_cluster_shape), so this only guards other callers.
+        # mapa.shared::cluster at one CTA is an illegal peer store.  This assert is the only
+        # guard: no kernel checks its cluster shape for the signal scheduler.
         assert const_expr(
             params.cluster_shape_mn[0] * params.cluster_shape_mn[1] > 1
         ), "the signal scheduler broadcasts with mapa.shared::cluster, which needs >= 2 CTAs"

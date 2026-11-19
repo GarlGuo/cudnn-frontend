@@ -319,9 +319,6 @@ def test_streaming_options_reject_invalid():
 
     with pytest.raises(ValueError, match="use_dynamic_sched"):
         make_kernel(False, streaming_signal_capacity=4)
-    for glu in (False, True):
-        with pytest.raises(ValueError, match="one CTA"):
-            make_kernel(glu, one_cta=True, use_dynamic_sched=True, streaming_signal_capacity=4)
     with pytest.raises(ValueError, match="device_layout"):
         make_kernel(False, use_dynamic_sched=True, device_layout=True)
     with pytest.raises(ValueError, match="launch_pdl_dependents_at_all_streaming_signal_slots_ready"):

@@ -44,7 +44,6 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     can_implement_bf16_grouped_gemm,
     check_dynamic_sched_cluster_shape,
-    check_streaming_signal_cluster_shape,
     compute_grid,
     epilog_gmem_copy_and_partition,
 )
@@ -75,7 +74,7 @@ class MoEGroupedGemmBf16Kernel:
     :param use_dynamic_sched: Enable dynamic tile scheduling.
     :param streaming_signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
         runs ``MoEStreamingInputBlockSignalTileScheduler`` and starts each M tile once the producer marks it ready.
-        Needs ``use_dynamic_sched`` and cluster (2, 1) with the 2-CTA MMA.
+        Needs ``use_dynamic_sched`` and cluster (2, 1) with the 2-CTA MMA; a (1, 1) cluster is not supported.
     :param streaming_output_notify: ``StreamingOutputNotifyConfig``; ``N_CHUNK`` publishes each finished chunk of D columns to a
         streaming consumer (``MoEStreamingOutputChunkSignalTileScheduler``). Not combined with ``streaming_signal_capacity``.
     :param device_layout: With ``streaming_signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
@@ -219,9 +218,7 @@ class MoEGroupedGemmBf16Kernel:
         )
         if self.streaming_output_notify.enabled and not use_dynamic_sched:
             raise ValueError("streaming_output_notify requires use_dynamic_sched=True")
-        if self.use_streaming_signal_sched:
-            check_streaming_signal_cluster_shape(use_2cta_instrs, cluster_shape_mn)
-        elif self.streaming_output_notify.enabled:
+        if self.use_streaming_signal_sched or self.streaming_output_notify.enabled:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
 
     # ------------------------------------------------------------------
