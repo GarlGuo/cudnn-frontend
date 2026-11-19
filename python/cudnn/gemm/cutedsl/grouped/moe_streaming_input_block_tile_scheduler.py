@@ -388,46 +388,55 @@ class MoEStreamingInputBlockSignalTileScheduler:
 
     @cute.jit
     def _expert_ready_m_tiles(self, expert: Int32) -> Int32:
-        """How many M-tiles of ``expert`` are READY in a row from its first unassigned M-tile
-        on, at most ``EXPERT_BATCH_MAX_M_TILES``.  An ``expert`` past the last expert has none."""
-        ready_m_tile_count = Int32(0)
-        if expert < const_expr(self.params.local_expert_count):
-            signal_slots_per_m_tile = const_expr(self.signal_slots_per_m_tile)
-            expert_end_signal_slot = self.expert_freq_offsets[expert] // const_expr(self.signal_slot_rows)
-            expert_first_signal_slot = self._expert_first_signal_slot(expert)
-            assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + expert
-            assigned_m_tiles = cute.arch.load(assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
-            first_unassigned_signal_slot = expert_first_signal_slot + signal_slots_per_m_tile * assigned_m_tiles
-            signal = streaming_signal_ptr(self._dynamic_state.counter_ptr)
-            # Every candidate signal slot's flag in one round of independent loads, off the batch opener's critical path; a
-            # signal slot past the expert's end reads its last signal slot instead, in bounds and ignored.
-            last_signal_slot = cutlass.max(expert_end_signal_slot - 1, 0)
-            flags = [
-                [
+        """How many M-tiles of ``expert`` are READY in a row from its first unassigned M-tile on, at most
+        ``EXPERT_BATCH_MAX_M_TILES``; none past the last expert.  A converged warp only (full-mask vote)."""
+        local_expert_count = const_expr(self.params.local_expert_count)
+        signal_slots_per_m_tile = const_expr(self.signal_slots_per_m_tile)
+        # A lane past the experts reads the last one's offsets, in bounds, and counts nothing.
+        clamped_expert = cutlass.min(expert, local_expert_count - 1)
+        expert_end_signal_slot = self.expert_freq_offsets[clamped_expert] // const_expr(self.signal_slot_rows)
+        expert_first_signal_slot = self._expert_first_signal_slot(clamped_expert)
+        assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + clamped_expert
+        assigned_m_tiles = cute.arch.load(assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+        first_unassigned_signal_slot = expert_first_signal_slot + signal_slots_per_m_tile * assigned_m_tiles
+        signal = streaming_signal_ptr(self._dynamic_state.counter_ptr)
+        # A signal slot past the expert's end reads its last signal slot instead, in bounds and not counted.
+        last_signal_slot = cutlass.max(expert_end_signal_slot - 1, 0)
+        run_signal_slot_limit = cutlass.min(expert_end_signal_slot - first_unassigned_signal_slot, EXPERT_BATCH_MAX_M_TILES * signal_slots_per_m_tile)
+        if expert >= local_expert_count:
+            run_signal_slot_limit = Int32(0)
+        ready_run_signal_slots = Int32(0)
+        run_continues = Int32(1)
+        if run_signal_slot_limit <= 0:
+            run_continues = Int32(0)
+        # Rounds of independent flag loads while any lane's run goes on: the loop is warp-uniform, so the warp
+        # stays converged for the opener's later collectives.
+        while cute.arch.vote_any_sync(run_continues == 1):
+            if run_continues == 1:
+                round_flags = [
                     cute.arch.load(
-                        (
-                            signal + cutlass.min(first_unassigned_signal_slot + m_tile_offset * signal_slots_per_m_tile + signal_slot_offset, last_signal_slot)
-                        ).llvm_ptr,
+                        (signal + cutlass.min(first_unassigned_signal_slot + ready_run_signal_slots + signal_slot_offset, last_signal_slot)).llvm_ptr,
                         Int32,
                         sem="relaxed",
                         scope="gpu",
                     )
-                    for signal_slot_offset in range(signal_slots_per_m_tile)
+                    for signal_slot_offset in range(EXPERT_BATCH_MAX_M_TILES)
                 ]
-                for m_tile_offset in range(EXPERT_BATCH_MAX_M_TILES)
-            ]
-            for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
-                # This M-tile counts if every M-tile before it did and it is still this expert's.
-                m_tile_signal_slot = first_unassigned_signal_slot + m_tile_offset * signal_slots_per_m_tile
-                if ready_m_tile_count == m_tile_offset and m_tile_signal_slot < expert_end_signal_slot:
-                    m_tile_ready = Boolean(True)
-                    for signal_slot_offset in cutlass.range_constexpr(signal_slots_per_m_tile):
-                        # Signal slot 0 is the expert's, by the test above; a tail M-tile has fewer signal slots.
-                        if const_expr(signal_slot_offset == 0) or m_tile_signal_slot + signal_slot_offset < expert_end_signal_slot:
-                            if flags[m_tile_offset][signal_slot_offset] < 0:
-                                m_tile_ready = Boolean(False)
-                    if m_tile_ready:
-                        ready_m_tile_count = ready_m_tile_count + 1
+                round_limit = cutlass.min(EXPERT_BATCH_MAX_M_TILES, run_signal_slot_limit - ready_run_signal_slots)
+                round_ready = Int32(0)
+                for signal_slot_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
+                    if round_ready == signal_slot_offset and signal_slot_offset < round_limit:
+                        if round_flags[signal_slot_offset] >= 0:
+                            round_ready = round_ready + 1
+                if round_ready < EXPERT_BATCH_MAX_M_TILES:
+                    run_continues = Int32(0)
+                ready_run_signal_slots = ready_run_signal_slots + round_ready
+                if ready_run_signal_slots >= run_signal_slot_limit:
+                    run_continues = Int32(0)
+        # An M-tile counts once all its signal slots are ready; the expert's last one may have fewer.
+        ready_m_tile_count = ready_run_signal_slots // signal_slots_per_m_tile
+        if run_signal_slot_limit > 0 and first_unassigned_signal_slot + ready_run_signal_slots == expert_end_signal_slot:
+            ready_m_tile_count = (ready_run_signal_slots + signal_slots_per_m_tile - 1) // signal_slots_per_m_tile
         return ready_m_tile_count
 
     @cute.jit
