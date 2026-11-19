@@ -224,8 +224,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
         ), f"signal slot of {self.signal_slot_rows} rows must divide the cluster tile M {params.cluster_tile_m}"
         self.signal_slots_per_m_tile = params.cluster_tile_m // self.signal_slot_rows
         check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity)
-        # mapa.shared::cluster at one CTA is an illegal peer store.  This assert is the only
-        # guard: no kernel checks its cluster shape for the signal scheduler.
+        # mapa.shared::cluster at one CTA is an illegal peer store; the kernels raise ValueError
+        # first (check_streaming_signal_cluster_shape), so this only guards other callers.
         assert const_expr(
             params.cluster_shape_mn[0] * params.cluster_shape_mn[1] > 1
         ), "the signal scheduler broadcasts with mapa.shared::cluster, which needs >= 2 CTAs"

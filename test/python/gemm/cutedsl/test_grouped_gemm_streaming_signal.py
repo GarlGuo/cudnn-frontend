@@ -30,16 +30,16 @@ def kernel_classes():
     return MoEGroupedGemmBf16Kernel, MoEGroupedGemmGluBiasBf16Kernel
 
 
-def make_kernel(glu, **options):
+def make_kernel(glu, one_cta=False, **options):
     import cutlass
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 
     plain_class, glu_class = kernel_classes()
     common = dict(
         acc_dtype=cutlass.Float32,
-        use_2cta_instrs=True,
-        mma_tiler_mn=(256, 256),
-        cluster_shape_mn=(2, 1),
+        use_2cta_instrs=not one_cta,
+        mma_tiler_mn=(128, 256) if one_cta else (256, 256),
+        cluster_shape_mn=(1, 1) if one_cta else (2, 1),
         vectorized_f32=True,
         expert_cnt=EXPERTS,
         weight_mode=MoEWeightMode.DENSE,
@@ -287,8 +287,9 @@ def test_device_layout_waits_for_producer(glu):
     assert torch.equal(d[:valid], stock_d[:valid])
 
 
+@pytest.mark.parametrize("one_cta", [False, True], ids=["cluster21", "cluster11"])
 @pytest.mark.parametrize("clusters_beside_consumer", [1, 1000])
-def test_output_notify_publishes_every_chunk(clusters_beside_consumer):
+def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta):
     require_sm100()
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import (
         StreamingOutputNotifyConfig,
@@ -301,8 +302,8 @@ def test_output_notify_publishes_every_chunk(clusters_beside_consumer):
     problem = make_problem([700, 0, 256, 1], n, FFN, seed=3)
     capacity = streaming_output_notify_capacity(chunk, n)
     notify = StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, chunk, capacity, clusters_beside_consumer=clusters_beside_consumer)
-    stock_c, stock_d, _ = run(make_kernel(False, use_dynamic_sched=True), problem, False)
-    kernel = make_kernel(False, use_dynamic_sched=True, streaming_output_notify=notify, launch_pdl_dependents_at_entry=True)
+    stock_c, stock_d, _ = run(make_kernel(False, one_cta, use_dynamic_sched=True), problem, False)
+    kernel = make_kernel(False, one_cta, use_dynamic_sched=True, streaming_output_notify=notify, launch_pdl_dependents_at_entry=True)
     c, d, workspace = run(kernel, problem, False)
     torch.cuda.synchronize()
     valid = valid_rows(problem)
@@ -318,6 +319,9 @@ def test_streaming_options_reject_invalid():
 
     with pytest.raises(ValueError, match="use_dynamic_sched"):
         make_kernel(False, streaming_signal_capacity=4)
+    for glu in (False, True):
+        with pytest.raises(ValueError, match="one CTA"):
+            make_kernel(glu, one_cta=True, use_dynamic_sched=True, streaming_signal_capacity=4)
     with pytest.raises(ValueError, match="device_layout"):
         make_kernel(False, use_dynamic_sched=True, device_layout=True)
     with pytest.raises(ValueError, match="launch_pdl_dependents_at_all_streaming_signal_slots_ready"):

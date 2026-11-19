@@ -217,8 +217,9 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 
 ## 6. Constraints
 
-- Dynamic scheduler cluster shapes: (2, 1) with the 2-CTA MMA, or (1, 1) with the 1-CTA MMA. Other shapes raise
-  `ValueError`, because a CTA could exit while a peer still arrives on its shared memory.
+- Cluster shapes: the input direction (`streaming_signal_capacity`) needs (2, 1) with the 2-CTA MMA, because its claim
+  broadcast stores into a peer CTA's shared memory. `N_CHUNK` takes (2, 1) with the 2-CTA MMA or (1, 1) with the 1-CTA
+  MMA. Other shapes raise `ValueError`, because a CTA could exit while a peer still arrives on its shared memory.
 - `streaming_signal_capacity` and `N_CHUNK` cannot be combined in one kernel; both need `use_dynamic_sched=True`.
 - N must be known at build time (dense B).
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`

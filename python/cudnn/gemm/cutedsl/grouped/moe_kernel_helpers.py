@@ -653,6 +653,17 @@ def check_dynamic_sched_cluster_shape(use_2cta_instrs: bool, cluster_shape_mn: T
         )
 
 
+def check_streaming_signal_cluster_shape(use_2cta_instrs: bool, cluster_shape_mn: Tuple[int, int]) -> None:
+    """Raise unless (2, 1) with the 2-CTA MMA: the streaming input signal scheduler broadcasts each claim into a peer
+    CTA's shared memory (``mapa.shared::cluster``), which needs a cluster of at least two CTAs."""
+    check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
+    if cluster_shape_mn[0] * cluster_shape_mn[1] < 2:
+        raise ValueError(
+            f"streaming_signal_capacity: cluster {tuple(cluster_shape_mn)} has one CTA; the input signal scheduler needs "
+            "(2, 1) with 2-CTA MMA (its claim broadcast stores into a peer CTA's shared memory)"
+        )
+
+
 def is_valid_mma_tiler_and_cluster_shape(
     use_2cta_instrs: bool,
     mma_tiler_mn: Tuple[int, int],

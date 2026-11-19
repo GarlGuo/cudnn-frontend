@@ -46,7 +46,7 @@ from ..moe_kernel_helpers import (
     silu_f32,
     silu_f32_geglu_scaled,
     can_implement_bf16_grouped_gemm,
-    check_dynamic_sched_cluster_shape,
+    check_streaming_signal_cluster_shape,
     compute_grid,
     epilog_gmem_copy_and_partition,
 )
@@ -75,7 +75,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
 
     :param streaming_signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
         runs ``MoEStreamingInputBlockSignalTileScheduler`` and starts each M tile once the producer marks it ready.
-        Needs ``use_dynamic_sched``.
+        Needs ``use_dynamic_sched`` and cluster (2, 1) with the 2-CTA MMA.
     :param device_layout: With ``streaming_signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
         and the scheduler waits for them. ``padded_offsets`` must then be ``layout[1:E+1]`` of an ``E + 1`` int32
         buffer that the caller sets to -1 before the producer starts (``layout[0]`` is read too).
@@ -228,7 +228,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
             raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
         if self.use_streaming_signal_sched:
-            check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
+            check_streaming_signal_cluster_shape(use_2cta_instrs, cluster_shape_mn)
         self.device_layout = device_layout
         self.use_pdl = use_pdl
         self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
