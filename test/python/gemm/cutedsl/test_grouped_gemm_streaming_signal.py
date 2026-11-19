@@ -287,9 +287,14 @@ def test_device_layout_waits_for_producer(glu):
     assert torch.equal(d[:valid], stock_d[:valid])
 
 
+# (D columns N, N chunk C): whole chunks; N < C (one chunk); N == C; a partial last chunk (columns 512..767).
+OUTPUT_CHUNKS = {"n1024_c256": (2 * HIDDEN, 256), "n768_c1024": (768, 1024), "n768_c768": (768, 768), "n768_c512": (768, 512)}
+
+
+@pytest.mark.parametrize("n_and_chunk", sorted(OUTPUT_CHUNKS))
 @pytest.mark.parametrize("one_cta", [False, True], ids=["cluster21", "cluster11"])
 @pytest.mark.parametrize("clusters_beside_consumer", [1, 1000])
-def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta):
+def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta, n_and_chunk):
     require_sm100()
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import (
         StreamingOutputNotifyConfig,
@@ -298,9 +303,10 @@ def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta):
         streaming_output_notify_offsets,
     )
 
-    n, chunk = 2 * HIDDEN, 256
+    n, chunk = OUTPUT_CHUNKS[n_and_chunk]
     problem = make_problem([700, 0, 256, 1], n, FFN, seed=3)
     capacity = streaming_output_notify_capacity(chunk, n)
+    assert capacity == len(range(0, n, chunk))
     notify = StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, chunk, capacity, clusters_beside_consumer=clusters_beside_consumer)
     stock_c, stock_d, _ = run(make_kernel(False, one_cta, use_dynamic_sched=True), problem, False)
     kernel = make_kernel(False, one_cta, use_dynamic_sched=True, streaming_output_notify=notify, launch_pdl_dependents_at_entry=True)
