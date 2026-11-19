@@ -82,12 +82,10 @@ class MoEGroupedGemmBf16Kernel:
         buffer that the caller sets to -1 before the producer starts (``layout[0]`` is read too).
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
         for that grid before it exits.
-    :param launch_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
+    :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
     FIX_PAD_SIZE = 256
-    #: Where a signal-scheduled base kernel lets its programmatic dependent launch: False, at its entry.
-    FC1_TAIL_AT_SLOTS_READY = False
 
     @staticmethod
     def can_implement(
@@ -144,7 +142,7 @@ class MoEGroupedGemmBf16Kernel:
         output_notify: Optional[OutputNotifyConfig] = None,
         device_layout: bool = False,
         use_pdl: bool = False,
-        launch_dependents_at_entry: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % mma_tile_m != 0:
@@ -214,7 +212,7 @@ class MoEGroupedGemmBf16Kernel:
             raise ValueError("device_layout requires streaming_signal_capacity")
         self.device_layout = device_layout
         self.use_pdl = use_pdl
-        self.launch_dependents_at_entry = launch_dependents_at_entry
+        self.launch_pdl_dependents_at_entry = launch_pdl_dependents_at_entry
         self.output_notify = (output_notify or OutputNotifyConfig()).bind(
             (mma_tiler_mn[0] // (2 if use_2cta_instrs else 1), mma_tiler_mn[1]), expert_cnt, self.use_streaming_signal_sched
         )
@@ -818,7 +816,7 @@ class MoEGroupedGemmBf16Kernel:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
-        if cutlass.const_expr(self.launch_dependents_at_entry):
+        if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
             cute.arch.griddepcontrol_launch_dependents()
 
         smem = SmemAllocator()

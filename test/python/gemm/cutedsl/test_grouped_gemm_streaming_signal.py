@@ -162,7 +162,7 @@ def test_signal_consumer_matches_dynamic(glu, variant, routing):
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity)
     if variant == "signal_layout_pdl":
         options.update(device_layout=True, use_pdl=True)
-        trigger = "launch_dependents_at_slots_ready" if glu else "launch_dependents_at_entry"
+        trigger = "launch_pdl_dependents_at_all_streaming_signal_slots_ready" if glu else "launch_pdl_dependents_at_entry"
         options[trigger] = True
     stock_c, stock_d, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
     signal_kernel = make_kernel(glu, **options)
@@ -248,7 +248,7 @@ def test_device_layout_waits_for_producer(glu):
     final_a, final_layout = problem["a"].clone(), problem["layout"].clone()
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity, device_layout=True)
     if glu:
-        options["launch_dependents_at_slots_ready"] = True
+        options["launch_pdl_dependents_at_all_streaming_signal_slots_ready"] = True
     kernel = make_kernel(glu, **options)
     stock_c, stock_d, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
     torch.cuda.synchronize()
@@ -287,8 +287,8 @@ def test_device_layout_waits_for_producer(glu):
     assert torch.equal(d[:valid], stock_d[:valid])
 
 
-@pytest.mark.parametrize("clusters_beside_combine", [1, 1000])
-def test_output_notify_publishes_every_chunk(clusters_beside_combine):
+@pytest.mark.parametrize("clusters_beside_consumer", [1, 1000])
+def test_output_notify_publishes_every_chunk(clusters_beside_consumer):
     require_sm100()
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import (
         OutputNotifyConfig,
@@ -300,9 +300,9 @@ def test_output_notify_publishes_every_chunk(clusters_beside_combine):
     n, chunk = 2 * HIDDEN, 256
     problem = make_problem([700, 0, 256, 1], n, FFN, seed=3)
     capacity = output_notify_capacity(chunk, n)
-    notify = OutputNotifyConfig(OutputNotifyMode.N_CHUNK, chunk, capacity, clusters_beside_combine=clusters_beside_combine)
+    notify = OutputNotifyConfig(OutputNotifyMode.N_CHUNK, chunk, capacity, clusters_beside_consumer=clusters_beside_consumer)
     stock_c, stock_d, _ = run(make_kernel(False, use_dynamic_sched=True), problem, False)
-    kernel = make_kernel(False, use_dynamic_sched=True, output_notify=notify, launch_dependents_at_entry=True)
+    kernel = make_kernel(False, use_dynamic_sched=True, output_notify=notify, launch_pdl_dependents_at_entry=True)
     c, d, workspace = run(kernel, problem, False)
     torch.cuda.synchronize()
     valid = valid_rows(problem)
@@ -320,9 +320,9 @@ def test_streaming_options_reject_invalid():
         make_kernel(False, streaming_signal_capacity=4)
     with pytest.raises(ValueError, match="device_layout"):
         make_kernel(False, use_dynamic_sched=True, device_layout=True)
-    with pytest.raises(ValueError, match="launch_dependents_at_slots_ready"):
-        make_kernel(True, use_dynamic_sched=True, launch_dependents_at_slots_ready=True)
-    notify = OutputNotifyConfig(OutputNotifyMode.N_CHUNK, 256, 4, clusters_beside_combine=1)
+    with pytest.raises(ValueError, match="launch_pdl_dependents_at_all_streaming_signal_slots_ready"):
+        make_kernel(True, use_dynamic_sched=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+    notify = OutputNotifyConfig(OutputNotifyMode.N_CHUNK, 256, 4, clusters_beside_consumer=1)
     with pytest.raises(ValueError, match="use_dynamic_sched"):
         make_kernel(False, output_notify=notify)
     with pytest.raises(AssertionError):

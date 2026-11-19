@@ -36,44 +36,44 @@ def fused_tail_heights(alignment, max_rows=FUSED_TAIL_MAX_ROWS):
 
 
 @cute.jit
-def fused_tail_chunks(tokens_i: Int32, max_rows: cutlass.Constexpr) -> Int32:
-    """Chunks of ``max_rows`` rows in which an expert of ``tokens_i`` rows fuses its tail into its last full M
+def fused_tail_chunks(expert_i_row_count: Int32, max_rows: cutlass.Constexpr) -> Int32:
+    """Chunks of ``max_rows`` rows in which an expert of ``expert_i_row_count`` rows fuses its tail into its last full M
     tiles (one chunk per tile), else 0."""
-    full_tiles = tokens_i // CLUSTER_TILE_M
-    tail_rows = tokens_i - full_tiles * CLUSTER_TILE_M
+    full_tiles = expert_i_row_count // CLUSTER_TILE_M
+    tail_rows = expert_i_row_count - full_tiles * CLUSTER_TILE_M
     chunks = (tail_rows + (max_rows - 1)) // max_rows
     fused = Int32(0)
     if tail_rows > 0 and chunks <= FUSED_TAIL_CHUNKS and full_tiles >= chunks:
-        if chunks == 1 or tokens_i < FUSED_TAIL_CHUNKED_MAX_EXPERT_ROWS:
+        if chunks == 1 or expert_i_row_count < FUSED_TAIL_CHUNKED_MAX_EXPERT_ROWS:
             fused = chunks
     return fused
 
 
 @cute.jit
-def fused_tail_rows(tokens_i: Int32, mma_tile_m: Int32, max_rows: cutlass.Constexpr) -> Int32:
-    """Rows of the tail chunk fused into full M tile ``mma_tile_m`` of an expert of ``tokens_i`` rows, else 0: the
+def fused_tail_rows(expert_i_row_count: Int32, mma_tile_m: Int32, max_rows: cutlass.Constexpr) -> Int32:
+    """Rows of the tail chunk fused into full M tile ``mma_tile_m`` of an expert of ``expert_i_row_count`` rows, else 0: the
     tail's last chunk (to the tail's end) rides in the last full tile, the one before it in the tile before."""
-    full_tiles = tokens_i // CLUSTER_TILE_M
-    chunks = fused_tail_chunks(tokens_i, max_rows)
+    full_tiles = expert_i_row_count // CLUSTER_TILE_M
+    chunks = fused_tail_chunks(expert_i_row_count, max_rows)
     fused = Int32(0)
     if chunks > 0 and mma_tile_m >= full_tiles - chunks and mma_tile_m < full_tiles:
-        fused = cutlass.min(tokens_i - fused_tail_first_row(tokens_i, mma_tile_m, max_rows), Int32(max_rows))
+        fused = cutlass.min(expert_i_row_count - fused_tail_first_row(expert_i_row_count, mma_tile_m, max_rows), Int32(max_rows))
     return fused
 
 
 @cute.jit
-def fused_tail_first_row(tokens_i: Int32, mma_tile_m: Int32, max_rows: cutlass.Constexpr) -> Int32:
+def fused_tail_first_row(expert_i_row_count: Int32, mma_tile_m: Int32, max_rows: cutlass.Constexpr) -> Int32:
     """First row (in the expert) of the tail chunk fused into full M tile ``mma_tile_m`` (see fused_tail_rows)."""
-    full_tiles = tokens_i // CLUSTER_TILE_M
-    return full_tiles * CLUSTER_TILE_M + (mma_tile_m - (full_tiles - fused_tail_chunks(tokens_i, max_rows))) * max_rows
+    full_tiles = expert_i_row_count // CLUSTER_TILE_M
+    return full_tiles * CLUSTER_TILE_M + (mma_tile_m - (full_tiles - fused_tail_chunks(expert_i_row_count, max_rows))) * max_rows
 
 
 @cute.jit
-def expert_m_units(tokens_i: Int32, max_rows: cutlass.Constexpr) -> Int32:
+def expert_m_units(expert_i_row_count: Int32, max_rows: cutlass.Constexpr) -> Int32:
     """M work units of an expert: its M tiles, less one when its tail is fused into the last full tile."""
-    units = (tokens_i + (CLUSTER_TILE_M - 1)) // CLUSTER_TILE_M
+    units = (expert_i_row_count + (CLUSTER_TILE_M - 1)) // CLUSTER_TILE_M
     if cutlass.const_expr(max_rows > 0):
-        if fused_tail_chunks(tokens_i, max_rows) > 0:
+        if fused_tail_chunks(expert_i_row_count, max_rows) > 0:
             units = units - 1
     return units
 
@@ -91,8 +91,8 @@ def tail_tile_heights(alignment):
 @cute.jit
 def m_tile_rows(padded_offsets: cute.Tensor, expert_idx: Int32, mma_tile_m: Int32) -> Int32:
     """Rows of M tile ``mma_tile_m`` of ``expert_idx``: 256, or fewer for its last tile."""
-    _, tokens_i = compute_expert_token_range(padded_offsets, expert_idx)
-    return cutlass.min(tokens_i - mma_tile_m * CLUSTER_TILE_M, CLUSTER_TILE_M)
+    _, expert_i_row_count = compute_expert_token_range(padded_offsets, expert_idx)
+    return cutlass.min(expert_i_row_count - mma_tile_m * CLUSTER_TILE_M, CLUSTER_TILE_M)
 
 
 def make_tail_mmas(ab_dtype, acc_dtype, heights, weight_major=OperandMajorMode.K):
@@ -179,11 +179,11 @@ def cluster_m_tile_count(
         for first_expert in cutlass.range_constexpr(0, expert_cnt, cute.arch.WARP_SIZE):
             expert = first_expert + lane_idx
             if expert < expert_cnt:
-                _, tokens_i = compute_expert_token_range(padded_offsets, expert)
+                _, expert_i_row_count = compute_expert_token_range(padded_offsets, expert)
                 if cutlass.const_expr(fused_tail_max_rows > 0):
-                    total = total + expert_m_units(tokens_i, fused_tail_max_rows)
+                    total = total + expert_m_units(expert_i_row_count, fused_tail_max_rows)
                 else:
-                    total = total + (tokens_i + (cluster_tile_m - 1)) // cluster_tile_m
+                    total = total + (expert_i_row_count + (cluster_tile_m - 1)) // cluster_tile_m
         total = cute.arch.warp_redux_sync(total, "add")
     return total
 
@@ -280,5 +280,5 @@ def fused_mainloop(
 @cute.jit
 def fused_tail_rows_of(padded_offsets: cute.Tensor, expert_idx: Int32, mma_tile_m: Int32, max_rows: cutlass.Constexpr) -> Int32:
     """Rows of the tail fused into M tile ``mma_tile_m`` of ``expert_idx``, else 0."""
-    _, tokens_i = compute_expert_token_range(padded_offsets, expert_idx)
-    return fused_tail_rows(tokens_i, mma_tile_m, max_rows)
+    _, expert_i_row_count = compute_expert_token_range(padded_offsets, expert_idx)
+    return fused_tail_rows(expert_i_row_count, mma_tile_m, max_rows)

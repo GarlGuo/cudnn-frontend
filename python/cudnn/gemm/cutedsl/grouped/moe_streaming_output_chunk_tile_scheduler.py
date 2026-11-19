@@ -28,7 +28,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
         stock: MoEPersistentTileScheduler,
         n_chunk_size: int,
         clusters_beside_combine: int,
-        total_expert_cnt: int,
+        local_expert_count: int,
         rows_aligned: bool = True,
         fused_tail_max_rows: int = 0,
     ):
@@ -40,7 +40,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
         self.n_chunk_size = n_chunk_size
         self.clusters_beside_combine = clusters_beside_combine
         # The stock ``expert_cnt`` is a kernel argument; this is the same count at trace time.
-        self.total_expert_cnt = total_expert_cnt
+        self.local_expert_count = local_expert_count
         self.rows_aligned = rows_aligned
         self.fused_tail_max_rows = fused_tail_max_rows
         self.expert_freq_offsets = stock.offs
@@ -58,7 +58,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
             super().__new_from_mlir_values__(values),
             self.n_chunk_size,
             self.clusters_beside_combine,
-            self.total_expert_cnt,
+            self.local_expert_count,
             self.rows_aligned,
             self.fused_tail_max_rows,
         )
@@ -68,7 +68,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
         """Cluster M tiles (M units with fused tails) over every expert.  Warp-collective."""
         return cluster_m_tile_count(
             self.expert_freq_offsets,
-            const_expr(self.total_expert_cnt),
+            const_expr(self.local_expert_count),
             const_expr(self.cluster_tile_m),
             const_expr(self.rows_aligned),
             const_expr(self.fused_tail_max_rows),
@@ -77,21 +77,21 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
     @cute.jit
     def _expert_m_tiles(self, expert_idx: Int32) -> Int32:
         """Cluster M tiles (M units with fused tails) of one expert."""
-        _, tokens_i = compute_expert_token_range(self.expert_freq_offsets, expert_idx)
+        _, expert_i_row_count = compute_expert_token_range(self.expert_freq_offsets, expert_idx)
         if const_expr(self.cluster_tile_m == CLUSTER_TILE_M):
-            return expert_m_units(tokens_i, const_expr(self.fused_tail_max_rows))
-        return (tokens_i + (self.cluster_tile_m - 1)) // self.cluster_tile_m
+            return expert_m_units(expert_i_row_count, const_expr(self.fused_tail_max_rows))
+        return (expert_i_row_count + (self.cluster_tile_m - 1)) // self.cluster_tile_m
 
     @dsl_user_op
     @cute.jit
     def _fetch_next_cluster_idx(self, *, loc=None, ip=None) -> Int32:
         """The stock fetch, but an extra cluster (rank >= ``clusters_beside_combine``) whose last claim is at or past
         N chunk 0's last wave adds 0 and broadcasts an index past every tile; the leader decides for the cluster."""
-        ds = self._dynamic_state
-        broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
-        if ds.is_leader_cta:
-            self.cluster_pipeline.producer_acquire(ds.producer_state)
-            full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip)
+        dynamic_state = self._dynamic_state
+        broadcast_tensor = cute.make_tensor(dynamic_state.broadcast_ptr, cute.make_layout((1,)))
+        if dynamic_state.is_leader_cta:
+            self.cluster_pipeline.producer_acquire(dynamic_state.producer_state)
+            full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(dynamic_state.producer_state.index, loc=loc, ip=ip)
             lane_idx = cute.arch.lane_idx()
             cluster_size = const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1])
             # The grid is (cluster shape, clusters), so bidz is this cluster's rank among them.
@@ -108,16 +108,16 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
                     stop = Int32(1)
             atomic_idx = Int32(0)
             if lane_idx == 0:
-                atomic_idx = atomic_add_i32(ds.counter_ptr.llvm_ptr, 1 - stop, loc=loc, ip=ip)
+                atomic_idx = atomic_add_i32(dynamic_state.counter_ptr.llvm_ptr, 1 - stop, loc=loc, ip=ip)
             atomic_idx = cute.arch.shuffle_sync(atomic_idx, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
             if stop == 1:
                 # SM100/107: cluster (2,1) 2-CTA or (1,1) only; this exit has no cluster barrier (check_dynamic_sched_cluster_shape).
                 atomic_idx = Int32(2**31 - 1)  # past every tile: invalid, so the cluster exits
             if lane_idx < cluster_size:
-                cute.arch.store_async_dsmem(ds.broadcast_ptr, atomic_idx, full_barrier_ptr, lane_idx, loc=loc, ip=ip)
+                cute.arch.store_async_dsmem(dynamic_state.broadcast_ptr, atomic_idx, full_barrier_ptr, lane_idx, loc=loc, ip=ip)
             self._cluster_producer_commit(loc=loc, ip=ip)
-        ds.producer_state.advance()
-        self.cluster_pipeline.consumer_wait(ds.consumer_state)
+        dynamic_state.producer_state.advance()
+        self.cluster_pipeline.consumer_wait(dynamic_state.consumer_state)
         return broadcast_tensor[0]
 
     @dsl_user_op
@@ -125,7 +125,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
     def _get_work_tile_for_linear_idx(self, cluster_linear_idx: Int32, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """The work tile at an index of the N-chunk order; invalid (expert -1) past the last tile."""
         N_TILE_SIZE = const_expr(self.cluster_tile_n)
-        last_expert_idx = const_expr(self.total_expert_cnt - 1)
+        last_expert_idx = const_expr(self.local_expert_count - 1)
         N_tiles_per_M_tile = ceil_div(self.intermediate, N_TILE_SIZE)
         total_M_tiles = self._total_m_tiles()
         work_tile_info = MoEWorkTileInfo(expert_idx=Int32(-1), tile_m_idx=Int32(0), tile_n_idx=Int32(0), k_tile_cnt=Int32(0))
@@ -196,16 +196,16 @@ class _NotifyState:
 
 class OutputNotifyConfig:
     """Trace-time notification settings; the default notifies nothing and costs nothing.  ``caller_reset``: the
-    caller runs ``reset`` ahead of each GEMM.  N_CHUNK: grid clusters from ``clusters_beside_combine`` on are extras."""
+    caller runs ``reset`` ahead of each GEMM.  N_CHUNK: grid clusters from ``clusters_beside_consumer`` on are extras."""
 
     def __init__(
-        self, mode: int = OutputNotifyMode.NONE, n_chunk_size: int = 0, n_chunk_capacity: int = 0, caller_reset: bool = False, clusters_beside_combine: int = 0
+        self, mode: int = OutputNotifyMode.NONE, n_chunk_size: int = 0, n_chunk_capacity: int = 0, caller_reset: bool = False, clusters_beside_consumer: int = 0
     ):
-        assert mode == OutputNotifyMode.NONE or clusters_beside_combine >= 1, f"N_CHUNK needs clusters_beside_combine >= 1, got {clusters_beside_combine}"
+        assert mode == OutputNotifyMode.NONE or clusters_beside_consumer >= 1, f"N_CHUNK needs clusters_beside_consumer >= 1, got {clusters_beside_consumer}"
         assert mode == OutputNotifyMode.NONE or n_chunk_size > 0, f"N_CHUNK needs n_chunk_size > 0, got {n_chunk_size}"
         self.mode, self.n_chunk_size, self.n_chunk_capacity = mode, n_chunk_size, n_chunk_capacity
         self.caller_reset = caller_reset
-        self.clusters_beside_combine = clusters_beside_combine
+        self.clusters_beside_consumer = clusters_beside_consumer
         self.enabled = mode != OutputNotifyMode.NONE
         # ``signal[n_chunk_capacity]``, int32, at the end of the kernel's workspace.
         self.workspace_bytes = 4 * n_chunk_capacity if self.enabled else 0
@@ -213,7 +213,7 @@ class OutputNotifyConfig:
     def bind(
         self,
         cta_tile_mn: Tuple[int, int],
-        expert_cnt: int,
+        local_expert_count: int,
         use_streaming_signal_sched: bool,
         tail_rows_alignment: Optional[int] = None,
         fused_tail_max_rows: int = 0,
@@ -224,7 +224,7 @@ class OutputNotifyConfig:
         assert not self.enabled or self.n_chunk_size % cta_tile_mn[1] == 0, f"N chunk {self.n_chunk_size} must be a multiple of CTA tile N {cta_tile_mn[1]}"
         bound = copy.copy(self)
         bound.cta_tile_m, bound.cta_tile_n = cta_tile_mn
-        bound.expert_cnt = expert_cnt
+        bound.expert_cnt = local_expert_count
         bound.rows_aligned = tail_rows_alignment is None or tail_rows_alignment >= CLUSTER_TILE_M
         bound.fused_tail_max_rows = fused_tail_max_rows
         return bound
@@ -245,7 +245,7 @@ class OutputNotifyConfig:
         if not self.enabled:
             return scheduler
         return MoEStreamingOutputChunkSignalTileScheduler(
-            scheduler, self.n_chunk_size, self.clusters_beside_combine, self.expert_cnt, self.rows_aligned, self.fused_tail_max_rows
+            scheduler, self.n_chunk_size, self.clusters_beside_consumer, self.expert_cnt, self.rows_aligned, self.fused_tail_max_rows
         )
 
     def _n_chunk_signal_ptr(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: int) -> cute.Pointer:
