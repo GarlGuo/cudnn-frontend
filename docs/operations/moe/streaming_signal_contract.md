@@ -79,8 +79,9 @@ producer does not need a proxy fence of its own.
   the claim counter either.
 - **Unbounded wait:** waits have no timeout; a bounded wait could return with the slot not ready. A cluster stops once
   its claim index passes the last tile (every M tile times `ceil(N / cluster tile N)`), before it waits on anything.
-- **Two GEMM launches on one counter:** a base kernel and its PDL tail can share one workspace and claim from the same
-  counter, and each tile is still computed once. Reset that workspace **once**, before the base.
+- **Two GEMM launches on one counter:** a base kernel and a second kernel launched as its PDL dependent can share one
+  workspace and claim from the same counter, and each tile is still computed once. Reset that workspace **once**,
+  before the base.
 
 ### Liveness
 
@@ -164,8 +165,8 @@ routing.
 | Option | Effect | Use |
 |---|---|---|
 | `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). | The GEMM runs beside its producer on one stream. |
-| `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM (a tail on the same counter) or an `N_CHUNK` consumer takes the SMs this grid leaves. |
-| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernel, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every signal slot is ready (with `device_layout`, after the layout), then lets the dependent launch. | The tail lands on the SMs the producer frees as it ends, not the first ones it frees. |
+| `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
+| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernel, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every signal slot is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
 
 ## 5. Sketches
 

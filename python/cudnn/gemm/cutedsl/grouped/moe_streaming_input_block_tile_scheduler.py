@@ -61,7 +61,6 @@ from .moe_signal_helpers import (
     mbarrier_try_wait_parity_acquire_cluster,
 )
 from .moe_utils import ceil_div
-from .moe_tail_tiles import cluster_m_tile_count
 from .moe_persistent_scheduler import (
     atomic_add_i32,
     MoEWorkTileInfo,
@@ -527,15 +526,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
         # inclusive ends padded to the signal slot, so the last one is the signal slot total.
         total_signal_slots = self.expert_freq_offsets[const_expr(self.params.local_expert_count - 1)] // const_expr(self.signal_slot_rows)
         linear_tile_idx = total_signal_slots * n_tiles_per_m_tile
-        claim_count = (
-            cluster_m_tile_count(
-                self.expert_freq_offsets,
-                const_expr(self.params.local_expert_count),
-                const_expr(self.params.cluster_tile_m),
-                const_expr(self.signal_slots_per_m_tile == 1),
-            )
-            * n_tiles_per_m_tile
-        )
+        # Experts are padded to whole cluster M tiles, so the M tile total is the padded row total over the tile M.
+        claim_count = self.expert_freq_offsets[const_expr(self.params.local_expert_count - 1)] // const_expr(self.params.cluster_tile_m) * n_tiles_per_m_tile
         if claim_idx < claim_count:
             # Every lane lands on the same side of this test: once ``assigned_claim_count``
             # is ``claim_idx`` it stays there until this very warp moves it.
