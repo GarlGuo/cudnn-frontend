@@ -387,7 +387,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
     @cute.jit
     def _expert_ready_m_tiles(self, expert: Int32) -> Int32:
         """How many M-tiles of ``expert`` are READY in a row from its first unassigned M-tile on, at most
-        ``EXPERT_BATCH_MAX_M_TILES``; none past the last expert.  One round of independent flag loads, no loop."""
+        ``EXPERT_BATCH_MAX_M_TILES``; none past the last expert.  One round of independent flag loads, no loop; a
+        lane loads only the flags of its expert's unassigned M-tiles, so a fully assigned expert costs no load."""
         local_expert_count = const_expr(self.params.local_expert_count)
         # A lane past the experts reads the last one's offsets, in bounds, and counts nothing.
         clamped_expert = cutlass.min(expert, local_expert_count - 1)
@@ -399,12 +400,13 @@ class MoEStreamingInputBlockSignalTileScheduler:
         if expert >= local_expert_count:
             run_limit = Int32(0)
         signal = streaming_signal_ptr(self._dynamic_state.counter_ptr)
-        # A flag past the expert's end reads its last M tile instead, in bounds and not counted.
-        last_m_tile = cutlass.max(expert_end_m_tile - 1, 0)
-        flags = [
-            cute.arch.load((signal + cutlass.min(first_unassigned_m_tile + m_tile_offset, last_m_tile)).llvm_ptr, Int32, sem="relaxed", scope="gpu")
-            for m_tile_offset in range(EXPERT_BATCH_MAX_M_TILES)
-        ]
+        # Predicated, still independent loads: only M-tiles below ``run_limit`` are read; the rest stay not ready.
+        flags = []
+        for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
+            flag = Int32(-1)
+            if m_tile_offset < run_limit:
+                flag = cute.arch.load((signal + (first_unassigned_m_tile + m_tile_offset)).llvm_ptr, Int32, sem="relaxed", scope="gpu")
+            flags.append(flag)
         ready_m_tile_count = Int32(0)
         for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
             if ready_m_tile_count == m_tile_offset and m_tile_offset < run_limit:
