@@ -228,5 +228,4 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 ## Acknowledgements
 
 The streaming signal contract and its schedulers were designed and developed by Wentao Guo, Phuong Nguyen,
-Zhongbo Zhu, Subhadeep Bhattacharya, Fei Wu, and Jimmy Zhang. See also
-[ACKNOWLEDGEMENTS.md](https://github.com/NVIDIA/cudnn-frontend/blob/main/ACKNOWLEDGEMENTS.md).
+Zhongbo Zhu, Subhadeep Bhattacharya, Fei Wu, and Jimmy Zhang.
