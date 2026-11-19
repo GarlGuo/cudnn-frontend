@@ -4,12 +4,32 @@
 
 """Streaming output-chunk tile scheduler and notifier for the MoE grouped GEMMs (2Dx3D).
 
-With ``StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, ...)`` the GEMM runs its tiles one N chunk of
-``C = n_chunk_size`` columns at a time. ``signal[]`` is int32, one entry per N chunk ``u`` in ``[0, ceil(N / C))``,
-at most ``n_chunk_capacity`` (size it with ``streaming_output_notify_capacity``). It is reset to -1 and stays negative
-(``-1 - tiles counted``) until the GEMM stores ``signal[u] = u`` with a gpu-scope release, once D's columns
-``[u * C, min((u + 1) * C, N))`` are in global memory for every row. A consumer kernel, such as an expert-parallel
-combine, sends each chunk while the GEMM is still running. Consumer contract: docs/operations/moe/streaming_signal_contract.md.
+With ``StreamingOutputNotifyMode.N_CHUNK`` the GEMM runs its tiles one N chunk of ``C = n_chunk_size`` columns
+at a time, so a consumer kernel, such as an expert-parallel combine, can send each chunk while the GEMM still runs.
+
+``signal[]``: int32, one entry per N chunk.
+- Chunk ``u`` covers D columns ``[u * C, min((u + 1) * C, N))``.
+- ``u`` is in ``[0, ceil(N / C))``, at most ``n_chunk_capacity`` (see ``streaming_output_notify_capacity``).
+- Reset to -1; stays negative (``-1 - tiles counted``) while incomplete.
+- The GEMM stores ``signal[u] = u`` with a gpu-scope release once every row of chunk ``u`` is in global memory.
+
+Consumer contract: docs/operations/moe/streaming_signal_contract.md.
+
+Terms:
+- Tiles counted: CTA tiles, two per cluster M tile with the 2-CTA MMA.
+- N-chunk order: ``cluster_linear_idx`` runs chunk by chunk, then M tile, then the chunk's N tiles.
+  Odd chunks walk M backward to reuse the A rows still in L2.
+- Extra clusters (rank >= ``clusters_beside_consumer``) exit once their claim reaches chunk 0's last wave,
+  leaving their SMs to the consumer.
+
+Example, cluster (1, 1), 2 M tiles x 4 N tiles, C = 2 N tiles; each tile shows its ``cluster_linear_idx``::
+
+             |- u0 -|- u1 -|
+              n0 n1  n2 n3
+        m0     0  1   6  7
+        m1     2  3   4  5        u1 starts on m1, whose A rows u0 just used
+
+    signal[0], 4 CTA tiles:  -1  ->  -3 (a CTA counts 2)  ->  -5 (another counts 2: 4 of 4)  ->  0 (release store)
 
 Assumes N <= (2^31 - 1) * n_chunk_size.
 """

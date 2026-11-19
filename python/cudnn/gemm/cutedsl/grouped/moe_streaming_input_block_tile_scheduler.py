@@ -4,13 +4,37 @@
 
 """Streaming input-block tile scheduler for the MoE grouped GEMMs (2Dx3D).
 
-``signal[]`` is int32, one entry per signal slot of ``signal_slot_rows`` rows of A (default the cluster tile M, which
-it must divide). Slot ``t`` covers A rows ``[t * signal_slot_rows, (t + 1) * signal_slot_rows)`` of the padded expert
-layout, for ``t`` in ``[0, padded_offsets[E - 1] / signal_slot_rows)``, at most ``streaming_signal_capacity`` slots.
-Before launch ``signal[]`` is reset to -1 (never 0: any value >= 0 reads as ready). A producer kernel, such as an
-expert-parallel dispatch, stores ``signal[t] = t`` with a gpu-scope release once slot ``t`` of A is in memory.
-The GEMM claims ready M tiles in expert-consecutive batches and starts each one as soon as it is ready, so it runs
-beside the producer instead of after it. Producer contract: docs/operations/moe/streaming_signal_contract.md.
+A producer kernel, such as an expert-parallel dispatch, fills A while the GEMM runs.
+
+``signal[]``: int32, one entry per signal slot of A.
+- Slot ``t`` covers A rows ``[t * signal_slot_rows, (t + 1) * signal_slot_rows)``;
+  ``signal_slot_rows`` defaults to the cluster tile M.
+- ``t`` is in ``[0, padded_offsets[E - 1] / signal_slot_rows)``, at most ``streaming_signal_capacity``.
+- Reset to -1 before launch (never 0: any value >= 0 reads as ready).
+- The producer stores ``signal[t] = t`` with a gpu-scope release once slot ``t`` is in memory.
+
+The GEMM runs ready M tiles in expert-consecutive batches as soon as they are ready.
+
+Producer contract: docs/operations/moe/streaming_signal_contract.md.
+
+Terms, with ``Q_N = ceil(N / cluster tile N)`` N tiles per M tile:
+- Ready M tile: all its signal slots read >= 0 (one slot per M tile by default).
+- ``claim_idx``: one atomic add on the counter, one (M tile, N tile) of work.
+  From ``M tiles * Q_N`` on, a claim gets END.
+- Expert-consecutive M batch: up to ``EXPERT_BATCH_MAX_M_TILES`` ready M tiles of one expert in a row.
+  It takes the next ``m_tile_count * Q_N`` claims N tile by N tile, so each N tile of B is reused from L2.
+- ``linear_tile_idx = m_tile_signal_slot * Q_N + n_tile``, broadcast to the cluster.
+  END is ``total_signal_slots * Q_N``.
+
+Example, ``Q_N = 2``, expert e0 with M tiles m0 and m1, e1 with m2; ``signal[1]`` is still -1::
+
+    M tile (slot t)     m0 (0, e0)    m1 (1, e0)    m2 (2, e1)
+    signal[t]           0             -1            2
+    linear_tile_idx     0, 1          2, 3          4, 5          END = 3 * 2 = 6
+    claim_idx           0, 1          4, 5          2, 3          >= 6: END
+
+Claim 0 opens e0 {m0} and claim 2 opens e1 {m2}.
+Claim 4 waits until ``signal[1] = 1``, then opens e0 {m1}.
 
 Assumes A rows <= (2^31 - 1) * signal_slot_rows.
 """
