@@ -82,7 +82,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
         for that grid before it exits.
     :param launch_pdl_dependents_at_all_streaming_signal_slots_ready: With ``streaming_signal_capacity``: one extra warp per CTA lets this kernel's
-        programmatic dependent launch once it has seen every ``signal[]`` slot ready.
+        programmatic dependent launch once it has seen every ``signal[]`` entry (M tile) ready.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -185,7 +185,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         if enable_bias:
             all_warps.append(self.bias_load_warp_id)
             warps_wo_sched.append(self.bias_load_warp_id)
-        # launch_pdl_dependents_at_all_streaming_signal_slots_ready: one more warp, which only waits for every signal slot and then triggers.
+        # launch_pdl_dependents_at_all_streaming_signal_slots_ready: one more warp, which only waits for every signal[] entry and then triggers.
         self.trigger_warp_id = len(all_warps) if launch_pdl_dependents_at_all_streaming_signal_slots_ready else None
         if launch_pdl_dependents_at_all_streaming_signal_slots_ready:
             all_warps.append(self.trigger_warp_id)

@@ -73,11 +73,11 @@ def streaming_signal_workspace_offsets(kernel) -> Dict[str, int]:
     for one signal-scheduler kernel INSTANCE."""
     desc_workspace_bytes = kernel.get_desc_workspace_bytes()
     capacity = kernel.streaming_signal_capacity
-    # The state holds 2 words per expert, assigned_claim_count and a 4-word record per M-tile: a kernel that sized
+    # The state holds 2 words per expert, assigned_claim_count and a 3-word record per M-tile: a kernel that sized
     # it otherwise overruns the workspace, and the scheduler hangs or faults.
     state_bytes = kernel.get_workspace_bytes() - (desc_workspace_bytes + streaming_scheduler_state_offset(capacity))
     assert state_bytes >= 4 * (
-        2 * kernel.expert_cnt + 1 + 4 * capacity
+        2 * kernel.expert_cnt + 1 + 3 * capacity
     ), f"state of {state_bytes} bytes: {kernel.expert_cnt} experts, capacity {capacity} do not fit"
     return {
         # The claim counter is the stock dynamic scheduler's own counter word.
