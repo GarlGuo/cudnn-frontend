@@ -41,15 +41,13 @@ EXPERT_BATCH_MAX_M_TILES = 16
 def _state_region_offsets(streaming_signal_capacity: int, local_expert_count: int) -> dict:
     """Int32 offset of each region of the scheduler state, and the total.  The reset is all zero; a batch record
     needs none, being written before ``assigned_claim_count`` exposes it."""
-    capacity = streaming_signal_capacity
-    # Indexed by expert, and a capacity can be below local_expert_count: fewer routed rows than experts.
-    expert_assigned_m_tiles_entry_count = max(capacity, local_expert_count)
-    # A batch record is 4 words per M-tile; then, per expert, 1 + the first claim index of its last batch (0: none).
-    expert_last_batch = expert_assigned_m_tiles_entry_count + 1 + 4 * capacity
+    # A word per expert, then assigned_claim_count; a batch record is 4 words per M-tile; then, per expert,
+    # 1 + the first claim index of its last batch (0: none).
+    expert_last_batch = local_expert_count + 1 + 4 * streaming_signal_capacity
     return {
         "expert_assigned_m_tiles": 0,
-        "assigned_claim_count": expert_assigned_m_tiles_entry_count,
-        "expert_consecutive_m_batch_record": expert_assigned_m_tiles_entry_count + 1,
+        "assigned_claim_count": local_expert_count,
+        "expert_consecutive_m_batch_record": local_expert_count + 1,
         "expert_last_batch": expert_last_batch,
         "total": expert_last_batch + local_expert_count,
     }
