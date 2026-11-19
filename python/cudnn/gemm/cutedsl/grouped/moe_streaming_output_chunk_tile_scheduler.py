@@ -21,7 +21,7 @@ from .moe_utils import ceil_div, compute_expert_token_range
 
 class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
     """Runs a stock scheduler N chunk -> every M tile -> the chunk's N tiles so a chunk finishes early; odd chunks walk
-    M backward to reuse the A rows still in L2.  ``rows_aligned``: rows are cluster-tile multiples, else tail tiles."""
+    M backward to reuse the A rows still in L2.  ``all_m_tiles_full``: rows are cluster-tile multiples, else tail tiles."""
 
     def __init__(
         self,
@@ -29,7 +29,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
         n_chunk_size: int,
         clusters_beside_consumer: int,
         local_expert_count: int,
-        rows_aligned: bool = True,
+        all_m_tiles_full: bool = True,
         fused_tail_max_rows: int = 0,
     ):
         assert (
@@ -41,7 +41,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
         self.clusters_beside_consumer = clusters_beside_consumer
         # The stock ``expert_cnt`` is a kernel argument; this is the same count at trace time.
         self.local_expert_count = local_expert_count
-        self.rows_aligned = rows_aligned
+        self.all_m_tiles_full = all_m_tiles_full
         self.fused_tail_max_rows = fused_tail_max_rows
         self.expert_freq_offsets = stock.offs
         # The current expert's M-tile range.  The stock walk state, which counts tiles
@@ -59,7 +59,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
             self.n_chunk_size,
             self.clusters_beside_consumer,
             self.local_expert_count,
-            self.rows_aligned,
+            self.all_m_tiles_full,
             self.fused_tail_max_rows,
         )
 
@@ -70,7 +70,7 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
             self.expert_freq_offsets,
             const_expr(self.local_expert_count),
             const_expr(self.cluster_tile_m),
-            const_expr(self.rows_aligned),
+            const_expr(self.all_m_tiles_full),
             const_expr(self.fused_tail_max_rows),
         )
 
@@ -101,16 +101,16 @@ class MoEStreamingOutputChunkSignalTileScheduler(MoEPersistentTileScheduler):
             total_M_tiles = self._total_m_tiles()
             first_n_chunk_tiles = total_M_tiles * cutlass.min(const_expr(self.n_chunk_size // N_TILE_SIZE), ceil_div(self.intermediate, N_TILE_SIZE))
             # Never below 0: every cluster claims its first tile.
-            stop_at = cutlass.max(first_n_chunk_tiles - self.num_persistent_clusters, 0)
-            stop = Int32(0)
+            early_exit_linear_idx = cutlass.max(first_n_chunk_tiles - self.num_persistent_clusters, 0)
+            exits_early = Int32(0)
             if cluster_rank >= const_expr(self.clusters_beside_consumer):
-                if self._current_work_linear_idx >= stop_at:
-                    stop = Int32(1)
+                if self._current_work_linear_idx >= early_exit_linear_idx:
+                    exits_early = Int32(1)
             atomic_idx = Int32(0)
             if lane_idx == 0:
-                atomic_idx = atomic_add_i32(dynamic_state.counter_ptr.llvm_ptr, 1 - stop, loc=loc, ip=ip)
+                atomic_idx = atomic_add_i32(dynamic_state.counter_ptr.llvm_ptr, 1 - exits_early, loc=loc, ip=ip)
             atomic_idx = cute.arch.shuffle_sync(atomic_idx, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
-            if stop == 1:
+            if exits_early == 1:
                 # SM100/107: cluster (2,1) 2-CTA or (1,1) only; this exit has no cluster barrier (check_dynamic_sched_cluster_shape).
                 atomic_idx = Int32(2**31 - 1)  # past every tile: invalid, so the cluster exits
             if lane_idx < cluster_size:
@@ -229,12 +229,12 @@ class StreamingOutputNotifyConfig:
         below the 2-CTA tile M (last M tile may be a tail); ``fused_tail_max_rows``: count M units."""
         assert not (use_streaming_signal_sched and self.enabled), "output notification is an FC2 feature; the signal scheduler is FC1's"
         assert not self.enabled or self.n_chunk_size % cta_tile_mn[1] == 0, f"N chunk {self.n_chunk_size} must be a multiple of CTA tile N {cta_tile_mn[1]}"
-        bound = copy.copy(self)
-        bound.cta_tile_m, bound.cta_tile_n = cta_tile_mn
-        bound.expert_cnt = local_expert_count
-        bound.rows_aligned = tail_rows_alignment is None or tail_rows_alignment >= CLUSTER_TILE_M
-        bound.fused_tail_max_rows = fused_tail_max_rows
-        return bound
+        resolved_config = copy.copy(self)
+        resolved_config.cta_tile_m, resolved_config.cta_tile_n = cta_tile_mn
+        resolved_config.expert_cnt = local_expert_count
+        resolved_config.all_m_tiles_full = tail_rows_alignment is None or tail_rows_alignment >= CLUSTER_TILE_M
+        resolved_config.fused_tail_max_rows = fused_tail_max_rows
+        return resolved_config
 
     def check_output_cols(self, output_cols) -> None:
         """Host side, before launch: ``signal[]`` must hold every N chunk of the GEMM's ``output_cols`` D columns, else
@@ -252,7 +252,7 @@ class StreamingOutputNotifyConfig:
         if not self.enabled:
             return scheduler
         return MoEStreamingOutputChunkSignalTileScheduler(
-            scheduler, self.n_chunk_size, self.clusters_beside_consumer, self.expert_cnt, self.rows_aligned, self.fused_tail_max_rows
+            scheduler, self.n_chunk_size, self.clusters_beside_consumer, self.expert_cnt, self.all_m_tiles_full, self.fused_tail_max_rows
         )
 
     def _n_chunk_signal_ptr(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: int) -> cute.Pointer:
@@ -364,7 +364,7 @@ class StreamingOutputStoreNotifier:
             counted_tile_count = pending_tile_count - 1 - cute.arch.warp_redux_sync(signal_before, "or")
             # CTA tiles of the chunk: every M tile times the N tiles of this possibly partial chunk.
             n_chunk_cols = cutlass.min(const_expr(config.n_chunk_size), self.output_cols - n_chunk * const_expr(config.n_chunk_size))
-            if const_expr(config.rows_aligned):
+            if const_expr(config.all_m_tiles_full):
                 total_rows = padded_offsets[const_expr(config.expert_cnt - 1)]
                 n_chunk_tile_count = total_rows // const_expr(config.cta_tile_m) * ceil_div(n_chunk_cols, const_expr(config.cta_tile_n))
             else:

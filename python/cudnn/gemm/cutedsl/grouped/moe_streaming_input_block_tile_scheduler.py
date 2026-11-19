@@ -353,13 +353,13 @@ class MoEStreamingInputBlockSignalTileScheduler:
         record_ptr = self._expert_consecutive_m_batch_record_ptr(m_tile_order)
         # Scheduler state is read and written at gpu scope (relaxed: L1 bypassed, so other SMs' writes are seen);
         # the release on ``assigned_claim_count`` publishes these stores.
-        for word, value in enumerate(record):
-            cute.arch.store((record_ptr + word).llvm_ptr, value, sem="relaxed", scope="gpu")
+        for record_entry_idx, value in enumerate(record):
+            cute.arch.store((record_ptr + record_entry_idx).llvm_ptr, value, sem="relaxed", scope="gpu")
 
     def _get_expert_consecutive_m_batch_record(self, m_tile_order: Int32) -> Tuple[Int32, Int32, Int32, Int32]:
         """The record (first claim index, first M-tile's signal slot, M-tile count, expert end signal slot) at ``m_tile_order``."""
         record_ptr = self._expert_consecutive_m_batch_record_ptr(m_tile_order)
-        return tuple(cute.arch.load((record_ptr + word).llvm_ptr, Int32, sem="relaxed", scope="gpu") for word in range(4))
+        return tuple(cute.arch.load((record_ptr + record_entry_idx).llvm_ptr, Int32, sem="relaxed", scope="gpu") for record_entry_idx in range(4))
 
     @cute.jit
     def _expert_first_signal_slot(self, expert: Int32) -> Int32:
@@ -457,38 +457,38 @@ class MoEStreamingInputBlockSignalTileScheduler:
             lane_ready_m_tile_count = Int32(0)
             lane_expert = Int32(0)
             for round_first_expert in cutlass.range_constexpr(0, local_expert_count, cute.arch.WARP_SIZE):
-                expert_of_lane = round_first_expert + lane_idx
-                ready_m_tile_count = self._expert_ready_m_tiles(expert_of_lane)
+                scanned_expert = round_first_expert + lane_idx
+                ready_m_tile_count = self._expert_ready_m_tiles(scanned_expert)
                 score = ready_m_tile_count
                 if ready_m_tile_count > 0:
-                    last_batch = cute.arch.load((expert_last_batch_ptr + expert_of_lane).llvm_ptr, Int32, sem="relaxed", scope="gpu")
+                    last_batch = cute.arch.load((expert_last_batch_ptr + scanned_expert).llvm_ptr, Int32, sem="relaxed", scope="gpu")
                     # Only a run that ends the expert or fills the batch cap: a shorter one (its rows still arriving)
                     # would open a small batch and cannot spare the expert another pass over its weights.
-                    expert_first_signal_slot = self._expert_first_signal_slot(expert_of_lane)
-                    assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + expert_of_lane
+                    expert_first_signal_slot = self._expert_first_signal_slot(scanned_expert)
+                    assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + scanned_expert
                     assigned_m_tiles = cute.arch.load(assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
                     run_end_signal_slot = expert_first_signal_slot + const_expr(self.signal_slots_per_m_tile) * (assigned_m_tiles + ready_m_tile_count)
-                    run_is_whole = ready_m_tile_count == const_expr(EXPERT_BATCH_MAX_M_TILES) or (
-                        run_end_signal_slot >= self.expert_freq_offsets[expert_of_lane] // const_expr(self.signal_slot_rows)
+                    ready_run_ends_expert_or_fills_batch = ready_m_tile_count == const_expr(EXPERT_BATCH_MAX_M_TILES) or (
+                        run_end_signal_slot >= self.expert_freq_offsets[scanned_expert] // const_expr(self.signal_slot_rows)
                     )
-                    if last_batch != 0 and run_is_whole:
+                    if last_batch != 0 and ready_run_ends_expert_or_fills_batch:
                         score = const_expr(EXPERT_BATCH_MAX_M_TILES) + last_batch
                 if score > lane_score:
                     lane_score = score
                     lane_ready_m_tile_count = ready_m_tile_count
-                    lane_expert = expert_of_lane
-            best_score = cute.arch.warp_redux_sync(lane_score, "max")
+                    lane_expert = scanned_expert
+            top_expert_score = cute.arch.warp_redux_sync(lane_score, "max")
             # Only a lane that holds the best score names its expert; the others
             # answer with the expert count, which is past all of them.
-            vote = Int32(local_expert_count)
-            if lane_score == best_score:
-                vote = lane_expert
-            expert = cute.arch.warp_redux_sync(vote, "min")
+            expert_candidate = Int32(local_expert_count)
+            if lane_score == top_expert_score:
+                expert_candidate = lane_expert
+            expert = cute.arch.warp_redux_sync(expert_candidate, "min")
             # And the lane that named it, its ready count (0 when no expert has one: look again).
-            count_vote = Int32(0)
+            ready_m_tile_count_candidate = Int32(0)
             if lane_expert == expert:
-                count_vote = lane_ready_m_tile_count
-            m_tile_count = cute.arch.warp_redux_sync(count_vote, "max")
+                ready_m_tile_count_candidate = lane_ready_m_tile_count
+            m_tile_count = cute.arch.warp_redux_sync(ready_m_tile_count_candidate, "max")
 
         with cute.arch.elect_one():
             expert_assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + expert
@@ -551,7 +551,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
                 claim_idx // n_tiles_per_m_tile
             )
             if const_expr(self.fused_tail_max_rows > 0):
-                # The record's last word is the expert; its offsets, as every offset here, are read after the layout
+                # The record's last entry is the expert; its offsets, as every offset here, are read after the layout
                 # wait.  A fused batch has one M unit fewer per N-tile: its tail M-tile rides in the units before it.
                 fused_batch = m_tile_count & FUSED_UNIT
                 m_tile_count = m_tile_count - fused_batch - fused_batch // FUSED_UNIT
@@ -630,12 +630,12 @@ class MoEStreamingInputBlockSignalTileScheduler:
         lane_idx = cute.arch.lane_idx()
         expert = Int32(local_expert_count)
         for first_expert in cutlass.range_constexpr(0, local_expert_count, cute.arch.WARP_SIZE):
-            expert_of_lane = first_expert + lane_idx
-            end_signal_slot = self.expert_freq_offsets[cutlass.min(expert_of_lane, local_expert_count - 1)] // const_expr(self.signal_slot_rows)
-            vote = Int32(local_expert_count)
-            if expert_of_lane < local_expert_count and m_tile_signal_slot < end_signal_slot:
-                vote = expert_of_lane
-            expert = cutlass.min(expert, cute.arch.warp_redux_sync(vote, "min"))
+            scanned_expert = first_expert + lane_idx
+            end_signal_slot = self.expert_freq_offsets[cutlass.min(scanned_expert, local_expert_count - 1)] // const_expr(self.signal_slot_rows)
+            expert_candidate = Int32(local_expert_count)
+            if scanned_expert < local_expert_count and m_tile_signal_slot < end_signal_slot:
+                expert_candidate = scanned_expert
+            expert = cutlass.min(expert, cute.arch.warp_redux_sync(expert_candidate, "min"))
         work_tile_info = MoEWorkTileInfo(expert_idx=Int32(-1), tile_m_idx=Int32(0), tile_n_idx=Int32(0), k_tile_cnt=Int32(0))
         if expert < local_expert_count:
             m_tile_in_expert = (m_tile_signal_slot - self._expert_first_signal_slot(expert)) // const_expr(self.signal_slots_per_m_tile)
