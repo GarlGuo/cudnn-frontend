@@ -81,7 +81,8 @@ class MoEGroupedGemmBf16Kernel:
         and the scheduler waits for them. ``padded_offsets`` must then be ``layout[1:E+1]`` of an ``E + 1`` int32
         buffer that the caller sets to -1 before the producer starts (``layout[0]`` is read too).
     :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
-        for that grid before it exits.
+        for that grid before it exits. With ``N_CHUNK`` and its own reset (not ``caller_reset``), that grid is the
+        reset, and every thread waits for it at entry instead, before any signal[] update or dependent launch.
     :param launch_pdl_dependents_at_entry: Let this kernel's own programmatic dependent launch at its entry.
     """
 
@@ -818,6 +819,10 @@ class MoEGroupedGemmBf16Kernel:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
         tidx, _, _ = cute.arch.thread_idx()
+        # With its own N_CHUNK reset, this kernel is the programmatic dependent of that reset: wait for it before any
+        # count lands on signal[] and before a dependent consumer can poll signal[].
+        if cutlass.const_expr(self.use_pdl and self.streaming_output_notify.enabled and not self.streaming_output_notify.caller_reset):
+            cute.arch.griddepcontrol_wait()
         if cutlass.const_expr(self.launch_pdl_dependents_at_entry):
             cute.arch.griddepcontrol_launch_dependents()
 
