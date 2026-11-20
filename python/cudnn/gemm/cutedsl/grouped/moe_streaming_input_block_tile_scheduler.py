@@ -67,6 +67,7 @@ from .moe_kernel_helpers import (
     mbarrier_try_wait_parity_acquire_cluster,
 )
 from .moe_utils import ceil_div
+from cudnn.frost.tile_dsl.consume import ReleaseZero, consume_then_arrive_on_peer
 from .moe_persistent_scheduler import (
     atomic_add_i32,
     MoEWorkTileInfo,
@@ -213,6 +214,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         cluster_pipeline,
         streaming_signal_capacity: int,
         device_layout: bool,
+        release_zero: ReleaseZero,
     ):
         self.params = params
         self.expert_freq_offsets = expert_freq_offsets
@@ -223,6 +225,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
         # Never serialized: a build-time int that only places the scheduler state.
         self.streaming_signal_capacity = streaming_signal_capacity
         self.device_layout = device_layout
+        # The kernel's release-zero (python/cudnn/AGENTS.md Rule 11), wrapped once at kernel entry; never serialized.
+        self.release_zero = release_zero
         check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity)
         # mapa.shared::cluster at one CTA is an illegal peer store.  check_dynamic_sched_cluster_shape admits (1, 1)
         # with the 1-CTA MMA, so this assert is what rejects it for the signal scheduler.
@@ -256,6 +260,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
             cluster_pipeline=self.cluster_pipeline,
             streaming_signal_capacity=self.streaming_signal_capacity,
             device_layout=const_expr(self.device_layout),
+            release_zero=self.release_zero,
         )
 
     @staticmethod
@@ -266,10 +271,13 @@ class MoEStreamingInputBlockSignalTileScheduler:
         sched_storage,
         *,
         streaming_signal_capacity: int,
+        release_zero: ReleaseZero,
         device_layout: bool = False,
     ) -> "MoEStreamingInputBlockSignalTileScheduler":
         """Create the scheduler from the claim counter ``counter_ptr``; ``signal[]`` and the scheduler state follow it.
-        ``device_layout``: wait for the dispatch-written layout before the first claim (see the module docstring)."""
+        ``device_layout``: wait for the dispatch-written layout before the first claim (see the module docstring).
+        ``release_zero``: ``release_zero(<the kernel's release-zero argument>)``, which orders each slot release after the
+        read of the slot (python/cudnn/AGENTS.md Rule 11)."""
         # %cluster_ctarank, hinted warp-uniform so it lands in a uniform register; CTAs are x-fastest in the cluster.
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cta_id_in_cluster = (
@@ -297,14 +305,22 @@ class MoEStreamingInputBlockSignalTileScheduler:
             cluster_pipeline=None,
             streaming_signal_capacity=streaming_signal_capacity,
             device_layout=device_layout,
+            release_zero=release_zero,
         )
 
     @cute.jit
     def advance_to_next_work(self) -> MoEWorkTileInfo:
         """Claim the cluster's next linear tile index and return its work tile, invalid past the last."""
-        work_tile_info = self._get_work_tile_for_linear_idx(self._broadcast_claimed_tile())
-        # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier.
-        self.cluster_pipeline.sync_object_empty.arrive(self._dynamic_state.consumer_state.index, 0)
+        claimed_linear_tile_idx = self._broadcast_claimed_tile()
+        work_tile_info = self._get_work_tile_for_linear_idx(claimed_linear_tile_idx)
+        # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier, each lane at an
+        # address computed from the slot word it read, so the read completes before the leader may refill the slot (Rule 11).
+        consume_then_arrive_on_peer(
+            self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index),
+            0,
+            claimed_linear_tile_idx,
+            self.release_zero,
+        )
         self._dynamic_state.consumer_state.advance()
         return work_tile_info
 

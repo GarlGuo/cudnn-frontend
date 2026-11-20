@@ -52,6 +52,7 @@ from ..moe_streaming_input_block_tile_scheduler import (
     MoEStreamingInputBlockSignalTileScheduler,
     streaming_signal_workspace_bytes_after_counter,
 )
+from cudnn.frost.tile_dsl.consume import release_zero
 from ..moe_streaming_output_chunk_tile_scheduler import StreamingOutputNotifyConfig
 
 
@@ -699,6 +700,7 @@ class MoEGroupedGemmBf16Kernel:
             self.epi_tile,
             self.sched_params,
             epilogue_op,
+            Int32(0) if self.use_streaming_signal_sched else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -797,7 +799,10 @@ class MoEGroupedGemmBf16Kernel:
         epi_tile: cute.Tile,
         sched_params: Union[MoESchedulerParams, MoEInputBlockSignalSchedulerParams],
         epilogue_op: cutlass.Constexpr,
+        release_zero_arg: Optional[Int32] = None,
     ):
+        """``release_zero_arg``: with the signal scheduler, the release-zero (python/cudnn/AGENTS.md Rule 11): the host
+        passes the literal 0 and its only use is ``release_zero()``; None otherwise."""
         del epilogue_op
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -885,6 +890,7 @@ class MoEGroupedGemmBf16Kernel:
                 counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
                 sched_storage=sched_storage,
                 streaming_signal_capacity=self.streaming_signal_capacity,
+                release_zero=release_zero(release_zero_arg),
                 device_layout=self.device_layout,
             )
         else:

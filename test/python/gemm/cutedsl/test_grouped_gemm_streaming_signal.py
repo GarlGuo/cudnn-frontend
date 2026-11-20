@@ -367,6 +367,35 @@ def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta, 
     assert signal.tolist() == list(range(capacity))
 
 
+def test_signal_slot_release_warm_stress():
+    """The claim slot each cluster broadcasts is released only after every lane read it (python/cudnn/AGENTS.md Rule 11):
+    back-to-back and shared-memory-poisoned launches of a shape with many claims per cluster, every byte against stock."""
+    from warm_stress import StressCase, assert_warm_stress
+
+    routing = ROUTINGS["big_expert"]
+    problem = make_problem(routing, FFN, HIDDEN, seed=13)
+    clusters = 4
+    stock_c, stock_d, _, _ = run(make_kernel(False, experts=len(routing), use_dynamic_sched=True), problem, False, max_active_clusters=clusters)
+    kernel = make_kernel(False, experts=len(routing), use_dynamic_sched=True, streaming_signal_capacity=problem["rows"] // ROWS_ALIGNMENT)
+    c, d, workspace, launch = run(kernel, problem, False, prepare_workspace=signal_ready(kernel), max_active_clusters=clusters, defer_launch=True)
+    reset_workspace = signal_ready(kernel)
+    claims = (problem["rows"] // ROWS_ALIGNMENT) * (FFN // 256)
+    assert_warm_stress(
+        StressCase(
+            "streaming signal scheduler, big expert, 4 clusters",
+            launch=launch,
+            outputs={"c": c, "d": d},
+            thread_blocks=2 * clusters,
+            refills_per_launch=claims // clusters,
+            reference={"c": stock_c, "d": stock_d},
+            reset=lambda: reset_workspace(workspace),
+        ),
+        warm=500,
+        poisoned=500,
+        budget_s=30.0,
+    )
+
+
 def test_streaming_options_reject_invalid():
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import StreamingOutputNotifyConfig, StreamingOutputNotifyMode
 

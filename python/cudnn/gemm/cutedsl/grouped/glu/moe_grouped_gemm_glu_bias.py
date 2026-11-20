@@ -55,6 +55,7 @@ from ..moe_streaming_input_block_tile_scheduler import (
     MoEStreamingInputBlockSignalTileScheduler,
     streaming_signal_workspace_bytes_after_counter,
 )
+from cudnn.frost.tile_dsl.consume import release_zero
 
 
 class MoEGroupedGemmGluBiasBf16Kernel:
@@ -760,6 +761,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             self.epi_tile,
             self.sched_params,
             linear_offset,
+            Int32(0) if self.use_streaming_signal_sched else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -990,9 +992,13 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         epi_tile: cute.Tile,
         sched_params: Union[MoESchedulerParams, MoEInputBlockSignalSchedulerParams],
         linear_offset: cutlass.Float32 = 0.0,
+        release_zero_arg: Optional[Int32] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
+
+        ``release_zero_arg``: with the signal scheduler, the release-zero (python/cudnn/AGENTS.md Rule 11): the host passes
+        the literal 0 and its only use is ``release_zero()``; None otherwise.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1079,6 +1085,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
                 counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
                 sched_storage=sched_storage,
                 streaming_signal_capacity=self.streaming_signal_capacity,
+                release_zero=release_zero(release_zero_arg),
                 device_layout=self.device_layout,
             )
         else:
