@@ -8,18 +8,21 @@ cluster runs a tile and when, never the tile math, so C and D must be raw-byte e
 orders, neighboring experts and the stock dynamic scheduler.
 
 Directions: forward only.  These are forward kernels; backward is unsupported by contract, not untested.
+
+Every category (replay, release order, batch invariance, N_CHUNK) runs at L0 on plain and GLU, both signal layouts, many
+experts and an expert of several batches, and ragged and partial tiles; L1 adds the remaining combinations of those.
 """
 
 import pytest
 import torch
 
 from determinism_utils import assert_bitwise, assert_replays, snapshot
-
-pytestmark = pytest.mark.L0
+from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, compile_once, kernel_args, launch_args
+from gemm.cutedsl._streaming_signal import make_kernel as build_kernel
+from gemm.cutedsl._streaming_signal import make_problem, new_buffers, padded, signal_ready
 
 HIDDEN = 512
 FFN = 512
-ROWS_ALIGNMENT = 256
 REPLAYS = 3
 
 
@@ -43,135 +46,26 @@ def require_sm10x_cutedsl():
 
 
 def make_kernel(glu, experts, **options):
-    import cutlass
-    from cudnn.gemm.cutedsl.grouped.glu.moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
-    from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
-    from cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm import MoEGroupedGemmBf16Kernel
-
-    common = dict(
-        acc_dtype=cutlass.Float32,
-        use_2cta_instrs=True,
-        mma_tiler_mn=(256, 256),
-        cluster_shape_mn=(2, 1),
-        vectorized_f32=True,
-        expert_cnt=experts,
-        weight_mode=MoEWeightMode.DENSE,
-        use_dynamic_sched=True,
-    )
-    if glu:
-        kernel = MoEGroupedGemmGluBiasBf16Kernel(generate_c=True, **common, **options)
-    else:
-        kernel = MoEGroupedGemmBf16Kernel(generate_c=True, enable_bias=False, **common, **options)
-    # Every constructor argument, so ``Launcher`` reuses a compile only for an identically built kernel.
-    kernel.test_compile_key = (type(kernel).__qualname__, frozen(common), frozen(options))
-    return kernel
-
-
-def frozen(value):
-    """A hashable, order-independent stand-in for a kernel option (tuples, enums, plain config objects)."""
-    if isinstance(value, dict):
-        return tuple(sorted((key, frozen(item)) for key, item in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(frozen(item) for item in value)
-    if hasattr(value, "__dict__") and not isinstance(value, type):
-        return (type(value).__qualname__, frozen(vars(value)))
-    return value
-
-
-# One compile per (kernel construction, argument layout, max_active_clusters) in this process: tensors are passed with
-# static layouts, so their shapes and strides are part of the key; their values and the launch buffers are not.
-COMPILED = {}
-
-
-def tensor_layout(x):
-    return (tuple(x.shape), tuple(x.stride()), str(x.dtype))
-
-
-def padded(tokens):
-    return -(-tokens // ROWS_ALIGNMENT) * ROWS_ALIGNMENT
-
-
-def make_problem(tokens_per_expert, n, k, seed=0, rows=None):
-    """Expert-major rows padded to ROWS_ALIGNMENT; padding rows hold data too (the kernel computes them).  ``rows``
-    can exceed the experts' rows: the extra rows are allocated but belong to no expert."""
-    experts = len(tokens_per_expert)
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    blocks = [padded(tokens) for tokens in tokens_per_expert]
-    rows = rows or max(sum(blocks), ROWS_ALIGNMENT)
-    a = torch.randn(rows, k, generator=generator, device="cuda", dtype=torch.bfloat16) * 0.25
-    b = torch.randn(experts, n, k, generator=generator, device="cuda", dtype=torch.bfloat16) * 0.25
-    layout = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
-    layout[1:] = torch.tensor(blocks, device="cuda", dtype=torch.int64).cumsum(0).to(torch.int32)
-    alpha = torch.rand(experts, generator=generator, device="cuda") + 0.5
-    prob = torch.rand(rows, 1, 1, generator=generator, device="cuda")
-    return {"a": a, "b": b, "layout": layout, "offsets": layout[1:], "alpha": alpha, "prob": prob, "rows": rows, "n": n, "k": k}
-
-
-def as_mkl(x):
-    m, k = x.shape
-    return x.as_strided((m, k, 1), (k, 1, m * k))
+    return build_kernel(glu, experts, use_dynamic_sched=True, **options)
 
 
 class Launcher:
-    """One ``cute.compile`` of ``kernel`` for a problem shape, launched any number of times on fresh NaN-filled C, D and
+    """One compile of ``kernel`` for a problem shape, launched any number of times on fresh NaN-filled C, D and
     workspace buffers, so a replay never reads what an earlier launch left behind."""
 
     def __init__(self, kernel, problem, glu, max_active_clusters=None):
-        import cuda.bindings.driver as cuda
-        import cutlass.cute as cute
-        from cutlass.utils import HardwareInfo
-
         self.kernel, self.glu = kernel, glu
-        if max_active_clusters is None:
-            max_active_clusters = HardwareInfo().get_max_active_clusters(2)
-        c, d, workspace = self.buffers(problem)
-        args = self._args(problem, c, d, workspace)
-        layouts = [as_mkl(problem["a"]), problem["b"].permute(1, 2, 0), as_mkl(c), as_mkl(d), problem["offsets"], problem["alpha"], problem["prob"], workspace]
-        key = (kernel.test_compile_key, glu, problem["n"], problem["k"], max_active_clusters, tuple(tensor_layout(x) for x in layouts))
-        self._compiled = COMPILED.get(key)
-        if self._compiled is None:
-            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-            self._compiled = COMPILED[key] = cute.compile(kernel, *args, max_active_clusters, stream)
+        self._compiled = compile_once(kernel, problem, glu, self.buffers(problem), max_active_clusters)
 
     def buffers(self, problem):
-        rows, n = problem["rows"], problem["n"]
-        c = torch.full((rows, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-        d = torch.full((rows, n // 2 if self.glu else n), float("nan"), device="cuda", dtype=torch.bfloat16)
-        workspace = torch.zeros(max(self.kernel.get_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
-        return c, d, workspace
-
-    def _args(self, problem, c, d, workspace):
-        import cutlass
-        from cutlass.cute.nvgpu import OperandMajorMode
-        from cutlass.cute.runtime import from_dlpack
-
-        def tensor(x):
-            return from_dlpack(x, assumed_align=16)
-
-        n, k = problem["n"], problem["k"]
-        args = [
-            tensor(as_mkl(problem["a"])),
-            tensor(problem["b"].permute(1, 2, 0)),
-            cutlass.Int32(n),
-            cutlass.Int32(k),
-            cutlass.Int64(k),
-            OperandMajorMode.K,
-            from_dlpack(workspace, assumed_align=128).iterator,
-            tensor(as_mkl(c)),
-            tensor(as_mkl(d)),
-            from_dlpack(problem["offsets"], assumed_align=4),
-            tensor(problem["alpha"]),
-        ]
-        prob = tensor(problem["prob"])
-        return args + ([prob, None] if self.glu else [None, prob])
+        return new_buffers(self.kernel, problem, self.glu)
 
     def launch(self, problem, buffers, stream=None):
         """Enqueue the GEMM on ``stream`` (default: current) with ``buffers`` = (C, D, workspace)."""
         import cuda.bindings.driver as cuda
 
         stream = stream or torch.cuda.current_stream()
-        runtime_args = [x for i, x in enumerate(self._args(problem, *buffers)) if i != 5]
-        self._compiled(*runtime_args, cuda.CUstream(stream.cuda_stream))
+        self._compiled(*launch_args(kernel_args(problem, self.glu, *buffers)), cuda.CUstream(stream.cuda_stream))
 
     def __call__(self, problem, prepare_workspace=None):
         """Fresh buffers, ``prepare_workspace(workspace)``, one launch; returns {"c", "d"} over the experts' rows."""
@@ -183,12 +77,6 @@ class Launcher:
         return {"c": buffers[0][:rows], "d": buffers[1][:rows]}
 
 
-def signal_ready(kernel):
-    from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
-
-    return lambda workspace: reset_streaming_signal_workspace(workspace, kernel, all_complete=True)
-
-
 def signal_options(glu, capacity, variant):
     options = dict(streaming_signal_capacity=capacity)
     if variant == "signal_layout_pdl":
@@ -198,15 +86,29 @@ def signal_options(glu, capacity, variant):
 
 
 # More than 32 experts take the batch opener several lane rounds; an expert of more than 16 M tiles needs several batches.
-ROUTINGS = {
-    "many_experts_64": [(0, 1, 255, 256, 257, 700, 1300)[i % 7] for i in range(64)],
-    "big_expert": [256, 5000, 0, 513, 1],
+ROUTINGS = {"many_experts_64": MANY_EXPERTS_64, "big_expert": BIG_EXPERT}
+
+
+def levels(cases, l0, ids):
+    """``cases`` as pytest params: L0 for those in ``l0``, L1 for the rest."""
+    return [pytest.param(*case, marks=pytest.mark.L0 if case in l0 else pytest.mark.L1, id=ids(*case)) for case in cases]
+
+
+def kernel_id(glu):
+    return f"fprop-bf16-{'glu' if glu else 'plain'}"
+
+
+REPLAY_CASES = [(glu, variant, routing) for glu in (False, True) for variant in ("signal", "signal_layout_pdl") for routing in sorted(ROUTINGS)]
+# Each kernel, signal layout and routing at L0 at least once (the other four pairings are L1).
+REPLAY_L0 = {
+    (False, "signal", "many_experts_64"),
+    (True, "signal", "big_expert"),
+    (False, "signal_layout_pdl", "big_expert"),
+    (True, "signal_layout_pdl", "many_experts_64"),
 }
 
 
-@pytest.mark.parametrize("routing", sorted(ROUTINGS))
-@pytest.mark.parametrize("variant", ["signal", "signal_layout_pdl"])
-@pytest.mark.parametrize("glu", [False, True], ids=["fprop-bf16-plain", "fprop-bf16-glu"])
+@pytest.mark.parametrize("glu, variant, routing", levels(REPLAY_CASES, REPLAY_L0, lambda glu, variant, routing: f"{kernel_id(glu)}-{variant}-{routing}"))
 def test_signal_replays_match_dynamic(glu, variant, routing):
     """Replays on fresh buffers beside concurrent work give the same bytes, which equal the stock dynamic scheduler's."""
     n = 2 * FFN if glu else FFN
@@ -229,6 +131,7 @@ def release_order(order, capacity):
     return torch.randperm(capacity, generator=torch.Generator().manual_seed(capacity)).tolist()
 
 
+@pytest.mark.L0
 @pytest.mark.parametrize("glu", [False, True], ids=["fprop-bf16-plain", "fprop-bf16-glu"])
 def test_producer_release_order_invariance(glu):
     """The GEMM starts while every M tile reads not-ready and A holds NaN; a producer on another stream releases the M
@@ -345,7 +248,11 @@ def batch_kernel(glu, mode, n):
     return kernel, signal_ready(kernel)
 
 
-@pytest.mark.parametrize("glu, mode", BATCH_CASES, ids=[f"fprop-bf16-{'glu' if glu else 'plain'}-{mode}" for glu, mode in BATCH_CASES])
+# Each kernel and each option at L0 once: plain host layout, GLU device layout, plain N_CHUNK.
+BATCH_L0 = {(False, "signal-host-layout"), (True, "signal-device-layout"), (False, "n-chunk")}
+
+
+@pytest.mark.parametrize("glu, mode", levels(BATCH_CASES, BATCH_L0, lambda glu, mode: f"{kernel_id(glu)}-{mode}"))
 def test_target_expert_batch_invariance(glu, mode):
     """The target expert's C and D bytes do not depend on what is packed around it: alone, with neighbors, behind empty
     experts, among ragged ones (1, 255, 257 rows), reordered, or duplicated."""
@@ -365,7 +272,10 @@ def test_target_expert_batch_invariance(glu, mode):
             assert_bitwise(got, expected, f"target in {name} (copy {copy})")
 
 
-@pytest.mark.parametrize("n_and_chunk", [(2 * HIDDEN, 256), (768, 512)], ids=["n1024_c256", "n768_c512"])
+# A partial last chunk at L0; whole chunks are at L0 in the batch-invariance N_CHUNK case.
+@pytest.mark.parametrize(
+    "n_and_chunk", [pytest.param((2 * HIDDEN, 256), marks=pytest.mark.L1, id="n1024_c256"), pytest.param((768, 512), marks=pytest.mark.L0, id="n768_c512")]
+)
 def test_output_notify_replays_match_dynamic(n_and_chunk):
     """N_CHUNK replays give the same bytes, which equal the stock scheduler's whether the extra clusters stop early
     (one cluster beside the consumer) or never stop."""

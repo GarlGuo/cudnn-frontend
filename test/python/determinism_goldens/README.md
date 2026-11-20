@@ -2257,7 +2257,7 @@ as part of this addition.
 
 ### Grouped GEMM streaming signal options — SM100, 2026-11-20
 
-`gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` adds 17 L0
+`gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` adds 17
 forward cases for the streaming options of the BF16 grouped GEMM kernels
 (plain and GLU, dense weights, 256 x 256 tile, (2, 1) cluster, dynamic
 scheduler). These options change which cluster runs a tile and when, never the
@@ -2282,6 +2282,13 @@ and also checks replays or packings:
   (partial last chunk). Replays use one cluster beside the consumer (early
   stop) and 1000 (none); the two settings and the stock scheduler agree.
 
+Levels: 10 cases are L0, which keeps every category at L0 on both kernels, both
+signal layouts, both routings, ragged experts and a partial last chunk. The L0
+cases are 4 replays (each kernel, layout and routing once), both release-order
+cases, 3 batch-invariance cases (plain host layout, GLU device layout, plain
+`N_CHUNK`) and the N=768/chunk 512 `N_CHUNK` replay. The other 7 combinations
+are L1.
+
 The independent float reference stays in
 `test_grouped_gemm_streaming_signal.py` (`plain_reference`). No golden is
 recorded for this suite: the claim is byte equality with the stock scheduler on
@@ -2302,12 +2309,15 @@ files. Each run sharded the cases over four GPUs:
 - Earlier runs on the `b45ad82e` and `63a7ee55` sources also passed with no
   failures or skips. They ran 101, 17 and 102 cases; the first predates the
   `N_CHUNK` batch-invariance case.
+- After the L0/L1 split (same sources, test files only): `-m "L0 or L1"` over
+  both files collected 103 cases and **103 passed**; `-m L0` alone, 21 cases of
+  which 10 are this suite's, passed serially on one GPU in 27 s.
 
 SM103, SM107 and CUDA 13 DSL compilation remain unverified. From `test/python`:
 
 ```bash
-python -m pytest gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py -m L0 -q -rs
-python -m pytest gemm/cutedsl/test_grouped_gemm_streaming_signal.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py -m "L0 or L1" -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_streaming_signal.py -m "L0 or L1" -q -rs
 ```
 
 ### GLU + Hadamard + quant column-scale packing — SM100, 2026-11-11

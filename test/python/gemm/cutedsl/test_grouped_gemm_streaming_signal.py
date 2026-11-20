@@ -5,17 +5,21 @@
 
 Each signal path must give the same bits as the stock dynamic scheduler: the tile math is the same, only the order
 in which tiles run and the readiness waits differ.
+
+L0 keeps one case per behaviour, chosen to reuse the kernels the determinism suite compiles; the remaining routings,
+release orders and chunk shapes are L1.
 """
 
 import pytest
 import torch
 
-pytestmark = pytest.mark.L0
+from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, compile_once, kernel_args, launch_args
+from gemm.cutedsl._streaming_signal import make_kernel as build_kernel
+from gemm.cutedsl._streaming_signal import make_problem, new_buffers, signal_ready
 
 EXPERTS = 4
 HIDDEN = 512
 FFN = 512
-ROWS_ALIGNMENT = 256
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +41,11 @@ def require_sm10x():
         pytest.skip(reason)
 
 
+def levels(cases, l0, ids):
+    """``cases`` as pytest params: L0 for those in ``l0``, L1 for the rest."""
+    return [pytest.param(*case, marks=pytest.mark.L0 if case in l0 else pytest.mark.L1, id=ids(*case)) for case in cases]
+
+
 def kernel_classes():
     from cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm import MoEGroupedGemmBf16Kernel
     from cudnn.gemm.cutedsl.grouped.glu.moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
@@ -44,121 +53,26 @@ def kernel_classes():
     return MoEGroupedGemmBf16Kernel, MoEGroupedGemmGluBiasBf16Kernel
 
 
-def frozen(value):
-    """A hashable, order-independent stand-in for a kernel option (tuples, enums, plain config objects)."""
-    if isinstance(value, dict):
-        return tuple(sorted((key, frozen(item)) for key, item in value.items()))
-    if isinstance(value, (list, tuple)):
-        return tuple(frozen(item) for item in value)
-    if hasattr(value, "__dict__") and not isinstance(value, type):
-        return (type(value).__qualname__, frozen(vars(value)))
-    return value
-
-
 def make_kernel(glu, one_cta=False, experts=EXPERTS, **options):
-    import cutlass
-    from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
-
-    plain_class, glu_class = kernel_classes()
-    common = dict(
-        acc_dtype=cutlass.Float32,
-        use_2cta_instrs=not one_cta,
-        mma_tiler_mn=(128, 256) if one_cta else (256, 256),
-        cluster_shape_mn=(1, 1) if one_cta else (2, 1),
-        vectorized_f32=True,
-        expert_cnt=experts,
-        weight_mode=MoEWeightMode.DENSE,
-    )
-    if glu:
-        kernel = glu_class(generate_c=True, **common, **options)
-    else:
-        kernel = plain_class(generate_c=True, enable_bias=False, **common, **options)
-    # Every constructor argument, so ``run`` reuses a compile only for an identically built kernel.
-    kernel.test_compile_key = (type(kernel).__qualname__, frozen(common), frozen(options))
-    return kernel
-
-
-# One compile per (kernel construction, argument layout, max_active_clusters) in this process: tensors are passed with
-# static layouts, so their shapes and strides are part of the key; their values and the launch buffers are not.
-COMPILED = {}
-
-
-def tensor_layout(x):
-    return (tuple(x.shape), tuple(x.stride()), str(x.dtype))
-
-
-def make_problem(tokens_per_expert, n, k, seed=0):
-    """Expert-major rows padded to ROWS_ALIGNMENT; padding rows hold data too (the kernel computes them).  One expert
-    per entry of ``tokens_per_expert``."""
-    experts = len(tokens_per_expert)
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    padded = [-(-tokens // ROWS_ALIGNMENT) * ROWS_ALIGNMENT for tokens in tokens_per_expert]
-    rows = max(sum(padded), ROWS_ALIGNMENT)
-    a = torch.randn(rows, k, generator=generator, device="cuda", dtype=torch.bfloat16) * 0.25
-    b = torch.randn(experts, n, k, generator=generator, device="cuda", dtype=torch.bfloat16) * 0.25
-    # A device layout reads layout[0] (expert 0's start) before padded_offsets = layout[1:E+1].
-    layout = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
-    layout[1:] = torch.tensor(padded, device="cuda", dtype=torch.int64).cumsum(0).to(torch.int32)
-    offsets = layout[1:]
-    alpha = torch.rand(experts, generator=generator, device="cuda") + 0.5
-    prob = torch.rand(rows, 1, 1, generator=generator, device="cuda")
-    return {"a": a, "b": b, "layout": layout, "offsets": offsets, "alpha": alpha, "prob": prob, "rows": rows, "n": n, "k": k}
-
-
-def as_mkl(x):
-    m, k = x.shape
-    return x.as_strided((m, k, 1), (k, 1, m * k))
+    return build_kernel(glu, experts, one_cta, **options)
 
 
 def run(kernel, problem, glu, prepare_workspace=None, max_active_clusters=None, stream=None, defer_launch=False):
-    """Compile ``kernel`` on ``problem`` and launch it, or with ``defer_launch`` leave the launch to the caller; returns
-    (C, D, workspace, launch), ``launch`` None once launched.  ``prepare_workspace(ws)`` runs on the launch stream first."""
+    """Compile ``kernel`` on ``problem`` (once per construction and layout) and launch it, or with ``defer_launch`` leave
+    the launch to the caller; returns (C, D, workspace, launch), ``launch`` None once launched.  ``prepare_workspace(ws)``
+    runs on the launch stream first."""
     import cuda.bindings.driver as cuda
-    import cutlass
-    import cutlass.cute as cute
-    from cutlass.cute.nvgpu import OperandMajorMode
-    from cutlass.cute.runtime import from_dlpack
-    from cutlass.utils import HardwareInfo
 
-    rows, n, k = problem["rows"], problem["n"], problem["k"]
-    d_cols = n // 2 if glu else n
-    c = torch.full((rows, n), float("nan"), device="cuda", dtype=torch.bfloat16)
-    d = torch.full((rows, d_cols), float("nan"), device="cuda", dtype=torch.bfloat16)
-    workspace = torch.zeros(max(kernel.get_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
+    buffers = new_buffers(kernel, problem, glu)
+    c, d, workspace = buffers
     stream = stream or torch.cuda.current_stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         if prepare_workspace is not None:
             prepare_workspace(workspace)
-    if max_active_clusters is None:
-        max_active_clusters = HardwareInfo().get_max_active_clusters(2)
-
-    def tensor(x):
-        return from_dlpack(x, assumed_align=16)
-
-    b = problem["b"].permute(1, 2, 0)
-    args = [
-        tensor(as_mkl(problem["a"])),
-        tensor(b),
-        cutlass.Int32(n),
-        cutlass.Int32(k),
-        cutlass.Int64(k),
-        OperandMajorMode.K,
-        from_dlpack(workspace, assumed_align=128).iterator,
-        tensor(as_mkl(c)),
-        tensor(as_mkl(d)),
-        from_dlpack(problem["offsets"], assumed_align=4),
-        tensor(problem["alpha"]),
-    ]
-    prob = tensor(problem["prob"])
-    args += [prob, None] if glu else [None, prob]
+    compiled = compile_once(kernel, problem, glu, buffers, max_active_clusters)
+    runtime_args = launch_args(kernel_args(problem, glu, *buffers))
     cu_stream = cuda.CUstream(stream.cuda_stream)
-    layouts = [as_mkl(problem["a"]), b, as_mkl(c), as_mkl(d), problem["offsets"], problem["alpha"], problem["prob"], workspace]
-    key = (kernel.test_compile_key, glu, n, k, max_active_clusters, tuple(tensor_layout(x) for x in layouts))
-    compiled = COMPILED.get(key)
-    if compiled is None:
-        compiled = COMPILED[key] = cute.compile(kernel, *args, max_active_clusters, cu_stream)
-    runtime_args = [x for i, x in enumerate(args) if i != 5]
 
     def launch():
         compiled(*runtime_args, cu_stream)
@@ -179,12 +93,6 @@ def plain_reference(problem):
     return out, out * prob[:, None]
 
 
-def signal_ready(kernel):
-    from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
-
-    return lambda workspace: reset_streaming_signal_workspace(workspace, kernel, all_complete=True)
-
-
 def valid_rows(problem):
     return int(problem["offsets"][-1].item())
 
@@ -194,9 +102,9 @@ def valid_rows(problem):
 ROUTINGS = {
     "uneven": [700, 0, 256, 1],
     "one_expert": [1300, 0, 0, 0],
-    "many_experts_64": [(0, 1, 255, 256, 257, 700, 1300)[i % 7] for i in range(64)],
+    "many_experts_64": MANY_EXPERTS_64,
     "many_experts_128_small": [(256, 300, 512, 600, 768)[i % 5] for i in range(128)],
-    "big_expert": [256, 5000, 0, 513, 1],
+    "big_expert": BIG_EXPERT,
     "mostly_empty": [700 if i == 5 else 300 if i == 31 else 0 for i in range(32)],
     "rows_not_aligned": [255, 257, 511, 1025],
 }
@@ -206,9 +114,13 @@ def experts_of(routing):
     return len(ROUTINGS[routing])
 
 
-@pytest.mark.parametrize("routing", sorted(ROUTINGS))
-@pytest.mark.parametrize("variant", ["signal", "signal_layout_pdl"])
-@pytest.mark.parametrize("glu", [False, True], ids=["plain", "glu"])
+MATCH_CASES = [(glu, variant, routing) for glu in (False, True) for variant in ("signal", "signal_layout_pdl") for routing in sorted(ROUTINGS)]
+MATCH_L0 = {(False, "signal", "many_experts_64"), (True, "signal", "big_expert"), (False, "signal_layout_pdl", "big_expert")}
+
+
+@pytest.mark.parametrize(
+    "glu, variant, routing", levels(MATCH_CASES, MATCH_L0, lambda glu, variant, routing: f"{'glu' if glu else 'plain'}-{variant}-{routing}")
+)
 def test_signal_consumer_matches_dynamic(glu, variant, routing):
     n = 2 * FFN if glu else FFN
     problem = make_problem(ROUTINGS[routing], n, HIDDEN, seed=len(routing))
@@ -232,8 +144,10 @@ def test_signal_consumer_matches_dynamic(glu, variant, routing):
         torch.testing.assert_close(d[:rows].float(), d_ref[:rows], atol=2e-2, rtol=2e-2)
 
 
-@pytest.mark.parametrize("experts", [EXPERTS, 64])
-@pytest.mark.parametrize("device_layout", [False, True])
+NO_ROWS_CASES = [(device_layout, experts) for device_layout in (False, True) for experts in (EXPERTS, 64)]
+
+
+@pytest.mark.parametrize("device_layout, experts", levels(NO_ROWS_CASES, {(True, EXPERTS)}, lambda device_layout, experts: f"{device_layout}-{experts}"))
 def test_signal_consumer_with_no_rows_exits(device_layout, experts):
     problem = make_problem([0] * experts, FFN, HIDDEN)
     kernel = make_kernel(False, experts=experts, use_dynamic_sched=True, streaming_signal_capacity=1, device_layout=device_layout)
@@ -253,9 +167,13 @@ def release_order(order, capacity):
     return torch.randperm(capacity, generator=torch.Generator().manual_seed(capacity)).tolist()
 
 
-@pytest.mark.parametrize("order", ["in_order", "reverse", "random"])
-@pytest.mark.parametrize("routing", sorted(PRODUCER_ROUTINGS))
-@pytest.mark.parametrize("glu", [False, True], ids=["plain", "glu"])
+PRODUCER_CASES = [(glu, routing, order) for glu in (False, True) for routing in sorted(PRODUCER_ROUTINGS) for order in ("in_order", "reverse", "random")]
+
+
+@pytest.mark.parametrize(
+    "glu, routing, order",
+    levels(PRODUCER_CASES, {(False, "many_experts_64", "reverse")}, lambda glu, routing, order: f"{'glu' if glu else 'plain'}-{routing}-{order}"),
+)
 def test_signal_consumer_waits_for_producer(glu, routing, order):
     """The GEMM starts while every signal[] entry reads not-ready and A holds NaN; a later kernel on another stream writes A one
     M tile at a time, in ``order``, and then marks it ready.  Reading any tile early would carry NaN into D."""
@@ -309,19 +227,21 @@ def test_signal_consumer_waits_for_producer(glu, routing, order):
     assert torch.equal(d[:valid], stock_d[:valid])
 
 
-@pytest.mark.parametrize("glu", [False, True], ids=["plain", "glu"])
+@pytest.mark.parametrize("glu", levels([(False,), (True,)], {(True,)}, lambda glu: "glu" if glu else "plain"))
 def test_device_layout_waits_for_producer(glu):
     """The GEMM starts while the layout reads -1, every signal[] entry reads not-ready and A holds NaN; a later kernel on
     another stream writes the layout, then A one M tile at a time with its signal[] entry.  The GLU also triggers once every M tile is ready."""
     n = 2 * FFN if glu else FFN
-    problem = make_problem([700, 300, 256, 513], n, HIDDEN, seed=11)
+    # Many experts: the layout has 65 entries to wait for, and the stock kernel is the one the other tests built.
+    experts = len(MANY_EXPERTS_64)
+    problem = make_problem(MANY_EXPERTS_64, n, HIDDEN, seed=11)
     capacity = problem["rows"] // ROWS_ALIGNMENT
     final_a, final_layout = problem["a"].clone(), problem["layout"].clone()
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity, device_layout=True)
     if glu:
         options["launch_pdl_dependents_at_all_streaming_signal_slots_ready"] = True
-    kernel = make_kernel(glu, **options)
-    stock_c, stock_d, _, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
+    kernel = make_kernel(glu, experts=experts, **options)
+    stock_c, stock_d, _, _ = run(make_kernel(glu, experts=experts, use_dynamic_sched=True), problem, glu)
     torch.cuda.synchronize()
 
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
@@ -366,9 +286,15 @@ OUTPUT_CASES = [(n_and_chunk, "uneven") for n_and_chunk in sorted(OUTPUT_CHUNKS)
 ]
 
 
-@pytest.mark.parametrize("n_and_chunk, routing", OUTPUT_CASES, ids=[f"{c}-{r}" for c, r in OUTPUT_CASES])
-@pytest.mark.parametrize("one_cta", [False, True], ids=["cluster21", "cluster11"])
-@pytest.mark.parametrize("clusters_beside_consumer", [1, 1000])
+NOTIFY_CASES = [(beside, one_cta, chunk, routing) for beside in (1, 1000) for one_cta in (False, True) for chunk, routing in OUTPUT_CASES]
+# A partial last chunk at cluster (2, 1), whole chunks at (1, 1), and N < C (one chunk).
+NOTIFY_L0 = {(1, False, "n768_c512", "many_experts_64"), (1, True, "n1024_c256", "uneven"), (1000, False, "n768_c1024", "uneven")}
+
+
+@pytest.mark.parametrize(
+    "clusters_beside_consumer, one_cta, n_and_chunk, routing",
+    levels(NOTIFY_CASES, NOTIFY_L0, lambda beside, one_cta, chunk, routing: f"{beside}-{'cluster11' if one_cta else 'cluster21'}-{chunk}-{routing}"),
+)
 def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta, n_and_chunk, routing):
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import (
         StreamingOutputNotifyConfig,
@@ -395,6 +321,7 @@ def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta, 
     assert signal.tolist() == list(range(capacity))
 
 
+@pytest.mark.L0
 def test_signal_slot_release_warm_stress():
     """The claim slot each cluster broadcasts is released only after every lane read it (python/cudnn/AGENTS.md Rule 11):
     back-to-back and shared-memory-poisoned launches of a shape with many claims per cluster, every byte against stock."""
@@ -403,7 +330,7 @@ def test_signal_slot_release_warm_stress():
     routing = ROUTINGS["big_expert"]
     problem = make_problem(routing, FFN, HIDDEN, seed=13)
     clusters = 4
-    stock_c, stock_d, _, _ = run(make_kernel(False, experts=len(routing), use_dynamic_sched=True), problem, False, max_active_clusters=clusters)
+    stock_c, stock_d, _, _ = run(make_kernel(False, experts=len(routing), use_dynamic_sched=True), problem, False)
     kernel = make_kernel(False, experts=len(routing), use_dynamic_sched=True, streaming_signal_capacity=problem["rows"] // ROWS_ALIGNMENT)
     c, d, workspace, launch = run(kernel, problem, False, prepare_workspace=signal_ready(kernel), max_active_clusters=clusters, defer_launch=True)
     reset_workspace = signal_ready(kernel)
@@ -424,6 +351,7 @@ def test_signal_slot_release_warm_stress():
     )
 
 
+@pytest.mark.L0
 def test_streaming_options_reject_invalid():
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import StreamingOutputNotifyConfig, StreamingOutputNotifyMode
 
