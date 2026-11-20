@@ -73,8 +73,8 @@ def as_mkl(x):
 
 
 def run(kernel, problem, glu, prepare_workspace=None, max_active_clusters=None, stream=None, defer_launch=False):
-    """Compile and launch ``kernel`` on ``problem``; returns (C, D, workspace), plus the launch itself with
-    ``defer_launch``.  ``prepare_workspace(ws)`` runs on the launch stream first."""
+    """Compile ``kernel`` on ``problem`` and launch it, or with ``defer_launch`` leave the launch to the caller; returns
+    (C, D, workspace, launch), ``launch`` None once launched.  ``prepare_workspace(ws)`` runs on the launch stream first."""
     import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
@@ -124,7 +124,7 @@ def run(kernel, problem, glu, prepare_workspace=None, max_active_clusters=None, 
     if defer_launch:
         return c, d, workspace, launch
     launch()
-    return c, d, workspace
+    return c, d, workspace, None
 
 
 def plain_reference(problem):
@@ -178,9 +178,9 @@ def test_signal_consumer_matches_dynamic(glu, variant, routing):
         trigger = "launch_pdl_dependents_at_all_streaming_signal_slots_ready" if glu else "launch_pdl_dependents_at_entry"
         options[trigger] = True
     experts = experts_of(routing)
-    stock_c, stock_d, _ = run(make_kernel(glu, experts=experts, use_dynamic_sched=True), problem, glu)
+    stock_c, stock_d, _, _ = run(make_kernel(glu, experts=experts, use_dynamic_sched=True), problem, glu)
     signal_kernel = make_kernel(glu, experts=experts, **options)
-    c, d, _ = run(signal_kernel, problem, glu, prepare_workspace=signal_ready(signal_kernel))
+    c, d, _, _ = run(signal_kernel, problem, glu, prepare_workspace=signal_ready(signal_kernel))
     torch.cuda.synchronize()
     rows = valid_rows(problem)
     assert torch.equal(c[:rows], stock_c[:rows])
@@ -229,7 +229,7 @@ def test_signal_consumer_waits_for_producer(glu, routing, order):
     final_a = problem["a"].clone()
     problem["a"].fill_(float("nan"))
     kernel = make_kernel(glu, experts=experts, use_dynamic_sched=True, streaming_signal_capacity=capacity)
-    stock_c, stock_d, _ = run(make_kernel(glu, experts=experts, use_dynamic_sched=True), dict(problem, a=final_a), glu)
+    stock_c, stock_d, _, _ = run(make_kernel(glu, experts=experts, use_dynamic_sched=True), dict(problem, a=final_a), glu)
     torch.cuda.synchronize()
 
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
@@ -283,7 +283,7 @@ def test_device_layout_waits_for_producer(glu):
     if glu:
         options["launch_pdl_dependents_at_all_streaming_signal_slots_ready"] = True
     kernel = make_kernel(glu, **options)
-    stock_c, stock_d, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
+    stock_c, stock_d, _, _ = run(make_kernel(glu, use_dynamic_sched=True), problem, glu)
     torch.cuda.synchronize()
 
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace, streaming_signal_workspace_offsets
@@ -346,9 +346,9 @@ def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta, 
     capacity = streaming_output_notify_capacity(chunk, n)
     assert capacity == len(range(0, n, chunk))
     notify = StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, chunk, capacity, clusters_beside_consumer=clusters_beside_consumer)
-    stock_c, stock_d, _ = run(make_kernel(False, one_cta, experts=experts, use_dynamic_sched=True), problem, False)
+    stock_c, stock_d, _, _ = run(make_kernel(False, one_cta, experts=experts, use_dynamic_sched=True), problem, False)
     kernel = make_kernel(False, one_cta, experts=experts, use_dynamic_sched=True, streaming_output_notify=notify, launch_pdl_dependents_at_entry=True)
-    c, d, workspace = run(kernel, problem, False)
+    c, d, workspace, _ = run(kernel, problem, False)
     torch.cuda.synchronize()
     valid = valid_rows(problem)
     assert torch.equal(c[:valid], stock_c[:valid])
