@@ -34,6 +34,14 @@ Example, ``Q_N = 2``, expert e0 with M tiles m0 and m1, e1 with m2; ``signal[1]`
 Claim 0 opens e0 {m0} and claim 2 opens e1 {m2}.
 Claim 4 waits until ``signal[1] = 1``, then opens e0 {m1}.
 
+Opening a batch: one warp, serialized across claims, scans the experts 32 at a time, one lane each.
+- A lane counts its expert's ready run: one round of ``EXPERT_BATCH_MAX_M_TILES`` independent flag loads from the
+  expert's first unassigned M tile, clamped to the expert's last one, and counted only below its remaining M tiles.
+- A lane whose expert has no M tile left (empty, all assigned, or past the last expert) issues no loads, and a round
+  where no lane has one skips them warp-wide. Its count is 0 with or without the loads, so batches are unchanged.
+- The warp then picks one expert (the one opened last if its run ends it or fills the cap, else the longest run)
+  and, with no ready M tile anywhere, scans again.
+
 Assumes A rows <= (2^31 - 1) * cluster tile M.
 """
 
@@ -387,7 +395,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
     @cute.jit
     def _expert_ready_m_tiles(self, expert: Int32) -> Int32:
         """How many M-tiles of ``expert`` are READY in a row from its first unassigned M-tile on, at most
-        ``EXPERT_BATCH_MAX_M_TILES``; none past the last expert.  One round of independent flag loads, no loop."""
+        ``EXPERT_BATCH_MAX_M_TILES``; none past the last expert.  One round of independent flag loads, no loop; a lane
+        with no M-tile left to count skips them, and so does the whole warp when no lane has one.  A converged warp
+        only (full-mask vote)."""
         local_expert_count = const_expr(self.params.local_expert_count)
         # A lane past the experts reads the last one's offsets, in bounds, and counts nothing.
         clamped_expert = cutlass.min(expert, local_expert_count - 1)
@@ -399,17 +409,21 @@ class MoEStreamingInputBlockSignalTileScheduler:
         if expert >= local_expert_count:
             run_limit = Int32(0)
         signal = streaming_signal_ptr(self._dynamic_state.counter_ptr)
-        # A flag past the expert's end reads its last M tile instead, in bounds and not counted.
-        last_m_tile = cutlass.max(expert_end_m_tile - 1, 0)
-        flags = [
-            cute.arch.load((signal + cutlass.min(first_unassigned_m_tile + m_tile_offset, last_m_tile)).llvm_ptr, Int32, sem="relaxed", scope="gpu")
-            for m_tile_offset in range(EXPERT_BATCH_MAX_M_TILES)
-        ]
         ready_m_tile_count = Int32(0)
-        for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
-            if ready_m_tile_count == m_tile_offset and m_tile_offset < run_limit:
-                if flags[m_tile_offset] >= 0:
-                    ready_m_tile_count = ready_m_tile_count + 1
+        # An idle lane counts 0 either way (``m_tile_offset < run_limit`` never holds), so skipping its loads changes
+        # no lane's count; with many small experts most lanes are idle late in the GEMM.
+        if cute.arch.vote_any_sync(run_limit > 0):
+            if run_limit > 0:
+                # A flag past the expert's end reads its last M tile instead, in bounds and not counted.
+                last_m_tile = cutlass.max(expert_end_m_tile - 1, 0)
+                flags = [
+                    cute.arch.load((signal + cutlass.min(first_unassigned_m_tile + m_tile_offset, last_m_tile)).llvm_ptr, Int32, sem="relaxed", scope="gpu")
+                    for m_tile_offset in range(EXPERT_BATCH_MAX_M_TILES)
+                ]
+                for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
+                    if ready_m_tile_count == m_tile_offset and m_tile_offset < run_limit:
+                        if flags[m_tile_offset] >= 0:
+                            ready_m_tile_count = ready_m_tile_count + 1
         return ready_m_tile_count
 
     @cute.jit
