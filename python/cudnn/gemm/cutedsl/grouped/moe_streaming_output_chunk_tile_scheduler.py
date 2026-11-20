@@ -32,9 +32,6 @@ Example, cluster (1, 1), 2 M tiles x 4 N tiles, C = 2 N tiles; each tile shows i
     signal[0], 4 CTA tiles:  -1  ->  -3 (a CTA counts 2)  ->  -5 (another counts 2: 4 of 4)  ->  0 (release store)
 
 Assumes N <= (2^31 - 1) * n_chunk_size.
-
-With ``n_chunk_size >= N`` there is one chunk: the consumer starts only after the whole GEMM, so nothing overlaps;
-keep two or more chunks (e.g. C <= N / 2).
 """
 
 import copy
