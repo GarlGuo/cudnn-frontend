@@ -18,9 +18,23 @@ FFN = 512
 ROWS_ALIGNMENT = 256
 
 
+@pytest.fixture(autouse=True)
 def require_sm10x():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+    """Every test here: an SM10x GPU (compute capability 10.x) with tcgen05, and a CuTe DSL that is new enough and
+    targets the device."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_state, cutedsl_too_old
+    from cudnn.tensor_adapter import has_tcgen05
+
+    cc = torch.cuda.get_device_capability()
+    if cc[0] != 10 or not has_tcgen05(cc[0]):
         pytest.skip("an SM10x GPU (compute capability 10.x) is required")
+    if cutedsl_too_old(cutedsl_state()[1]):
+        pytest.skip(f"the CuTe DSL is older than the library floor: {cutedsl_state()[1]}")
+    reason = cutedsl_arch_requirement_error(cc)
+    if reason is not None:
+        pytest.skip(reason)
 
 
 def kernel_classes():
@@ -168,7 +182,6 @@ def experts_of(routing):
 @pytest.mark.parametrize("variant", ["signal", "signal_layout_pdl"])
 @pytest.mark.parametrize("glu", [False, True], ids=["plain", "glu"])
 def test_signal_consumer_matches_dynamic(glu, variant, routing):
-    require_sm10x()
     n = 2 * FFN if glu else FFN
     problem = make_problem(ROUTINGS[routing], n, HIDDEN, seed=len(routing))
     capacity = problem["rows"] // ROWS_ALIGNMENT
@@ -194,7 +207,6 @@ def test_signal_consumer_matches_dynamic(glu, variant, routing):
 @pytest.mark.parametrize("experts", [EXPERTS, 64])
 @pytest.mark.parametrize("device_layout", [False, True])
 def test_signal_consumer_with_no_rows_exits(device_layout, experts):
-    require_sm10x()
     problem = make_problem([0] * experts, FFN, HIDDEN)
     kernel = make_kernel(False, experts=experts, use_dynamic_sched=True, streaming_signal_capacity=1, device_layout=device_layout)
     run(kernel, problem, False, prepare_workspace=signal_ready(kernel))
@@ -219,7 +231,6 @@ def release_order(order, capacity):
 def test_signal_consumer_waits_for_producer(glu, routing, order):
     """The GEMM starts while every signal[] entry reads not-ready and A holds NaN; a later kernel on another stream writes A one
     M tile at a time, in ``order``, and then marks it ready.  Reading any tile early would carry NaN into D."""
-    require_sm10x()
     n = 2 * FFN if glu else FFN
     tokens_per_expert = PRODUCER_ROUTINGS[routing]
     experts = len(tokens_per_expert)
@@ -274,7 +285,6 @@ def test_signal_consumer_waits_for_producer(glu, routing, order):
 def test_device_layout_waits_for_producer(glu):
     """The GEMM starts while the layout reads -1, every signal[] entry reads not-ready and A holds NaN; a later kernel on
     another stream writes the layout, then A one M tile at a time with its signal[] entry.  The GLU also triggers once every M tile is ready."""
-    require_sm10x()
     n = 2 * FFN if glu else FFN
     problem = make_problem([700, 300, 256, 513], n, HIDDEN, seed=11)
     capacity = problem["rows"] // ROWS_ALIGNMENT
@@ -332,7 +342,6 @@ OUTPUT_CASES = [(n_and_chunk, "uneven") for n_and_chunk in sorted(OUTPUT_CHUNKS)
 @pytest.mark.parametrize("one_cta", [False, True], ids=["cluster21", "cluster11"])
 @pytest.mark.parametrize("clusters_beside_consumer", [1, 1000])
 def test_output_notify_publishes_every_chunk(clusters_beside_consumer, one_cta, n_and_chunk, routing):
-    require_sm10x()
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import (
         StreamingOutputNotifyConfig,
         StreamingOutputNotifyMode,
