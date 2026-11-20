@@ -94,15 +94,16 @@ def _state_region_offsets(streaming_signal_capacity: int, local_expert_count: in
 
 
 def check_linear_tile_idx_range(intermediate, cluster_tile_n: int, streaming_signal_capacity) -> None:
-    """Build-time bounds on a linear tile index (M tile * Q_N + N tile): N > 0, and every M tile, END included,
-    below 2^31."""
+    """Build-time bounds on a linear tile index (M tile * Q_N + N tile): N > 0, and every claim index, END included,
+    below 2^31.  The batch opener scores an expert ``EXPERT_BATCH_MAX_M_TILES + 1 + claim index``, so the bound leaves
+    that much room too."""
     assert isinstance(intermediate, int), f"the signal scheduler needs a build-time N (dense B), not {intermediate}"
     assert intermediate > 0, f"the signal scheduler needs N > 0 (a linear tile index // Q_N), got N = {intermediate}"
     assert isinstance(streaming_signal_capacity, int), f"streaming_signal_capacity must be a build-time int, not {streaming_signal_capacity}"
     n_tiles_per_m_tile = -(-intermediate // cluster_tile_n)  # host-side: moe_utils.ceil_div is @cute.jit
     assert (
-        streaming_signal_capacity * n_tiles_per_m_tile < 2**31
-    ), f"streaming_signal_capacity {streaming_signal_capacity} x Q_N {n_tiles_per_m_tile} linear tile indices reach 2^31"
+        streaming_signal_capacity * n_tiles_per_m_tile < 2**31 - EXPERT_BATCH_MAX_M_TILES - 1
+    ), f"streaming_signal_capacity {streaming_signal_capacity} x Q_N {n_tiles_per_m_tile} claim indices overflow the batch opener's int32 score"
 
 
 def streaming_signal_workspace_bytes_after_counter(streaming_signal_capacity: int, local_expert_count: int) -> int:
@@ -223,8 +224,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
         self.streaming_signal_capacity = streaming_signal_capacity
         self.device_layout = device_layout
         check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity)
-        # mapa.shared::cluster at one CTA is an illegal peer store.  This assert is the only
-        # guard: no kernel checks its cluster shape for the signal scheduler.
+        # mapa.shared::cluster at one CTA is an illegal peer store.  check_dynamic_sched_cluster_shape admits (1, 1)
+        # with the 1-CTA MMA, so this assert is what rejects it for the signal scheduler.
         assert const_expr(
             params.cluster_shape_mn[0] * params.cluster_shape_mn[1] > 1
         ), "the signal scheduler broadcasts with mapa.shared::cluster, which needs >= 2 CTAs"
