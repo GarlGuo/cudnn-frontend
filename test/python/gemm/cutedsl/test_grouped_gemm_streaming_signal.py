@@ -44,6 +44,17 @@ def kernel_classes():
     return MoEGroupedGemmBf16Kernel, MoEGroupedGemmGluBiasBf16Kernel
 
 
+def frozen(value):
+    """A hashable, order-independent stand-in for a kernel option (tuples, enums, plain config objects)."""
+    if isinstance(value, dict):
+        return tuple(sorted((key, frozen(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(frozen(item) for item in value)
+    if hasattr(value, "__dict__") and not isinstance(value, type):
+        return (type(value).__qualname__, frozen(vars(value)))
+    return value
+
+
 def make_kernel(glu, one_cta=False, experts=EXPERTS, **options):
     import cutlass
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
@@ -59,8 +70,21 @@ def make_kernel(glu, one_cta=False, experts=EXPERTS, **options):
         weight_mode=MoEWeightMode.DENSE,
     )
     if glu:
-        return glu_class(generate_c=True, **common, **options)
-    return plain_class(generate_c=True, enable_bias=False, **common, **options)
+        kernel = glu_class(generate_c=True, **common, **options)
+    else:
+        kernel = plain_class(generate_c=True, enable_bias=False, **common, **options)
+    # Every constructor argument, so ``run`` reuses a compile only for an identically built kernel.
+    kernel.test_compile_key = (type(kernel).__qualname__, frozen(common), frozen(options))
+    return kernel
+
+
+# One compile per (kernel construction, argument layout, max_active_clusters) in this process: tensors are passed with
+# static layouts, so their shapes and strides are part of the key; their values and the launch buffers are not.
+COMPILED = {}
+
+
+def tensor_layout(x):
+    return (tuple(x.shape), tuple(x.stride()), str(x.dtype))
 
 
 def make_problem(tokens_per_expert, n, k, seed=0):
@@ -129,7 +153,11 @@ def run(kernel, problem, glu, prepare_workspace=None, max_active_clusters=None, 
     prob = tensor(problem["prob"])
     args += [prob, None] if glu else [None, prob]
     cu_stream = cuda.CUstream(stream.cuda_stream)
-    compiled = cute.compile(kernel, *args, max_active_clusters, cu_stream)
+    layouts = [as_mkl(problem["a"]), b, as_mkl(c), as_mkl(d), problem["offsets"], problem["alpha"], problem["prob"], workspace]
+    key = (kernel.test_compile_key, glu, n, k, max_active_clusters, tuple(tensor_layout(x) for x in layouts))
+    compiled = COMPILED.get(key)
+    if compiled is None:
+        compiled = COMPILED[key] = cute.compile(kernel, *args, max_active_clusters, cu_stream)
     runtime_args = [x for i, x in enumerate(args) if i != 5]
 
     def launch():

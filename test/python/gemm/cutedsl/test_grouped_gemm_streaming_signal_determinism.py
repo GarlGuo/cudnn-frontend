@@ -59,8 +59,32 @@ def make_kernel(glu, experts, **options):
         use_dynamic_sched=True,
     )
     if glu:
-        return MoEGroupedGemmGluBiasBf16Kernel(generate_c=True, **common, **options)
-    return MoEGroupedGemmBf16Kernel(generate_c=True, enable_bias=False, **common, **options)
+        kernel = MoEGroupedGemmGluBiasBf16Kernel(generate_c=True, **common, **options)
+    else:
+        kernel = MoEGroupedGemmBf16Kernel(generate_c=True, enable_bias=False, **common, **options)
+    # Every constructor argument, so ``Launcher`` reuses a compile only for an identically built kernel.
+    kernel.test_compile_key = (type(kernel).__qualname__, frozen(common), frozen(options))
+    return kernel
+
+
+def frozen(value):
+    """A hashable, order-independent stand-in for a kernel option (tuples, enums, plain config objects)."""
+    if isinstance(value, dict):
+        return tuple(sorted((key, frozen(item)) for key, item in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(frozen(item) for item in value)
+    if hasattr(value, "__dict__") and not isinstance(value, type):
+        return (type(value).__qualname__, frozen(vars(value)))
+    return value
+
+
+# One compile per (kernel construction, argument layout, max_active_clusters) in this process: tensors are passed with
+# static layouts, so their shapes and strides are part of the key; their values and the launch buffers are not.
+COMPILED = {}
+
+
+def tensor_layout(x):
+    return (tuple(x.shape), tuple(x.stride()), str(x.dtype))
 
 
 def padded(tokens):
@@ -102,7 +126,12 @@ class Launcher:
             max_active_clusters = HardwareInfo().get_max_active_clusters(2)
         c, d, workspace = self.buffers(problem)
         args = self._args(problem, c, d, workspace)
-        self._compiled = cute.compile(kernel, *args, max_active_clusters, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+        layouts = [as_mkl(problem["a"]), problem["b"].permute(1, 2, 0), as_mkl(c), as_mkl(d), problem["offsets"], problem["alpha"], problem["prob"], workspace]
+        key = (kernel.test_compile_key, glu, problem["n"], problem["k"], max_active_clusters, tuple(tensor_layout(x) for x in layouts))
+        self._compiled = COMPILED.get(key)
+        if self._compiled is None:
+            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+            self._compiled = COMPILED[key] = cute.compile(kernel, *args, max_active_clusters, stream)
 
     def buffers(self, problem):
         rows, n = problem["rows"], problem["n"]
