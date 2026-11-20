@@ -279,6 +279,8 @@ class StreamingOutputNotifyConfig:
             if n_chunk < n_chunk_capacity:
                 n_chunk_signal[n_chunk] = -1
 
+    reset_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
     @cute.jit
     def reset(self, workspace_ptr: cute.Pointer, kernel_workspace_bytes: cutlass.Constexpr, stream: cuda.CUstream) -> None:
         """Enqueue the reset on ``stream``; ``kernel_workspace_bytes`` is ``get_workspace_bytes()``.
