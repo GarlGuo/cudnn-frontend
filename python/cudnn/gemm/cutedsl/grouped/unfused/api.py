@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Neutral public API for SM100 unfused BF16 grouped GEMM."""
+"""Neutral public API for the SM100 (and SM90) unfused BF16 grouped GEMM."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ class GroupedGemmSm100(APIBase):
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
@@ -246,8 +246,8 @@ def _normalize_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if not has_tcgen05(major):
-        raise RuntimeError(f"GroupedGemmSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
+    if not (has_tcgen05(major) or major == 9):
+        raise RuntimeError(f"GroupedGemmSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
     tensor_m, k = a_shape[:2]
     if tensor_m % 256 != 0:
@@ -308,7 +308,7 @@ def grouped_gemm_wrapper_sm100(
     c_tensor: Optional[torch.Tensor] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     vector_f32: bool = False,
     m_aligned: int = 256,
@@ -341,7 +341,7 @@ def grouped_gemm_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         vector_f32,
         m_aligned,
@@ -450,7 +450,7 @@ def grouped_gemm_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        tuple(mma_tiler_mn) if mma_tiler_mn is not None else None,
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         vector_f32,
         m_aligned,

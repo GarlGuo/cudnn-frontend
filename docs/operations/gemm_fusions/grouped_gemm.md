@@ -1,7 +1,8 @@
-# Grouped GEMM (SM100 BF16)
+# Grouped GEMM (SM100 and SM90 BF16)
 
 **This is an experimental API and subject to change.** It requires an NVIDIA
-SM100-or-newer GPU. The CuTe DSL dependencies ship with the package:
+SM100-or-newer GPU, or an SM90 (Hopper) GPU for the subset in
+[SM90 (Hopper)](#sm90-hopper). The CuTe DSL dependencies ship with the package:
 
 ```bash
 pip install nvidia-cudnn-frontend
@@ -160,9 +161,28 @@ For a discrete class instance, replace `sample_b` with
 `num_experts=L`, `b_shape=(N, K)`, `b_dtype=torch.bfloat16`, and pass
 `b_ptrs` to `execute()`.
 
+## SM90 (Hopper)
+
+On an SM90 device the same `GroupedGemmSm100` and `grouped_gemm_wrapper_sm100`
+run a Hopper kernel (WGMMA and TMA, accumulator in registers). The `_sm100`
+suffix is historical; no new names are added. The SM90 path covers the
+forward GEMM (`b_major="k"`) and the input-gradient GEMM over the forward
+weights (`b_major="n"`), with these limits:
+
+- Dense `B` only (`b_tensor`); discrete `b_ptrs` raise `NotImplementedError`.
+- No `bias`; it raises `NotImplementedError`.
+- `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
+- Torch tensors only (no JAX entry).
+- Always the dynamic scheduler: `use_dynamic_sched` is accepted and ignored.
+- `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
+  `(256, 256)` on SM100. An explicit SM90 tile has M in `{64, 128}` and N a
+  multiple of 32 up to 256. `cluster_shape_mn=None` selects `(2, 1)`; an
+  explicit cluster has power-of-two sides and at most 8 CTAs.
+- `vector_f32` is accepted; Hopper has no packed FP32 arithmetic.
+
 ## Scheduling, caching, and errors
 
-- `use_dynamic_sched=False` uses the static scheduler.
+- `use_dynamic_sched=False` uses the static scheduler (SM100; SM90 is always dynamic).
 - `use_dynamic_sched=True` compiles a dynamic-M callable and reuses it for
   compatible M values; discrete mode also allocates the per-expert tensor-map
   workspace. Wrapper cache keys retain dtype, layout, expert count, optional
@@ -170,7 +190,7 @@ For a discrete class instance, replace `sample_b` with
   margin.
 - Dense and discrete weight arguments are mutually exclusive. Invalid shapes,
   strides, dtypes, devices, alignment, offsets, pointer entries, output
-  descriptors, tiles/clusters, or a target below SM100 raise `ValueError` or
+  descriptors, tiles/clusters, or a target other than SM90 or SM100+ raise `ValueError` or
   `RuntimeError` before launch.
 - Fused GLU, dGLU, and WGrad APIs select BF16 from BF16 operands while keeping
   their existing FP4/FP8 block-scaled backends. For BF16 on those fused APIs,
