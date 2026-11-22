@@ -361,8 +361,8 @@ class GroupedGemmBf16API(APIBase):
             raise ValueError("max_active_clusters must be > 0 after applying " "CUDNNFE_CLUSTER_OVERLAP_MARGIN")
 
         workspace_bytes = kernel.get_workspace_bytes()
-        # Bytes the wrappers allocate per call on the launch stream: overlapping calls must not share the dynamic counter.
-        self._scratch_nbytes = workspace_bytes if self.use_dynamic_sched else 0
+        # Bytes the wrappers allocate per call on the launch stream: overlapping calls must not share the counter or descriptors.
+        self._scratch_nbytes = workspace_bytes
         # Internal scratch in the caller's framework allocator; kernels write through its
         # raw pointer and it is never surfaced as a framework array.
         self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)

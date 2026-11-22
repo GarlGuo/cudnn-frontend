@@ -322,8 +322,9 @@ class GroupedGemmWgradBf16API(APIBase):
         # Internal scratch in the caller's framework allocator; kernels write through its
         # raw pointer and it is never surfaced as a framework array.
         self._workspace = allocate_byte_workspace(self._framework, kernel.get_workspace_bytes(), self.a_desc.device)
-        # Bytes the wrapper allocates per call on the launch stream: overlapping calls must not share the SM90 tile counter.
-        self._scratch_nbytes = kernel.get_workspace_bytes() if self._is_sm90 else 0
+        # Bytes the wrapper allocates per call on the launch stream: overlapping calls must not share the SM90 tile counter
+        # or the SM100 discrete/ragged TMA descriptors.
+        self._scratch_nbytes = kernel.get_workspace_bytes()
         self._validate_data_alignment(self._workspace, "workspace", 128)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
