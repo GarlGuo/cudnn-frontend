@@ -68,6 +68,7 @@ class GroupedGemmWgradBf16API(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: Union[WGradInputOrder, str] = WGradInputOrder.Tensor2D,
+        kernel_schedule: Optional[Literal["cooperative", "pingpong"]] = None,
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -105,7 +106,12 @@ class GroupedGemmWgradBf16API(APIBase):
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: tile M <= 128 and a (2, 1) cluster by default.
         self._is_sm90 = is_sm90_device()
-        self.mma_tiler_mn = tuple(mma_tiler_mn or ((128, 256) if self._is_sm90 else (256, 256)))
+        if kernel_schedule not in (None, "cooperative", "pingpong"):
+            raise ValueError(f'kernel_schedule must be None, "cooperative" or "pingpong", got {kernel_schedule!r}')
+        self.kernel_schedule = kernel_schedule
+        self.pingpong = kernel_schedule == "pingpong"
+        default_tile = ((128, 192) if self.pingpong else (128, 256)) if self._is_sm90 else (256, 256)
+        self.mma_tiler_mn = tuple(mma_tiler_mn or default_tile)
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.accumulate_on_output = accumulate_on_output
@@ -247,6 +253,8 @@ class GroupedGemmWgradBf16API(APIBase):
             raise NotImplementedError("accumulate_on_output is not supported on SM90")
         if self._is_sm90 and (self.weight_mode != MoEWeightMode.DENSE or self.input_order != WGradInputOrder.Tensor2D):
             raise NotImplementedError("SM90 wgrad supports dense output and the Tensor2D input order only")
+        if not self._is_sm90 and self.kernel_schedule is not None:
+            raise ValueError("kernel_schedule selects an SM90 kernel schedule; pass None on SM100+")
 
         # Per-expert token counts are device data (Rule 3); can_implement gets a split with the right total.
         groups = [tokens_sum] + [0] * (self.expert_cnt - 1)
@@ -266,8 +274,9 @@ class GroupedGemmWgradBf16API(APIBase):
             self.b_major,
             self.weight_mode,
             self.input_order,
+            **(dict(pingpong=self.pingpong) if self._is_sm90 else {}),
         ):
-            raise ValueError("Unsupported BF16 grouped GEMM wgrad configuration: check mma_tiler, cluster, and alignment")
+            raise ValueError("Unsupported BF16 grouped GEMM wgrad configuration: check mma_tiler, cluster, kernel_schedule, and alignment")
         if not cuda_is_available():
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
@@ -312,6 +321,7 @@ class GroupedGemmWgradBf16API(APIBase):
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
             input_order=self.input_order,
+            **(dict(pingpong=self.pingpong) if self._is_sm90 else {}),
         )
         hardware_info = cutlass.utils.HardwareInfo()
         max_active_clusters = hardware_info.get_max_active_clusters(self.cluster_shape_mn[0] * self.cluster_shape_mn[1]) - self.num_cluster_overlap_margin
