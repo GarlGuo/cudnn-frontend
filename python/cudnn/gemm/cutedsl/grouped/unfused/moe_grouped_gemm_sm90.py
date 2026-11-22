@@ -177,6 +177,7 @@ class MoEGroupedGemmBf16KernelSm90:
             and cd_major == "n"
             and is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major)
             and n % 32 == 0
+            and k > 0
             and m % 256 == 0
         )
 
@@ -1012,13 +1013,10 @@ class MoEGroupedGemmBf16KernelSm90:
                 # ---- mainloop: one accumulator init and one wgmma fence per output tile ----
                 ab_consumer_read_state.reset_count()
                 ab_consumer_release_state.reset_count()
+                # The first k-block zero-inits (K >= 1, so every tile has one): no register fill to sink past the WGMMA.
+                tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                 if cutlass.const_expr(self.pingpong):
-                    # The first k-block zero-inits: a register fill of the second m64 atom can sink past the first WGMMA.
-                    tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                     mma_turn.arrive_and_wait()
-                else:
-                    accumulators.fill(0.0)
-                    tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                 warpgroup.fence()
 
                 prologue_mma_cnt = cutlass.min(k_pipe_mmas, k_tile_cnt)
@@ -1027,8 +1025,7 @@ class MoEGroupedGemmBf16KernelSm90:
                     for kblock_idx in cutlass.range_constexpr(num_k_blocks):
                         kblock_coord = (None, None, kblock_idx, ab_consumer_read_state.index)
                         cute.gemm(tiled_mma, accumulators, tCrA[kblock_coord], tCrB[kblock_coord], accumulators)
-                        if cutlass.const_expr(self.pingpong):
-                            tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                     warpgroup.commit_group()
                     ab_consumer_read_state.advance()
 
@@ -1050,9 +1047,6 @@ class MoEGroupedGemmBf16KernelSm90:
                 for k_tile in cutlass.range(0, prologue_mma_cnt, 1, unroll=1):
                     ab_pipeline.consumer_release(ab_consumer_release_state)
                     ab_consumer_release_state.advance()
-                if cutlass.const_expr(self.pingpong):
-                    if k_tile_cnt == 0:
-                        accumulators.fill(0.0)
 
                 # ---- epilogue ----
                 real_d, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
