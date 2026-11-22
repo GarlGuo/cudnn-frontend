@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Private descriptor-first BF16 API for SM100 grouped GEMM wgrad."""
+"""Private descriptor-first BF16 API for SM90 and SM100 grouped GEMM wgrad."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc
+from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
@@ -37,6 +37,7 @@ from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug
 from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
+from .moe_grouped_gemm_wgrad_sm90 import MoEGroupedGemmWgradBF16KernelSm90
 
 
 def _output_dtypes():
@@ -61,7 +62,7 @@ class GroupedGemmWgradBf16API(APIBase):
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -102,9 +103,11 @@ class GroupedGemmWgradBf16API(APIBase):
             )
 
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
-        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        # SM90 runs the Hopper kernel: tile M <= 128 and a (2, 1) cluster by default.
+        self._is_sm90 = is_sm90_device()
+        self.mma_tiler_mn = tuple(mma_tiler_mn or ((128, 256) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
+        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.accumulate_on_output = accumulate_on_output
         self.sf_vec_size = sf_vec_size
         self.sf_fp8_dtype_override = sf_fp8_dtype_override
@@ -114,7 +117,7 @@ class GroupedGemmWgradBf16API(APIBase):
             sample_global_scale_a,
             sample_global_scale_b,
         )
-        self._kernel = MoEGroupedGemmWgradBF16Kernel
+        self._kernel = MoEGroupedGemmWgradBF16KernelSm90 if self._is_sm90 else MoEGroupedGemmWgradBF16Kernel
         self._workspace: Optional[torch.Tensor] = None
         self._compile_wgrad_ptrs: Optional[torch.Tensor] = None
         self._single_expert_placeholder: Optional[torch.Tensor] = None
@@ -240,6 +243,11 @@ class GroupedGemmWgradBf16API(APIBase):
             if pointer % alignment:
                 raise ValueError(f"{name} data pointer must be {alignment}-byte aligned")
 
+        if self._is_sm90 and self.accumulate_on_output:
+            raise NotImplementedError("accumulate_on_output is not supported on SM90")
+        if self._is_sm90 and (self.weight_mode != MoEWeightMode.DENSE or self.input_order != WGradInputOrder.Tensor2D):
+            raise NotImplementedError("SM90 wgrad supports dense output and the Tensor2D input order only")
+
         # Per-expert token counts are device data (Rule 3); can_implement gets a split with the right total.
         groups = [tokens_sum] + [0] * (self.expert_cnt - 1)
 
@@ -264,8 +272,8 @@ class GroupedGemmWgradBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         capability = major * 10 + minor
-        if not has_tcgen05(major):
-            raise RuntimeError(f"GroupedGemmWgradSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
+        if not (has_tcgen05(major) or capability == 90):
+            raise RuntimeError(f"GroupedGemmWgradSm100 requires SM90 or SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
         return True
 
