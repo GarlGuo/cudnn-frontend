@@ -146,6 +146,18 @@ def test_sm90_wgrad_pingpong_matches_reference(monkeypatch, case):
     assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
 
 
+@pytest.mark.parametrize("tokens", [256, 0], ids=["buffer-256", "zero-tokens"])
+@pytest.mark.parametrize("schedule", ["cooperative", "pingpong"])
+def test_sm90_wgrad_all_experts_empty(schedule, tokens):
+    # Every expert has 0 tokens (total K = 0), over a 256-token buffer or true (M, 0) / (0, N) inputs: dW is all zeros.
+    problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=(tokens, 0, 0), m=256, n=384, a_major="m", b_major="n", initial_value=3.0)
+    problem["offsets"].zero_()
+    actual = run_wrapper(problem, schedule=schedule)
+    torch.cuda.synchronize()
+    assert actual is problem["output"]
+    assert torch.count_nonzero(actual) == 0
+
+
 @pytest.mark.parametrize(
     "overrides,error,match",
     [

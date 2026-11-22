@@ -334,6 +334,17 @@ def test_sm90_dglu_all_empty():
     assert torch.count_nonzero(result["dprob_tensor"]) == 0
 
 
+def test_sm90_glu_and_dglu_zero_rows():
+    # A rank with no routed tokens: 0-row A, C and prob give empty outputs (unique N/K, see the fwd zero-row test).
+    problem = make_problem((0, 0), n=448, k=192)
+    problem.update(a=problem["a"][:0], prob=problem["prob"][:0], c=problem["c"][:0])
+    glu = run_glu(problem)
+    dglu = run_dglu(problem)
+    torch.cuda.synchronize()
+    assert glu["c_tensor"].shape == (0, 448) and glu["d_tensor"].shape == (0, 224)
+    assert tuple(dglu["d_row_tensor"].shape) == (0, 896) and dglu["dprob_tensor"].numel() == 0
+
+
 def test_sm90_dglu_rejects_unsupported():
     problem = make_problem((256, 256), n=256, k=256)
     with pytest.raises(NotImplementedError, match="dbias"):

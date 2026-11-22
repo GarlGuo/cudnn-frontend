@@ -116,10 +116,25 @@ def test_sm90_grouped_gemm_experts(experts):
 
 
 def test_sm90_grouped_gemm_all_empty():
+    # Contract: with no routed rows the kernel exits before any store, so caller-supplied C and D stay untouched.
     problem = make_problem((0, 0, 0), n=256, k=256)
-    result = run(problem)
+    c, d = (torch.full((256, 256), 7.0, dtype=torch.bfloat16, device="cuda") for _ in range(2))
+    result = run(problem, c_tensor=c, d_tensor=d)
     torch.cuda.synchronize()
     assert result["d_tensor"].shape == (256, 256)
+    assert bool((c == 7.0).all()) and bool((d == 7.0).all())
+
+
+@pytest.mark.parametrize("direction", ["fwd", "dgrad"])
+@pytest.mark.parametrize("schedule", ["cooperative", "pingpong"])
+def test_sm90_grouped_gemm_zero_rows(direction, schedule):
+    # A rank with no routed tokens: (0, K) A and 0-row C/D/prob. N/K are unique here: a cached 256-row compile of
+    # the same signature rejects 0-row operands (their stride order differs), on SM100 as well.
+    problem = make_problem((0, 0), n=352, k=192, direction=direction)
+    problem.update(a=problem["a"][:0], prob=problem["prob"][:0])
+    result = run(problem, schedule=schedule)
+    torch.cuda.synchronize()
+    assert result["c_tensor"].shape == (0, 352) and result["d_tensor"].shape == (0, 352)
 
 
 def test_sm90_grouped_gemm_fp16_and_legacy_layout():
