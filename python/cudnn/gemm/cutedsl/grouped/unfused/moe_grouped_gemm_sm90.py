@@ -766,15 +766,9 @@ class MoEGroupedGemmBf16KernelSm90:
         if total_token <= 0:
             cute.arch.nvvm.exit()
 
-        if cutlass.const_expr(self.pingpong):
-            # The increase sits in the MMA branch: ptxas keeps setmaxnreg only if no MMA code is reachable after the decrease.
-            if warp_idx >= self.tma_warp_id:
-                cute.arch.setmaxregister_decrease(self.load_register_requirement)
-        else:
-            if warp_idx >= self.tma_warp_id:
-                cute.arch.setmaxregister_decrease(self.load_register_requirement)
-            else:
-                cute.arch.setmaxregister_increase(self.mma_register_requirement)
+        # The increase opens the MMA branch: ptxas ignores a decrease whose region reaches the MMA code (C7507).
+        if warp_idx >= self.tma_warp_id:
+            cute.arch.setmaxregister_decrease(self.load_register_requirement)
 
         # ==== Scheduler warp (MoE Persistent Tile Scheduler) ====
         if warp_idx == self.sched_warp_id:
@@ -886,8 +880,7 @@ class MoEGroupedGemmBf16KernelSm90:
         # ==== MMA + epilogue warp group(s) ====
         # WGMMA accumulates in these threads' registers, so the mainloop and the epilogue live in the same warps.
         if warp_idx < self.tma_warp_id and total_token > 0:
-            if cutlass.const_expr(self.pingpong):
-                cute.arch.setmaxregister_increase(self.mma_register_requirement)
+            cute.arch.setmaxregister_increase(self.mma_register_requirement)
             epi_tidx = tidx
             epilog_barrier = self.epilog_sync_barrier
             epi_store_warp = self.epi_store_warp_id
