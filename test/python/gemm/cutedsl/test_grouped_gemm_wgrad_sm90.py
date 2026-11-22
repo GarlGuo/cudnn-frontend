@@ -11,7 +11,7 @@ import torch
 from cudnn.tensor_adapter import has_wgmma
 import cudnn
 
-from gemm.cutedsl.test_grouped_gemm_sm90 import forced_schedule
+from gemm.cutedsl.test_grouped_gemm_sm90 import override_schedule
 from gemm.cutedsl.test_grouped_gemm_wgrad_bf16_utils import (
     assert_grouped_gemm_wgrad_close,
     grouped_gemm_wgrad_bf16_reference,
@@ -40,7 +40,7 @@ def run_wrapper(problem, schedule=None, **overrides):
         wgrad_dtype=problem["output_dtype"],
     )
     kwargs.update(overrides)
-    with forced_schedule(schedule):
+    with override_schedule(schedule):
         return cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs)["wgrad_tensor"]
 
 
@@ -159,7 +159,7 @@ def test_sm90_wgrad_pingpong_matches_reference(monkeypatch, case):
         (dict(schedule="pingpong", mma_tiler_mn=(128, 160)), ValueError, "pingpong runs only"),
         (dict(schedule="pingpong", mma_tiler_mn=(64, 256), cluster_shape_mn=(1, 2)), ValueError, "pingpong runs only"),
         (dict(schedule="pingpong", mma_tiler_mn=(128, 192), cluster_shape_mn=(1, 2)), ValueError, "pingpong runs only"),
-        (dict(schedule="stream-k"), ValueError, "forced SM90 schedule must be"),
+        (dict(schedule="stream-k"), ValueError, "SM90 schedule override must be"),
     ],
     ids=[
         "accumulate",

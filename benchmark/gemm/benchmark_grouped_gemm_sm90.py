@@ -107,16 +107,16 @@ def torch_dswiglu(g, c, prob):
     return torch.stack((d1.view(m, n // BLOCK, BLOCK), d2.view(m, n // BLOCK, BLOCK)), dim=2).reshape(m, 2 * n).to(torch.bfloat16)
 
 
-def forced_schedule(fn, schedule):
-    """``fn`` under a forced SM90 schedule (a test / benchmark hook; the library picks it by shape otherwise)."""
+def override_schedule(fn, schedule):
+    """``fn`` under an SM90 schedule override (a test / benchmark hook; the library picks it by shape otherwise)."""
     import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
 
     def run():
-        saved, sm90._FORCE_SCHEDULE = sm90._FORCE_SCHEDULE, schedule
+        saved, sm90._SCHEDULE_OVERRIDE = sm90._SCHEDULE_OVERRIDE, schedule
         try:
             return fn()
         finally:
-            sm90._FORCE_SCHEDULE = saved
+            sm90._SCHEDULE_OVERRIDE = saved
 
     return run
 
@@ -186,7 +186,7 @@ def backends(p, t, names, config=None, schedules=(None,)):
         fn, reference = ours, grouped_mm
     pingpong_config = dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1))
     arm = lambda s: functools.partial(fn, pingpong_config if s == "pingpong" else config)
-    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): forced_schedule(arm(s), s) for s in schedules}
+    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): override_schedule(arm(s), s) for s in schedules}
     if "torch_grouped_mm" in names:
         runs["torch_grouped_mm"] = reference
     return runs
@@ -231,7 +231,7 @@ def main(argv=None):
     parser.add_argument(
         "--schedules",
         default=None,
-        help="comma list of forced SM90 schedules (cooperative, pingpong), one arm each; default: the heuristic's. "
+        help="comma list of SM90 schedule overrides (cooperative, pingpong), one arm each; default: the heuristic's. "
         "The pingpong arm always runs 128x192 on a (2, 1) cluster",
     )
     parser.add_argument("--tile", type=pair, default=None, help="mma_tiler_mn as M,N (GEMM and GLU ops)")

@@ -28,7 +28,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from .moe_grouped_gemm_sm90 import sm90_forced_schedule
+from .moe_grouped_gemm_sm90 import schedule_override
 from ..backend_utils import row_major_layout
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
@@ -350,7 +350,7 @@ def grouped_gemm_wrapper_sm100(
         generate_c,
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
-        sm90_forced_schedule(),
+        schedule_override(),
     )
     memo = _wrapper_memo.get(_memo_key)
     if memo is not None:
@@ -462,7 +462,7 @@ def grouped_gemm_wrapper_sm100(
         overlap_margin,
         workspace_signature,
         # The SM90 schedule is a function of the shapes and tile above plus the forced one.
-        sm90_forced_schedule(),
+        schedule_override(),
     )
 
     op = _cache_of_GroupedGemmSm100Objects.get(cache_key)

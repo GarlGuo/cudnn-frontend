@@ -37,7 +37,7 @@ from ..backend_utils import debug_validate_offsets, debug_validate_pointer_value
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
-from .moe_grouped_gemm_sm90 import MoEGroupedGemmBf16KernelSm90, check_pingpong_tile, sm90_default_mma_tiler, sm90_schedule_is_pingpong
+from .moe_grouped_gemm_sm90 import MoEGroupedGemmBf16KernelSm90, check_pingpong_tile, default_mma_tiler, use_pingpong
 
 
 def _output_dtypes():
@@ -157,8 +157,8 @@ class GroupedGemmBf16API(APIBase):
         self._is_sm90 = has_wgmma(major)
         # The SM90 schedule comes from the GEMM's (N, K) and the tile; B is (N, K, experts) here.
         dense_b = self.b_desc is not None and self.b_desc.ndim == 3
-        self._pingpong = self._is_sm90 and dense_b and sm90_schedule_is_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
-        self.mma_tiler_mn = tuple(mma_tiler_mn or (sm90_default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
+        self._pingpong = self._is_sm90 and dense_b and use_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn)
+        self.mma_tiler_mn = tuple(mma_tiler_mn or (default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.vector_f32 = vector_f32

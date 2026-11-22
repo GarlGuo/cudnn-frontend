@@ -85,7 +85,7 @@ def _block_scaled_dtype_pairs():
 
 
 from ._bf16_api import GroupedGemmGluBf16API
-from ..unfused.moe_grouped_gemm_sm90 import sm90_forced_schedule
+from ..unfused.moe_grouped_gemm_sm90 import schedule_override
 from ._blockscaled_api import GroupedGemmGluBlockScaledAPI
 
 
@@ -1195,7 +1195,7 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
         call.b_major,
         call.use_dynamic_sched,
         # The SM90 schedule is a function of the shapes and tile in this key plus the forced one.
-        sm90_forced_schedule(),
+        schedule_override(),
         workspace_bytes,
         ((get_device(call.a_tensor).type, get_device(call.a_tensor).index)),
         overlap_margin,
@@ -1436,7 +1436,7 @@ def grouped_gemm_glu_wrapper_sm100(
         use_single_group_runtime_offsets,
         generate_c,
         glu_layout,
-        sm90_forced_schedule(),
+        schedule_override(),
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
         os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
     )

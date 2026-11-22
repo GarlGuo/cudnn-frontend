@@ -56,9 +56,9 @@ def make_tensors(p, seed=0):
 
 
 def backends(p, t, names, schedules=(None,)):
-    """One cudnn arm per forced SM90 schedule (None: the heuristic's)."""
+    """One cudnn arm per SM90 schedule override (None: the heuristic's)."""
     import cudnn
-    from benchmark_grouped_gemm_sm90 import forced_schedule
+    from benchmark_grouped_gemm_sm90 import override_schedule
 
     def ours():
         return cudnn.grouped_gemm_wgrad_wrapper_sm100(
@@ -72,7 +72,7 @@ def backends(p, t, names, schedules=(None,)):
             wgrad_dtype=torch.bfloat16,
         )["wgrad_tensor"]
 
-    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): forced_schedule(ours, s) for s in schedules}
+    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): override_schedule(ours, s) for s in schedules}
     if "torch_grouped_mm" in names:
         # 2D x 2D grouped mm: offs splits the shared K (tokens) per expert.
         runs["torch_grouped_mm"] = lambda: torch._grouped_mm(t["a"], t["b"], offs=t["offsets"], out_dtype=torch.bfloat16)
@@ -114,7 +114,9 @@ def main(argv=None):
     parser.add_argument("--reps", type=int, default=100)
     parser.add_argument("--l2-flush", type=float, default=2.0, help="flush buffer size in multiples of L2")
     parser.add_argument("--out", default=None)
-    parser.add_argument("--schedules", default=None, help="comma list of forced SM90 schedules (cooperative, pingpong), one arm each; default: the heuristic's")
+    parser.add_argument(
+        "--schedules", default=None, help="comma list of SM90 schedule overrides (cooperative, pingpong), one arm each; default: the heuristic's"
+    )
     args = parser.parse_args(argv)
     if args.list_items:
         print("\n".join(ITEMS))

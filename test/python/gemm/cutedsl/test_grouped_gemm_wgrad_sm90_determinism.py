@@ -14,7 +14,7 @@ import cudnn
 
 from cudnn.gemm.cutedsl.grouped.wgrad import api as wgrad_api
 from determinism_utils import assert_bitwise, assert_golden, assert_replays
-from gemm.cutedsl.test_grouped_gemm_sm90 import forced_schedule
+from gemm.cutedsl.test_grouped_gemm_sm90 import override_schedule
 
 pytestmark = pytest.mark.L0
 
@@ -44,7 +44,7 @@ def run(slices, order=None, schedule=None, **kwargs):
     dy = torch.cat([slices[e][0].t() for e in order]).contiguous()
     x = torch.cat([slices[e][1] for e in order]).contiguous()
     counts = torch.tensor([slices[e][0].shape[1] for e in order], dtype=torch.int32, device="cuda")
-    with forced_schedule(schedule):
+    with override_schedule(schedule):
         out = cudnn.grouped_gemm_wgrad_wrapper_sm100(
             a_tensor=dy.t(),
             b_tensor=x,

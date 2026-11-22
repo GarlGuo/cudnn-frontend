@@ -11,7 +11,7 @@ import torch
 
 from cudnn.tensor_adapter import has_wgmma
 
-from gemm.cutedsl.test_grouped_gemm_sm90 import forced_schedule
+from gemm.cutedsl.test_grouped_gemm_sm90 import override_schedule
 
 pytestmark = pytest.mark.L0
 
@@ -95,7 +95,7 @@ def run_glu(problem, act="swiglu", schedule=None, **kwargs):
     """``schedule`` forces the SM90 schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
     import cudnn
 
-    with forced_schedule(schedule):
+    with override_schedule(schedule):
         return cudnn.grouped_gemm_glu_wrapper_sm100(
             a_tensor=problem["a"],
             sfa_tensor=None,

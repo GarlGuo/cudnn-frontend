@@ -17,15 +17,15 @@ pytestmark = pytest.mark.L0
 
 
 @contextlib.contextmanager
-def forced_schedule(schedule):
+def override_schedule(schedule):
     """Force the SM90 BF16 grouped GEMMs' warp-group schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
     import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
 
-    saved, sm90._FORCE_SCHEDULE = sm90._FORCE_SCHEDULE, schedule
+    saved, sm90._SCHEDULE_OVERRIDE = sm90._SCHEDULE_OVERRIDE, schedule
     try:
         yield
     finally:
-        sm90._FORCE_SCHEDULE = saved
+        sm90._SCHEDULE_OVERRIDE = saved
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +65,7 @@ def run(problem, schedule=None, **kwargs):
     """``schedule`` forces the SM90 schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
     import cudnn
 
-    with forced_schedule(schedule):
+    with override_schedule(schedule):
         return cudnn.grouped_gemm_wrapper_sm100(
             a_tensor=problem["a"],
             padded_offsets=problem["offsets"],
@@ -241,7 +241,7 @@ def test_sm90_pingpong_fp16_genc_and_legacy_layout():
     result = run(problem, schedule="pingpong")
     check(problem, result)
     m, k = problem["a"].shape
-    with forced_schedule("pingpong"):
+    with override_schedule("pingpong"):
         legacy = cudnn.grouped_gemm_wrapper_sm100(
             a_tensor=problem["a"].as_strided((m, k, 1), (k, 1, m * k)),
             padded_offsets=problem["offsets"],
@@ -271,12 +271,12 @@ def test_sm90_pingpong_all_empty():
         (dict(mma_tiler_mn=(64, 256), cluster_shape_mn=(1, 2), schedule="pingpong"), "pingpong"),
         (dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(1, 2), schedule="pingpong"), "pingpong"),
         (dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(4, 1), schedule="pingpong"), "pingpong"),
-        (dict(schedule="stream_k"), "forced SM90 schedule"),
+        (dict(schedule="stream_k"), "SM90 schedule override"),
     ],
     ids=["128x256", "128x224", "128x160", "128x128", "64x256-c12", "128x192-c12", "128x192-c41", "unknown-schedule"],
 )
 def test_sm90_pingpong_rejects(kwargs, match):
-    # Pingpong runs only 128x192 tiles on (2, 1) clusters; an unknown forced schedule raises too.
+    # Pingpong runs only 128x192 tiles on (2, 1) clusters; an unknown schedule override raises too.
     problem = make_problem((256, 256), n=256, k=256)
     with pytest.raises(ValueError, match=match):
         run(problem, **kwargs)
@@ -311,7 +311,7 @@ def test_sm90_schedule_heuristic(n, k, tile, cluster, glu_c, expected):
     # Pingpong for K <= 2048 and N >= 2048 (a GLU's N is 2I) on 128x192 tiles and (2, 1) clusters; a GLU with C never.
     from cudnn.gemm.cutedsl.grouped.glu._bf16_api import GroupedGemmGluBf16API
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import GroupedGemmBf16API
-    from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad_sm90 import sm90_wgrad_schedule_is_pingpong
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad_sm90 import use_pingpong_wgrad
 
     m, dev = 256, "cuda"
     a = torch.zeros((m, k), dtype=torch.bfloat16, device=dev)
@@ -323,10 +323,10 @@ def test_sm90_schedule_heuristic(n, k, tile, cluster, glu_c, expected):
     api = (GroupedGemmGluBf16API if glu_c else GroupedGemmBf16API)(a, c, d, **common)
     assert (api._pingpong, api.mma_tiler_mn) == expected
     # wgrad: pingpong for output N >= 2048 on 128x192 tiles and (2, 1) clusters.
-    assert sm90_wgrad_schedule_is_pingpong(2048, None) and not sm90_wgrad_schedule_is_pingpong(1024, None)
-    assert sm90_wgrad_schedule_is_pingpong(4096, (128, 192), (2, 1))
-    assert not sm90_wgrad_schedule_is_pingpong(4096, (128, 256))
-    assert not sm90_wgrad_schedule_is_pingpong(4096, (128, 160))
-    assert not sm90_wgrad_schedule_is_pingpong(4096, None, (1, 2))
-    with forced_schedule("cooperative"):
-        assert not sm90_wgrad_schedule_is_pingpong(4096, None)
+    assert use_pingpong_wgrad(2048, None) and not use_pingpong_wgrad(1024, None)
+    assert use_pingpong_wgrad(4096, (128, 192), (2, 1))
+    assert not use_pingpong_wgrad(4096, (128, 256))
+    assert not use_pingpong_wgrad(4096, (128, 160))
+    assert not use_pingpong_wgrad(4096, None, (1, 2))
+    with override_schedule("cooperative"):
+        assert not use_pingpong_wgrad(4096, None)
