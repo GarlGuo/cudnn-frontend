@@ -212,8 +212,9 @@ class MoEGroupedGemmWgradBF16KernelSm90:
         c_bytes = cute.size_in_bytes(self.c_dtype, c_stage_one)
         free_bytes = self.smem_capacity - 1024 - c_bytes
         self.num_ab_stage = free_bytes // ab_bytes
-        # A second C stage from the bytes the A/B stages leave, so a subtile need not wait for its own TMA store.
-        self.num_c_stage = 2 if free_bytes % ab_bytes >= c_bytes else 1
+        # The bytes the A/B stages leave become C stages (up to one per subtile), so subtiles rarely wait on TMA stores.
+        num_subtiles = -(-self.mma_tiler[0] // self.epi_tile[0]) * -(-self.mma_tiler[1] // self.epi_tile[1])
+        self.num_c_stage = min(1 + free_bytes % ab_bytes // c_bytes, num_subtiles)
         self.num_tma_load_bytes = ab_bytes
 
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(self.a_layout, self.mma_tiler, self.a_dtype, self.num_ab_stage)
