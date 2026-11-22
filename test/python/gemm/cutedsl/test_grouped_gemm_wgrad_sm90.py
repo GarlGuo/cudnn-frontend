@@ -4,6 +4,7 @@
 
 """SM90 (Hopper) BF16 grouped GEMM wgrad behind grouped_gemm_wgrad_wrapper_sm100 / GroupedGemmWgradSm100."""
 
+import cutlass
 import pytest
 import torch
 import cudnn
@@ -89,6 +90,48 @@ def test_sm90_wgrad_class_api_reuses_compile_across_token_counts():
         assert_grouped_gemm_wgrad_close(problem["output"], grouped_gemm_wgrad_bf16_reference(problem))
 
 
+def one_cluster_margin(cluster):
+    """The CUDNNFE_CLUSTER_OVERLAP_MARGIN that leaves one persistent cluster: every CTA then runs all its slot's tiles."""
+    return str(cutlass.utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1]) - 1)
+
+
+# 3 M tiles x 1 N tile per expert: 15 tiles per CTA of the one cluster (8 for MMA group 0, 7 for group 1), two
+# zero-token experts and one whose 2048 tokens wrap the A/B stages several times.
+PINGPONG_GROUPS = (256, 0, 768, 0, 2048)
+
+
+@pytest.mark.parametrize("cluster", [(1, 1), (2, 1), (1, 2)], ids=["c11", "c21", "c12"])
+@pytest.mark.parametrize("tile_n", [128, 160, 192])
+def test_sm90_wgrad_pingpong_one_cluster(monkeypatch, tile_n, cluster):
+    monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", one_cluster_margin(cluster))
+    m = 640 if cluster == (2, 1) else 384
+    problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=PINGPONG_GROUPS, m=m, n=tile_n, a_major="m", b_major="n", initial_value=3.0)
+    actual = run_wrapper(problem, mma_tiler_mn=(128, tile_n), cluster_shape_mn=cluster, kernel_schedule="pingpong")
+    torch.cuda.synchronize()
+    assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
+
+
+# id: (group_k_list, m, n, a_major, b_major, wgrad dtype, mma_tiler_mn, cluster_shape_mn, one cluster); None takes the
+# pingpong default tile (128, 192) and the (2, 1) cluster.
+PINGPONG_CASES = {
+    "default-ragged": ((0, 256, 512, 1024) * 4, 512, 384, "m", "n", torch.bfloat16, None, None, False),
+    "kmajor-even-tiles": ((256, 0, 768, 512), 640, 192, "k", "k", torch.bfloat16, None, None, True),
+    "fp32-128x160": ((512, 0, 256), 256, 320, "m", "k", torch.float32, (128, 160), (2, 1), False),
+    "fp16-128x128-c11": ((0, 768, 256), 384, 256, "k", "n", torch.float16, (128, 128), (1, 1), True),
+}
+
+
+@pytest.mark.parametrize("case", list(PINGPONG_CASES))
+def test_sm90_wgrad_pingpong_matches_reference(monkeypatch, case):
+    group_k_list, m, n, a_major, b_major, dtype, tile, cluster, one_cluster = PINGPONG_CASES[case]
+    if one_cluster:
+        monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", one_cluster_margin(cluster or (2, 1)))
+    problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=group_k_list, m=m, n=n, a_major=a_major, b_major=b_major, output_dtype=dtype, initial_value=3.0)
+    actual = run_wrapper(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster, kernel_schedule="pingpong")
+    torch.cuda.synchronize()
+    assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
+
+
 @pytest.mark.parametrize(
     "overrides,error,match",
     [
@@ -97,8 +140,12 @@ def test_sm90_wgrad_class_api_reuses_compile_across_token_counts():
         (dict(input_order="tensor_ragged"), NotImplementedError, "Tensor2D"),
         (dict(mma_tiler_mn=(256, 128)), ValueError, "Unsupported BF16 grouped GEMM wgrad configuration"),
         (dict(cluster_shape_mn=(4, 4)), ValueError, "Unsupported BF16 grouped GEMM wgrad configuration"),
+        (dict(kernel_schedule="pingpong", mma_tiler_mn=(128, 256)), ValueError, "kernel_schedule"),
+        (dict(kernel_schedule="pingpong", mma_tiler_mn=(64, 128)), ValueError, "kernel_schedule"),
+        (dict(kernel_schedule="pingpong", mma_tiler_mn=(128, 224)), ValueError, "kernel_schedule"),
+        (dict(kernel_schedule="stream-k"), ValueError, "kernel_schedule must be"),
     ],
-    ids=["accumulate", "discrete", "ragged", "tile-m-256", "cluster-16"],
+    ids=["accumulate", "discrete", "ragged", "tile-m-256", "cluster-16", "pingpong-128x256", "pingpong-64x128", "pingpong-128x224", "schedule-name"],
 )
 def test_sm90_wgrad_rejects_unsupported(overrides, error, match):
     problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=(256, 256), m=256, n=256)

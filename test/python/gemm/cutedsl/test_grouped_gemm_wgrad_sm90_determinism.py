@@ -5,6 +5,7 @@
 """Bitwise determinism of the SM90 BF16 grouped GEMM wgrad: one CTA owns each output tile and there is no split-K,
 so neither the counter's claim order nor the other experts may change an expert's dW bytes."""
 
+import cutlass
 import pytest
 import torch
 import cudnn
@@ -34,7 +35,7 @@ def expert_slices(group_k_list, seed=7):
     return slices
 
 
-def run(slices, order=None):
+def run(slices, order=None, **schedule):
     """dW for the experts in ``order`` (default all), from row-major dY (tokens, M) and X (tokens, N)."""
     order = list(range(len(slices))) if order is None else order
     dy = torch.cat([slices[e][0].t() for e in order]).contiguous()
@@ -48,6 +49,7 @@ def run(slices, order=None):
         offsets_tensor=counts.cumsum(0, dtype=torch.int32),
         acc_dtype=torch.float32,
         wgrad_dtype=torch.bfloat16,
+        **schedule,
     )["wgrad_tensor"]
     return {"wgrad": out}
 
@@ -99,3 +101,39 @@ def test_sm90_wgrad_golden():
     slices = expert_slices(GROUPS)
     inputs = {f"dy_{e}": a for e, (a, _) in enumerate(slices)} | {f"x_{e}": b for e, (_, b) in enumerate(slices)}
     assert_golden("grouped_gemm_wgrad_sm90_bf16", inputs, run(slices))
+
+
+PINGPONG = dict(kernel_schedule="pingpong")
+
+
+def test_sm90_wgrad_pingpong_replays_bitwise():
+    slices = expert_slices(GROUPS)
+    assert_replays(lambda: run(slices, **PINGPONG), repeats=6)
+
+
+@pytest.mark.parametrize("tile", [(128, 128), (128, 160), (128, 192)], ids=["128x128", "128x160", "128x192"])
+def test_sm90_wgrad_pingpong_matches_cooperative_bytes(tile):
+    # Both schedules reduce each output element with the same WGMMA sequence, so at one tile the bytes agree.
+    slices = expert_slices(GROUPS)
+    cooperative = run(slices, mma_tiler_mn=tile, kernel_schedule="cooperative")
+    assert_bitwise(run(slices, mma_tiler_mn=tile, **PINGPONG), cooperative, f"pingpong vs cooperative {tile}")
+
+
+@pytest.mark.parametrize("remaining", ["half", "one"], ids=["half-clusters", "one-cluster"])
+def test_sm90_wgrad_pingpong_claim_order_invariance(monkeypatch, remaining):
+    # Fewer (2, 1) clusters claim more tiles each, handed in turn to the two MMA warp groups.
+    slices = expert_slices(GROUPS)
+    expected = run(slices, **PINGPONG)
+    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+    margin = str(clusters - (clusters // 2 if remaining == "half" else 1))
+    monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", margin)
+    assert_bitwise(run(slices, **PINGPONG), expected, f"margin {margin}")
+
+
+def test_sm90_wgrad_pingpong_expert_batch_invariance():
+    slices = expert_slices(GROUPS)
+    full = run(slices, **PINGPONG)["wgrad"]
+    order = [6, 2, 0, 7, 4]
+    reordered = run(slices, order, **PINGPONG)["wgrad"]
+    for position, expert in enumerate(order):
+        assert_bitwise({"wgrad": reordered[position]}, {"wgrad": full[expert]}, f"expert {expert} reordered")
