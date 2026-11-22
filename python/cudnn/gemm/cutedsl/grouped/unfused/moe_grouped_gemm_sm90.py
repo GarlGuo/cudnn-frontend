@@ -56,6 +56,13 @@ def _widen_for_cluster(tma_tensor, mode, tile, cluster_count):
 KERNEL_SCHEDULES = ("cooperative", "pingpong")
 
 
+def check_register_split(load_regs: int, mma_regs: int, num_mma_warp_groups: int) -> None:
+    """setmaxnreg.inc waits for registers the decreases free: the split must fit the launch allocation or the MMA warps hang."""
+    launch_regs = min(65536 // ((num_mma_warp_groups + 1) * 128) // 8 * 8, 256)
+    if load_regs + num_mma_warp_groups * mma_regs > (num_mma_warp_groups + 1) * launch_regs:
+        raise ValueError(f"setmaxnreg split {load_regs} + {num_mma_warp_groups} x {mma_regs} exceeds {num_mma_warp_groups + 1} x {launch_regs} registers")
+
+
 def sm90_default_mma_tiler(pingpong: bool, glu_generate_c: bool = False) -> Tuple[int, int]:
     """The SM90 CTA tile when the caller gives none: (128, 256) cooperative; pingpong (128, 192), (128, 128) for a GLU with C."""
     if not pingpong:
@@ -229,6 +236,7 @@ class MoEGroupedGemmBf16KernelSm90:
         self.tile_info_consumers = (self.num_mma_threads + self.threads_per_warp) if pingpong else (self.num_mma_threads // self.threads_per_warp + 1)
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
+        check_register_split(self.load_register_requirement, self.mma_register_requirement, self.num_mma_warp_groups)
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,

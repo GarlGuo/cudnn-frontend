@@ -35,7 +35,7 @@ from ..moe_persistent_scheduler import (
 from ..moe_utils import MoEWeightMode, compute_expert_token_range, rewrite_tensor_shape
 from ..moe_sched_extension import ContiguousGroupedGemmSchedExtension
 from ..moe_kernel_helpers import atomic_add_float32, compute_grid, fmax, fmin, sigmoid_f32
-from ..unfused.moe_grouped_gemm_sm90 import _widen_for_cluster
+from ..unfused.moe_grouped_gemm_sm90 import _widen_for_cluster, check_register_split
 
 
 class MoEGroupedGemmDgluBf16KernelSm90:
@@ -165,9 +165,10 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         self.threads_per_cta = (self.num_mma_warp_groups + 1) * self.num_threads_per_warp_group
         # Every MMA warp, the TMA warp and the C-load warp read each tile_info entry; one elected lane per warp releases it.
         self.tile_info_consumer_warps = self.num_mma_threads // self.threads_per_warp + 2
-        # 48 + 2 x 232 fills the 512-register budget; with setmaxnreg honored the producer warps spill at 40.
-        self.load_register_requirement = 48
-        self.mma_register_requirement = 232
+        # The split must fit the 3 x 168 launch registers (48 + 2 x 232 hung); the producer warps spill at 40.
+        self.load_register_requirement = 56
+        self.mma_register_requirement = 224
+        check_register_split(self.load_register_requirement, self.mma_register_requirement, self.num_mma_warp_groups)
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
