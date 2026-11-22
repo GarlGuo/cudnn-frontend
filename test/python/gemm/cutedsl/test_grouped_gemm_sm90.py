@@ -138,10 +138,6 @@ def test_sm90_grouped_gemm_rejects_unsupported():
         run(fp32)
     with pytest.raises((NotImplementedError, ValueError, AssertionError)):
         run(problem, mma_tiler_mn=(256, 256))
-    # A cluster M tile over the 256-row expert pad would spill into the next expert.
-    for tile, cluster in (((128, 256), (4, 1)), ((64, 128), (8, 1)), ((128, 128), (4, 2))):
-        with pytest.raises(ValueError):
-            run(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster)
     import cudnn
 
     ptrs = torch.tensor([w.data_ptr() for w in problem["weights"]], dtype=torch.int64, device="cuda")
@@ -155,3 +151,11 @@ def test_sm90_grouped_gemm_rejects_unsupported():
             b_dtype=torch.bfloat16,
             prob_tensor=problem["prob"],
         )
+
+
+@pytest.mark.parametrize("tile,cluster", [((128, 256), (4, 1)), ((64, 128), (8, 1)), ((128, 128), (4, 2))], ids=["128-c41", "64-c81", "128-c42"])
+def test_sm90_grouped_gemm_rejects_cluster_m_over_expert_pad(tile, cluster):
+    # A cluster M tile over the 256-row expert pad would write the next expert's rows.
+    problem = make_problem((256, 256), n=256, k=256)
+    with pytest.raises(ValueError):
+        run(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster)
