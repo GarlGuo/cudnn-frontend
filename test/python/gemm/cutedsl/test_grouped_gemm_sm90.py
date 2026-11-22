@@ -323,10 +323,10 @@ def test_sm90_schedule_heuristic(n, k, tile, cluster, glu_c, expected):
     api = (GroupedGemmGluBf16API if glu_c else GroupedGemmBf16API)(a, c, d, **common)
     assert (api._pingpong, api.mma_tiler_mn) == expected
     # wgrad: pingpong for output N >= 2048 on 128x192 tiles and (2, 1) clusters.
-    assert use_pingpong_wgrad(2048, None) and not use_pingpong_wgrad(1024, None)
+    assert use_pingpong_wgrad(2048, None, None) and not use_pingpong_wgrad(1024, None, None)
     assert use_pingpong_wgrad(4096, (128, 192), (2, 1))
-    assert not use_pingpong_wgrad(4096, (128, 256))
-    assert not use_pingpong_wgrad(4096, (128, 160))
+    assert not use_pingpong_wgrad(4096, (128, 256), None)
+    assert not use_pingpong_wgrad(4096, (128, 160), None)
     assert not use_pingpong_wgrad(4096, None, (1, 2))
     with override_schedule("cooperative"):
-        assert not use_pingpong_wgrad(4096, None)
+        assert not use_pingpong_wgrad(4096, None, None)
