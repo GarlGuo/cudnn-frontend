@@ -1120,12 +1120,12 @@ class MoEGroupedGemmBf16KernelSm90:
                         acc_base = subtile_idx * size_tRS_rD
                         for i in cutlass.range_constexpr(size_tRS_rD):
                             acc_coord = tRS_cAcc[acc_base + i]
-                            # prob depends on the row only: load it at the first N subtile of each M subtile.
+                            # The row scale alpha * prob, set at the first N subtile of each M subtile: D takes one multiply.
                             if cutlass.const_expr(subtile_idx % subtile_shape[1] == 0):
-                                tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0]
-                            c_value = tRS_rAcc[acc_base + i] * alpha_val
-                            tRS_rC[i] = c_value
-                            tRS_rD[i] = c_value * tRS_rProb[i]
+                                tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0] * alpha_val
+                            if cutlass.const_expr(self.generate_c):
+                                tRS_rC[i] = tRS_rAcc[acc_base + i] * alpha_val
+                            tRS_rD[i] = tRS_rAcc[acc_base + i] * tRS_rProb[i]
 
                     if cutlass.const_expr(self.generate_c and self.fused_glu):
                         # C keeps the pre-activation gate and up blocks; two C stores per D subtile, own buffers.

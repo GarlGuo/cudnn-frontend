@@ -61,7 +61,7 @@ def reference(problem):
     return c, c * problem["prob"][:, None]
 
 
-def run(problem, schedule=None, **kwargs):
+def run(problem, schedule=None, generate_c=True, **kwargs):
     """``schedule`` forces the SM90 schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
     import cudnn
 
@@ -75,7 +75,7 @@ def run(problem, schedule=None, **kwargs):
             prob_tensor=problem["prob"],
             c_dtype=problem["out_dtype"],
             d_dtype=problem["out_dtype"],
-            generate_c=True,
+            generate_c=generate_c,
             **kwargs,
         )
 
@@ -232,6 +232,24 @@ def test_sm90_pingpong_matches_cooperative(direction):
     check(problem, pingpong)
     for name in ("c_tensor", "d_tensor"):
         assert torch.equal(pingpong[name], cooperative[name]), name
+
+
+@pytest.mark.parametrize("direction", ["fwd", "dgrad"])
+@pytest.mark.parametrize("schedule", ["cooperative", "pingpong"])
+def test_sm90_random_scales_without_c(direction, schedule):
+    # D = A @ B * (alpha * prob) with random per-expert alpha and per-row prob, with and without C: the same D bytes.
+    problem = make_problem((512, 0, 768, 256), n=2304, k=448, direction=direction, seed=53)
+    generator = torch.Generator(device="cuda").manual_seed(53)
+    problem["alpha"] = torch.rand((4,), generator=generator, device="cuda") * 3.0 - 1.0
+    problem["prob"] = torch.rand(problem["prob"].shape, generator=generator, device="cuda") * 2.0
+    without_c = run(problem, schedule=schedule, generate_c=False)
+    with_c = run(problem, schedule=schedule)
+    check(problem, with_c)
+    _, expected_d = reference(problem)
+    rows = sum(problem["counts"])
+    actual = without_c["d_tensor"][:rows].float()
+    torch.testing.assert_close(actual, expected_d[:rows].to(torch.bfloat16).float(), rtol=2e-2, atol=3e-2)
+    assert torch.equal(without_c["d_tensor"][:rows], with_c["d_tensor"][:rows])
 
 
 def test_sm90_pingpong_fp16_genc_and_legacy_layout():
