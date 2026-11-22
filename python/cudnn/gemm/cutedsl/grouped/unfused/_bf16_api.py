@@ -165,7 +165,8 @@ class GroupedGemmBf16API(APIBase):
         self.m_aligned = m_aligned
         self.generate_c = generate_c
         self.b_major = b_major
-        self.use_dynamic_sched = use_dynamic_sched or self._is_sm90
+        # SM90's only scheduler is the dynamic one (the gmem atomic-counter claim), so it is the default there.
+        self.use_dynamic_sched = True if self._is_sm90 else use_dynamic_sched
         self._has_bias = self.bias_desc is not None
         self._kernel = MoEGroupedGemmBf16KernelSm90 if self._is_sm90 else MoEGroupedGemmBf16Kernel
         self._workspace: Optional[torch.Tensor] = None

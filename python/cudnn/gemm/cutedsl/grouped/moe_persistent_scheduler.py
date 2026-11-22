@@ -248,10 +248,10 @@ class MoESchedulerParams:
         cta_tile_shape_mnk: Tuple[int, int, int],  # (tile_m, tile_n, tile_k)
         cluster_shape_mn: Tuple[int, int],  # (cluster_m, cluster_n)
         use_dynamic_sched: bool = False,
-        wgrad_counter_claim: bool = False,  # 2Dx2D: claim from the gmem counter on persistent clusters, not CLC
+        atomic_counter_claim: bool = False,  # 2Dx2D (SM90, no CLC): claim from the gmem atomic counter on persistent clusters
     ):
         self.scenario = scenario
-        self.wgrad_counter_claim = wgrad_counter_claim
+        self.atomic_counter_claim = atomic_counter_claim
         e, i, h = expert_shape
         self.expert_cnt = e if isinstance(e, Int32) else Int32(e)
         self.intermediate = i if isinstance(i, Int32) else Int32(i)
@@ -264,8 +264,8 @@ class MoESchedulerParams:
 
     @property
     def uses_clc(self) -> bool:
-        """2Dx2D claims with CLC (Blackwell): a grid of every tile instead of persistent clusters."""
-        return self.scenario == "2Dx2D" and not self.wgrad_counter_claim
+        """2Dx2D claims with CLC (Blackwell) unless it claims from the atomic counter: a grid of every tile, not persistent clusters."""
+        return self.scenario == "2Dx2D" and not self.atomic_counter_claim
 
     @property
     def cluster_tile_m(self) -> int:
@@ -302,7 +302,7 @@ class MoESchedulerParams:
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
             use_dynamic_sched=self.use_dynamic_sched,
-            wgrad_counter_claim=self.wgrad_counter_claim,
+            atomic_counter_claim=self.atomic_counter_claim,
         )
 
     @staticmethod

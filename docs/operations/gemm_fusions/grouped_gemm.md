@@ -173,7 +173,8 @@ weights (`b_major="n"`), with these limits:
 - No `bias`; it raises `NotImplementedError`.
 - `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
 - Torch tensors only (no JAX entry).
-- Always the dynamic scheduler: `use_dynamic_sched` is accepted and ignored.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
 - The SM90 kernel picks its warp-group schedule from the problem shape, and
   `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
   or `(128, 192)` for short K (`K <= 2048`, `N >= 2048`). SM100 uses
@@ -188,7 +189,8 @@ weights (`b_major="n"`), with these limits:
 
 ## Scheduling, caching, and errors
 
-- `use_dynamic_sched=False` uses the static scheduler (SM100; SM90 is always dynamic).
+- `use_dynamic_sched=False` uses the static scheduler on SM100. SM90 uses the
+  dynamic scheduler (atomic counter) by default; the static scheduler is not available.
 - `use_dynamic_sched=True` compiles a dynamic-M callable and reuses it for
   compatible M values; discrete mode also allocates the per-expert tensor-map
   workspace. Wrapper cache keys retain dtype, layout, expert count, optional

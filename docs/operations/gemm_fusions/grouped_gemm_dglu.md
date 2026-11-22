@@ -223,7 +223,8 @@ added. Limits:
 - `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
 - `dprob` is an atomic per-row sum over N tiles, as on SM100; zero it before each
   call. Torch tensors only (no JAX entry); block-scaled inputs are SM100 only.
-- Always the dynamic scheduler: `use_dynamic_sched` is accepted and ignored.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
 - `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
   `(256, 256)` on SM100. An explicit SM90 tile is `(128, 128)` or `(128, 256)`.
   `cluster_shape_mn=None` selects `(2, 1)`; an explicit cluster has power-of-two

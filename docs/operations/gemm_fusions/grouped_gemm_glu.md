@@ -121,7 +121,8 @@ registers). The `_sm100` suffix is historical; no new names are added. Limits:
 - Dense K-major `B` only; discrete `b_ptrs` and `bias` raise `NotImplementedError`.
 - `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
 - Torch tensors only (no JAX entry); block-scaled inputs are SM100 only.
-- Always the dynamic scheduler: `use_dynamic_sched` is accepted and ignored.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
 - The SM90 kernel picks its warp-group schedule from the problem shape, and
   `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
   or `(128, 192)` for short K (`K <= 2048`, pre-activation `N >= 2048`) without

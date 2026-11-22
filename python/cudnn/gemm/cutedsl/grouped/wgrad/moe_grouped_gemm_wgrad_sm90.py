@@ -20,7 +20,7 @@ Supports:
     - k_tile_cnt == 0 handling (zero output for empty experts)
     - Cooperative (both MMA warp groups on one tile) or pingpong (each MMA warp group owns alternate tiles)
 
-Scheduler: moe_persistent_scheduler.py (scenario="2Dx2D", wgrad_counter_claim=True)
+Scheduler: moe_persistent_scheduler.py (scenario="2Dx2D", atomic_counter_claim=True)
 Extension: moe_sched_extension.py (WgradGemmSchedExtension)
 """
 
@@ -317,7 +317,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
             expert_shape=(experts, intermediate, hidden),
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
-            wgrad_counter_claim=True,
+            atomic_counter_claim=True,
         )
         grid = MoESchedulerParams.get_grid_shape(sched_params, max_active_clusters)
 

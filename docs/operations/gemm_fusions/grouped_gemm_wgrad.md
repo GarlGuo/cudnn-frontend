@@ -282,6 +282,8 @@ clusters, as SM90 has no cluster launch control. It covers the BF16 contract
 above with these limits:
 
 - Dense `wgrad_tensor` output only; `output_mode="discrete"` raises `NotImplementedError`.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available.
 - `input_order="tensor2d"` only; `"tensor_ragged"` raises `NotImplementedError`.
 - `accumulate_on_output=True` raises `NotImplementedError`.
 - Block-scaled (FP8/FP4) inputs are not supported on SM90.
