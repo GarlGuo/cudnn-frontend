@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Private BF16 API for the SM100 grouped GEMM GLU kernel."""
+"""Private BF16 API for the SM100 (and SM90) grouped GEMM GLU kernel."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc
+from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
@@ -37,6 +37,7 @@ from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake
 from ..moe_utils import MoEWeightMode
 from ..glu_layout import validate_glu_layout
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
+from .moe_grouped_gemm_glu_sm90 import MoEGroupedGemmGluBf16KernelSm90
 
 
 def _output_dtypes():
@@ -60,7 +61,7 @@ class GroupedGemmGluBf16API(APIBase):
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
@@ -121,18 +122,20 @@ class GroupedGemmGluBf16API(APIBase):
         self.b_shape = tuple(b_shape) if b_shape is not None else None
         self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
-        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        # SM90 runs the Hopper kernel: tile M <= 128, a (2, 1) cluster by default and the dynamic scheduler always.
+        self._is_sm90 = is_sm90_device()
+        self.mma_tiler_mn = tuple(mma_tiler_mn or ((128, 256) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
+        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.generate_c = generate_c
         self.glu_layout = validate_glu_layout(glu_layout)
         self.act_func = act_func
         self.b_major = b_major
-        self.use_dynamic_sched = use_dynamic_sched
+        self.use_dynamic_sched = use_dynamic_sched or self._is_sm90
         self._has_bias = self.bias_desc is not None
-        self._kernel = MoEGroupedGemmGluBiasBf16Kernel
+        self._kernel = MoEGroupedGemmGluBf16KernelSm90 if self._is_sm90 else MoEGroupedGemmGluBiasBf16Kernel
         self._workspace: Optional[torch.Tensor] = None
         self._live_b_ptrs = None
         self._compile_b_ptrs = None
@@ -259,7 +262,17 @@ class GroupedGemmGluBf16API(APIBase):
 
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
-        if self.m_aligned != MoEGroupedGemmGluBiasBf16Kernel.FIX_PAD_SIZE:
+        if self._is_sm90:
+            if self.weight_mode != MoEWeightMode.DENSE:
+                raise NotImplementedError("SM90 grouped GEMM GLU supports dense weights (sample_b) only, not discrete b_ptrs")
+            if self._has_bias:
+                raise NotImplementedError("SM90 grouped GEMM GLU does not support bias")
+            if self.glu_layout != "interleaved_32":
+                raise NotImplementedError("SM90 grouped GEMM GLU supports glu_layout='interleaved_32' only")
+            for desc, name in ((self.c_desc, "sample_c"), (self.d_desc, "sample_d")):
+                if _convert_to_cutlass_data_type(desc.dtype) not in (cutlass.BFloat16, cutlass.Float16):
+                    raise NotImplementedError(f"SM90 grouped GEMM GLU {name} must be BF16 or FP16, got {desc.dtype}")
+        if self.m_aligned != self._kernel.FIX_PAD_SIZE:
             raise ValueError(f"m_aligned must be 256, got {self.m_aligned}")
         if self.act_func not in ("swiglu", "geglu"):
             raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {self.act_func}")
@@ -293,8 +306,8 @@ class GroupedGemmGluBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
-        if not has_tcgen05(major):
-            raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
+        if not (has_tcgen05(major) or compute_capability == 90):
+            raise RuntimeError(f"GroupedGemmGluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         if self.glu_layout == "gate_then_up":
             self._not_implemented_error_if(compute_capability not in (100, 103), "gate_then_up GLU requires SM100/103")

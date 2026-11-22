@@ -1,4 +1,4 @@
-# Grouped GEMM + dGLU (SM100)
+# Grouped GEMM + dGLU (SM100 and SM90 BF16)
 
 **This is an experimental API and subject to change.**
 
@@ -207,6 +207,27 @@ out = cudnn.grouped_gemm_dglu_wrapper_sm100(
 )
 assert out["activation_tensor"] is activation
 ```
+
+## SM90 (Hopper)
+
+On an SM90 device, `GroupedGemmDgluSm100` and `grouped_gemm_dglu_wrapper_sm100`
+run a Hopper kernel for the BF16 contract (WGMMA and TMA, accumulator in
+registers, a C-load warp). The `_sm100` suffix is historical; no new names are
+added. Limits:
+
+- `act_func` is `"dswiglu"` or `"dgeglu"` with `glu_layout="interleaved_32"`;
+  `geglu_alpha`, the clamps, `linear_offset` and `round_dgrad_to_input_dtype`
+  behave as on SM100.
+- Dense `B` (`b_major="k"` or `"n"`) only; discrete `b_ptrs`,
+  `generate_dbias=True` and `activation_tensor` raise `NotImplementedError`.
+- `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
+- `dprob` is an atomic per-row sum over N tiles, as on SM100; zero it before each
+  call. Torch tensors only (no JAX entry); block-scaled inputs are SM100 only.
+- Always the dynamic scheduler: `use_dynamic_sched` is accepted and ignored.
+- `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
+  `(256, 256)` on SM100. An explicit SM90 tile is `(128, 128)` or `(128, 256)`.
+  `cluster_shape_mn=None` selects `(2, 1)`; an explicit cluster has power-of-two
+  sides, at most 8 CTAs, and `128 * cluster_m` dividing 256.
 
 ## Block-scaled contract
 

@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileContributor: Wentao Guo, Phuong Nguyen
 
-"""Time the SM90 BF16 grouped GEMM (grouped_gemm_wrapper_sm100 on H100) against torch._grouped_mm on MoE shapes.
+"""Time the SM90 BF16 grouped GEMMs (the *_wrapper_sm100 APIs on H100) against torch._grouped_mm on MoE shapes.
 
 One item is (model, op) at one EP rank's sizes: tokens per GPU x top_k routed rows spread evenly over the rank's
 experts, each expert padded to 256 rows. Ops: fc1_fwd (N=2I, K=H), fc2_fwd (N=H, K=I), fc1_dgrad (N=H, K=2I),
-fc2_dgrad (N=I, K=H); the dgrad ops read the forward weights N-major. Timings interleave the backends rep by rep,
-each rep behind an L2 flush.
+fc2_dgrad (N=I, K=H); the dgrad ops read the forward weights N-major. fc1_glu is fc1_fwd with the SwiGLU fused
+(grouped_gemm_glu_wrapper_sm100); fc2_dglu is fc2_dgrad with the dSwiGLU fused (grouped_gemm_dglu_wrapper_sm100).
+Their torch baseline is torch._grouped_mm plus the activation in eager torch. Timings interleave the backends rep by
+rep, each rep behind an L2 flush.
 
   python benchmark/gemm/benchmark_grouped_gemm_sm90.py --list-items
   python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --ep 8 --out perf.json
@@ -30,7 +32,8 @@ MODEL_SHAPES = {
     "qwen38_2p4t": dict(hidden=8192, experts=512, top_k=10, intermediate=2048),
     "glm53_flash": dict(hidden=4096, experts=288, top_k=8, intermediate=2048),
 }
-OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad")
+OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad", "fc1_glu", "fc2_dglu")
+BLOCK = 32  # interleaved_32 gate/up column blocks
 ITEMS = [f"{model}.{op}" for model in MODEL_SHAPES for op in OPS]
 
 
@@ -46,11 +49,13 @@ def item_problem(item: str, ep: int, tokens: int):
         "fc2_fwd": (hidden, shape["intermediate"]),
         "fc1_dgrad": (hidden, inter2),
         "fc2_dgrad": (shape["intermediate"], hidden),
+        "fc1_glu": (inter2, hidden),
+        "fc2_dglu": (shape["intermediate"], hidden),
     }[op]
     rows = -(-tokens * shape["top_k"] // experts)
     count = -(-rows // 256) * 256
     return dict(
-        model=model, op=op, experts=experts, n=n, k=k, rows_per_expert=rows, count=count, m=count * experts, b_major="n" if op.endswith("dgrad") else "k"
+        model=model, op=op, experts=experts, n=n, k=k, rows_per_expert=rows, count=count, m=count * experts, b_major="n" if op in ("fc1_dgrad", "fc2_dgrad", "fc2_dglu") else "k"
     )
 
 
@@ -64,11 +69,65 @@ def make_tensors(p, seed=0):
     alpha = torch.ones(p["experts"], device="cuda", dtype=torch.float32)
     prob = torch.ones(p["m"], device="cuda", dtype=torch.float32)
     d = torch.empty((p["m"], p["n"]), device="cuda", dtype=torch.bfloat16)
-    return dict(a=a, b=b, offsets=offsets, alpha=alpha, prob=prob, d=d)
+    # fc2_dglu reads the forward's saved pre-activation C (gate | up, 2N wide) and accumulates dprob.
+    c = torch.randn((p["m"], 2 * p["n"]), generator=g, device="cuda", dtype=torch.bfloat16) if p["op"] == "fc2_dglu" else None
+    dprob = torch.zeros(p["m"], device="cuda", dtype=torch.float32)
+    return dict(a=a, b=b, offsets=offsets, alpha=alpha, prob=prob, d=d, c=c, dprob=dprob)
+
+
+def split_gate_up(x):
+    m, two_n = x.shape
+    blocks = x.view(m, two_n // (2 * BLOCK), 2, BLOCK)
+    return blocks[:, :, 0].reshape(m, -1), blocks[:, :, 1].reshape(m, -1)
+
+
+def torch_swiglu(acc, prob):
+    gate, up = split_gate_up(acc.float())
+    return (up * torch.nn.functional.silu(gate) * prob[:, None]).to(torch.bfloat16)
+
+
+def torch_dswiglu(g, c, prob):
+    """D (dgate | dup, interleaved) of SwiGLU from g = dY @ W^T and the saved C; alpha = beta = 1."""
+    g = g.float()
+    x1, x2 = (half.float() for half in split_gate_up(c))
+    s = torch.sigmoid(x1)
+    d1 = g * prob[:, None] * x2 * s * (1 + x1 * (1 - s))
+    d2 = g * prob[:, None] * x1 * s
+    m, n = d1.shape
+    return torch.stack((d1.view(m, n // BLOCK, BLOCK), d2.view(m, n // BLOCK, BLOCK)), dim=2).reshape(m, 2 * n).to(torch.bfloat16)
 
 
 def backends(p, t, names):
     import cudnn
+
+    def ours_glu():
+        return cudnn.grouped_gemm_glu_wrapper_sm100(
+            a_tensor=t["a"],
+            sfa_tensor=None,
+            padded_offsets=t["offsets"],
+            alpha_tensor=t["alpha"],
+            b_tensor=t["b"],
+            prob_tensor=t["prob"],
+            c_dtype=torch.bfloat16,
+            d_dtype=torch.bfloat16,
+            act_func="swiglu",
+        )["d_tensor"]
+
+    def ours_dglu():
+        return cudnn.grouped_gemm_dglu_wrapper_sm100(
+            a_tensor=t["a"],
+            c_tensor=t["c"],
+            sfa_tensor=None,
+            padded_offsets=t["offsets"],
+            alpha_tensor=t["alpha"],
+            beta_tensor=t["alpha"],
+            prob_tensor=t["prob"],
+            dprob_tensor=t["dprob"],
+            b_tensor=t["b"],
+            b_major=p["b_major"],
+            d_dtype=torch.bfloat16,
+            act_func="dswiglu",
+        )["d_row_tensor"]
 
     def ours():
         cudnn.grouped_gemm_wrapper_sm100(
@@ -86,9 +145,18 @@ def backends(p, t, names):
 
     # torch._grouped_mm takes (G, K, N) weights: a view of either layout.
     b_kn = t["b"].transpose(1, 2) if p["b_major"] == "k" else t["b"]
-    runs = {"cudnn_sm90": ours}
+    grouped_mm = lambda: torch._grouped_mm(t["a"], b_kn, offs=t["offsets"], out_dtype=torch.bfloat16)
+    if p["op"] == "fc1_glu":
+        runs = {"cudnn_sm90": ours_glu}
+        reference = lambda: torch_swiglu(grouped_mm(), t["prob"])
+    elif p["op"] == "fc2_dglu":
+        runs = {"cudnn_sm90": ours_dglu}
+        reference = lambda: torch_dswiglu(grouped_mm(), t["c"], t["prob"])
+    else:
+        runs = {"cudnn_sm90": ours}
+        reference = grouped_mm
     if "torch_grouped_mm" in names:
-        runs["torch_grouped_mm"] = lambda: torch._grouped_mm(t["a"], b_kn, offs=t["offsets"], out_dtype=torch.bfloat16)
+        runs["torch_grouped_mm"] = reference
     return runs
 
 
@@ -139,7 +207,7 @@ def main(argv=None):
     p = item_problem(args.item, args.ep, args.tokens)
     t = make_tensors(p)
     runs = backends(p, t, set(filter(None, args.baselines.split(","))))
-    outputs = {name: fn().float() for name, fn in runs.items()}
+    outputs = {name: fn().float().view(p["m"], -1) for name, fn in runs.items()}
     torch.cuda.synchronize()
     check = {}
     if "torch_grouped_mm" in outputs:

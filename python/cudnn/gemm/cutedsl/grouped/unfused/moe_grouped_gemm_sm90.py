@@ -36,7 +36,7 @@ from ..moe_persistent_scheduler import (
 )
 from ..moe_utils import MoEWeightMode, rewrite_tensor_shape
 from ..moe_sched_extension import ContiguousGroupedGemmSchedExtension
-from ..moe_kernel_helpers import compute_grid, is_valid_tensor_alignment
+from ..moe_kernel_helpers import compute_grid, fmax, fmin, is_valid_tensor_alignment, silu_f32, silu_f32_geglu_scaled
 
 
 def _widen_for_cluster(tma_tensor, mode, tile, cluster_count):
@@ -125,8 +125,13 @@ class MoEGroupedGemmBf16KernelSm90:
         expert_cnt: int,
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = True,
+        act_func: Optional[str] = None,
     ):
         mma_tile_m = mma_tiler_mn[0]
+        if act_func not in (None, "swiglu", "geglu"):
+            raise ValueError(f"act_func must be None, 'swiglu' or 'geglu', got {act_func!r}")
+        if act_func is not None and mma_tiler_mn[1] % 64 != 0:
+            raise ValueError(f"A fused GLU pairs adjacent 32-column gate/up blocks: CTA tile N must be a multiple of 64, got {mma_tiler_mn[1]}.")
         if self.FIX_PAD_SIZE % (mma_tile_m * cluster_shape_mn[0]) != 0:
             # A cluster M tile past one padded expert segment would write the next expert's rows and read prob OOB.
             raise ValueError(
@@ -190,6 +195,9 @@ class MoEGroupedGemmBf16KernelSm90:
         self.weight_mode = weight_mode
         self.use_dynamic_sched = True
         self.num_epilog_warps = len(self.epilog_warp_id)
+        # act_func fuses a GLU (interleaved 32-column gate/up blocks): D has half the accumulator's N columns.
+        self.act_func = act_func
+        self.fused_glu = act_func is not None
 
     # ------------------------------------------------------------------
     # _setup_attributes
@@ -219,6 +227,7 @@ class MoEGroupedGemmBf16KernelSm90:
         )
         # No 2-CTA MMA on Hopper: the CTA tile is the MMA tile and the cluster's "V" mode is 1.
         self.cta_tile_shape_mnk = self.mma_tiler
+        self.mma_tiler_d = (self.mma_tiler[0], self.mma_tiler[1] // 2, self.mma_tiler[2]) if self.fused_glu else self.mma_tiler
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)),
             (cute.make_layout(1),),
@@ -232,6 +241,8 @@ class MoEGroupedGemmBf16KernelSm90:
             self.d_dtype,
             is_cooperative=self.atom_layout_mnk == (2, 1, 1),
         )
+        if self.fused_glu and self.epi_tile[1] != 32:
+            raise ValueError(f"A fused GLU needs a 32-column epilogue tile (the gate/up block), got {self.epi_tile[1]}.")
 
         (
             self.num_ab_stage,
@@ -380,6 +391,10 @@ class MoEGroupedGemmBf16KernelSm90:
         ``b`` is the dense (N, K, L) weight tensor; ``n``, ``k``, ``b_stride_size`` and ``bias`` are unused
         and kept so every grouped GEMM kernel takes the same arguments.
         """
+        self._launch(a, b, b_major_mode, workspace_ptr, c, d, padded_offsets, alpha, prob, max_active_clusters, stream, None)
+
+    def _launch(self, a, b, b_major_mode, workspace_ptr, c, d, padded_offsets, alpha, prob, max_active_clusters, stream, linear_offset):
+        """Trace the launch for ``__call__``; ``linear_offset`` is the GeGLU up offset (None without a fused GLU)."""
         a = kernel_facing_mx(a)
         c = kernel_facing_mx(c)
         d = kernel_facing_mx(d)
@@ -444,7 +459,7 @@ class MoEGroupedGemmBf16KernelSm90:
         cluster_n = self.cluster_shape_mn[1]
         tma_tensor_b = _widen_for_cluster(tma_tensor_b, 0, self.mma_tiler[1], cluster_n)
         tma_tensor_c = _widen_for_cluster(tma_tensor_c, 1, self.mma_tiler[1], cluster_n)
-        tma_tensor_d = _widen_for_cluster(tma_tensor_d, 1, self.mma_tiler[1], cluster_n)
+        tma_tensor_d = _widen_for_cluster(tma_tensor_d, 1, self.mma_tiler_d[1], cluster_n)
 
         # ---- Helper kernel: dynamic scheduler counter reset ----
         self.helper_kernel(workspace_ptr).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream, min_blocks_per_mp=1)
@@ -501,6 +516,7 @@ class MoEGroupedGemmBf16KernelSm90:
             padded_offsets,
             alpha,
             prob,
+            linear_offset,
             workspace_ptr,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
@@ -578,6 +594,7 @@ class MoEGroupedGemmBf16KernelSm90:
         padded_offsets: cute.Tensor,
         alpha: cute.Tensor,
         prob: cute.Tensor,
+        linear_offset: Optional[cutlass.Float32],
         workspace_ptr,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -664,8 +681,8 @@ class MoEGroupedGemmBf16KernelSm90:
         thr_mma = tiled_mma.get_slice(mma_warp_group_thread_layout(warp_group_idx))
         tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
         tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
-        gD_mnl_shape = cute.local_tile(mD_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
-        acc_shape = thr_mma.partition_C(gD_mnl_shape).shape[:3]
+        # Shape the accumulator from the CTA tile, not D: a fused GLU's D has half the N columns.
+        acc_shape = thr_mma.partition_C(cute.make_identity_tensor((self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]))).shape[:3]
         accumulators = cute.make_rmem_tensor(acc_shape, self.acc_dtype)
 
         if cute.size(self.cluster_shape_mn) > 1:
@@ -816,6 +833,8 @@ class MoEGroupedGemmBf16KernelSm90:
                 thr_copy_r2s_c = tiled_copy_r2s_c.get_slice(epi_tidx)
                 tRS_sC = thr_copy_r2s_c.partition_D(sC)
                 tRS_rC_out = cute.make_rmem_tensor(tRS_rD_layout.shape, self.c_dtype)
+                if cutlass.const_expr(self.fused_glu):
+                    tRS_rC_up = cute.make_rmem_tensor(tRS_rD_layout.shape, self.acc_dtype)
 
             epi_ext = ContiguousGroupedGemmSchedExtension()
             ab_consumer_read_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
@@ -886,7 +905,7 @@ class MoEGroupedGemmBf16KernelSm90:
                 real_prob, _ = epi_ext.get_gmem_tensor("prob", prob, padded_offsets, epi_work_tile_info)
                 m_base = epi_work_tile_info.tile_m_idx * self.cta_tile_shape_mnk[0]
 
-                gD_mnl_loop = cute.local_tile(real_d, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
+                gD_mnl_loop = cute.local_tile(real_d, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
                 gD_tile = gD_mnl_loop[(None, None, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx, 0)]
                 gD_epi = cute.zipped_divide(gD_tile, epi_tile)
                 bSG_sD, bSG_gD = cpasync.tma_partition(
@@ -907,6 +926,8 @@ class MoEGroupedGemmBf16KernelSm90:
                         cute.group_modes(sC, 0, 2),
                         gC_epi,
                     )
+                    c_subtile_shape = gC_epi.shape[1]
+                    c_subtile_layout = cute.make_layout(c_subtile_shape, stride=(c_subtile_shape[1], 1))
 
                 subtile_cnt = cute.size(gD_epi, mode=[1])
                 subtile_shape = gD_epi.shape[1]
@@ -914,17 +935,70 @@ class MoEGroupedGemmBf16KernelSm90:
 
                 for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     gmem_coord = subtile_layout.get_hier_coord(subtile_idx)
-                    acc_base = subtile_idx * size_tRS_rD
-                    for i in cutlass.range_constexpr(size_tRS_rD):
-                        acc_coord = tRS_cAcc[acc_base + i]
-                        # prob depends on the row only: load it at the first N subtile of each M subtile.
-                        if cutlass.const_expr(subtile_idx % subtile_shape[1] == 0):
-                            tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0]
-                        c_value = tRS_rAcc[acc_base + i] * alpha_val
-                        tRS_rC[i] = c_value
-                        tRS_rD[i] = c_value * tRS_rProb[i]
+                    if cutlass.const_expr(self.fused_glu):
+                        # A load past the previous subtile's barriers keeps ptxas from hoisting this subtile's
+                        # activation above the C stores (spills at SM90's flat 168 registers).
+                        if cutlass.const_expr(subtile_idx > 0 and self.generate_c):
+                            alpha_val = cutlass.Float32(alpha[expert_idx])
+                        # D subtile s reads accumulator subtiles 2s (gate) and 2s+1 (up): same rows, 32 columns apart.
+                        acc_gate = 2 * subtile_idx * size_tRS_rD
+                        acc_up = acc_gate + size_tRS_rD
+                        for i in cutlass.range_constexpr(size_tRS_rD):
+                            acc_coord = tRS_cAcc[acc_gate + i]
+                            if cutlass.const_expr(subtile_idx % subtile_shape[1] == 0):
+                                tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0]
+                            gate_value = tRS_rAcc[acc_gate + i] * alpha_val
+                            up_value = tRS_rAcc[acc_up + i] * alpha_val
+                            if cutlass.const_expr(self.generate_c):
+                                tRS_rC[i] = gate_value
+                                tRS_rC_up[i] = up_value
+                            if cutlass.const_expr(self.act_func == "geglu"):
+                                gate_value = fmin(gate_value, cutlass.Float32(7.0))
+                                up_value = fmax(fmin(up_value, cutlass.Float32(7.0)), cutlass.Float32(-7.0))
+                                act_value = (up_value + linear_offset) * silu_f32_geglu_scaled(gate_value, fastmath=True)
+                            else:
+                                act_value = up_value * silu_f32(gate_value, fastmath=True)
+                            tRS_rD[i] = act_value * tRS_rProb[i]
+                    else:
+                        acc_base = subtile_idx * size_tRS_rD
+                        for i in cutlass.range_constexpr(size_tRS_rD):
+                            acc_coord = tRS_cAcc[acc_base + i]
+                            # prob depends on the row only: load it at the first N subtile of each M subtile.
+                            if cutlass.const_expr(subtile_idx % subtile_shape[1] == 0):
+                                tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0]
+                            c_value = tRS_rAcc[acc_base + i] * alpha_val
+                            tRS_rC[i] = c_value
+                            tRS_rD[i] = c_value * tRS_rProb[i]
 
-                    if cutlass.const_expr(self.generate_c):
+                    if cutlass.const_expr(self.generate_c and self.fused_glu):
+                        # C keeps the pre-activation gate and up blocks; two C stores per D subtile, own buffers.
+                        self.store_c(
+                            tiled_copy_r2s_c,
+                            tma_atom_c,
+                            warp_idx,
+                            tRS_rC,
+                            tRS_rC_out,
+                            tRS_sC,
+                            bSG_gC,
+                            bSG_sC,
+                            c_pipeline,
+                            (2 * num_prev_subtiles) % self.num_c_stage,
+                            c_subtile_layout.get_hier_coord(2 * subtile_idx),
+                        )
+                        self.store_c(
+                            tiled_copy_r2s_c,
+                            tma_atom_c,
+                            warp_idx,
+                            tRS_rC_up,
+                            tRS_rC_out,
+                            tRS_sC,
+                            bSG_gC,
+                            bSG_sC,
+                            c_pipeline,
+                            (2 * num_prev_subtiles + 1) % self.num_c_stage,
+                            c_subtile_layout.get_hier_coord(2 * subtile_idx + 1),
+                        )
+                    elif cutlass.const_expr(self.generate_c):
                         self.store_c(
                             tiled_copy_r2s_c,
                             tma_atom_c,

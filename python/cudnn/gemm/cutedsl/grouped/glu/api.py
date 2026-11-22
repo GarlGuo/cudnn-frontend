@@ -87,6 +87,13 @@ from ._bf16_api import GroupedGemmGluBf16API
 from ._blockscaled_api import GroupedGemmGluBlockScaledAPI
 
 
+def _default_mma_tiler(mma_tiler_mn: Optional[Tuple[int, int]]) -> Tuple[int, int]:
+    """The CTA tile when the caller gives none: (128, 256) on SM90 (Hopper kernel), else (256, 256)."""
+    if mma_tiler_mn is not None:
+        return tuple(mma_tiler_mn)
+    return (128, 256) if get_device_type() == "hopper" else (256, 256)
+
+
 @dataclass(frozen=True)
 class GluCall:
     """Immutable normalized input for GLU dispatch, allocation, and caching."""
@@ -192,7 +199,7 @@ class GroupedGemmGluSm100(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -221,6 +228,7 @@ class GroupedGemmGluSm100(APIBase):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmGluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
             self._pending_init_kwargs["acc_dtype"] = cutlass.Float32
+        self._pending_init_kwargs["mma_tiler_mn"] = _default_mma_tiler(mma_tiler_mn)
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -1089,8 +1097,8 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if not has_tcgen05(major):
-        raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
+    if not (has_tcgen05(major) or compute_capability == 90):
+        raise RuntimeError(f"GroupedGemmGluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
     return normalized, backend
 
 
@@ -1283,7 +1291,7 @@ def grouped_gemm_glu_wrapper_sm100(
     c_dtype: Optional[torch.dtype] = None,
     d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     vector_f32: bool = False,
@@ -1322,6 +1330,7 @@ def grouped_gemm_glu_wrapper_sm100(
     before each call; use distinct counters for overlapping invocations and GEMMs.
     """
     validate_glu_layout(glu_layout)
+    mma_tiler_mn = _default_mma_tiler(mma_tiler_mn)
     if glu_layout != "interleaved_32" and detect_framework(a_tensor) != "torch":
         raise NotImplementedError("gate_then_up GLU currently supports torch inputs only")
     if glu_layout == "gate_then_up":
@@ -1332,6 +1341,8 @@ def grouped_gemm_glu_wrapper_sm100(
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_glu_jax_sm100
 
+        if get_device_type() == "hopper":
+            raise NotImplementedError("SM90 grouped GEMM GLU supports torch tensors only")
         check_jax_wrapper_options(
             acc_dtype=acc_dtype,
             cd_major=cd_major,
