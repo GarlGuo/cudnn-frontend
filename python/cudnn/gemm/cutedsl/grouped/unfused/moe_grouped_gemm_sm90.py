@@ -407,7 +407,8 @@ class MoEGroupedGemmBf16KernelSm90:
         ab_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one) + cute.size_in_bytes(b_dtype, b_smem_layout_stage_one)
         mbar_helpers_bytes = 1024
         sinfo_bytes = 4 * 4 * num_tile_stage
-        c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one) * num_epi_groups
+        # Without C no sC is allocated, so its bytes go to A/B and D stages.
+        c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one) * num_epi_groups if generate_c else 0
         d_bytes = cute.size_in_bytes(d_dtype, d_smem_layout_stage_one) * num_epi_groups
 
         free_bytes = num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + d_bytes + sinfo_bytes)
@@ -573,14 +574,16 @@ class MoEGroupedGemmBf16KernelSm90:
         SchedulerStorage = MoEPersistentTileScheduler.make_storage_struct(self.num_tile_stage, True)
 
         # ---- Shared storage ----
+        sC_cosize = cute.cosize(self.c_smem_layout_staged.outer)
+        sC_field = cute.struct.Align[cute.struct.MemRange[self.c_dtype, sC_cosize], self.buffer_align_bytes]
+        if cutlass.const_expr(not self.generate_c):
+            sC_field = cute.struct.MemRange[self.c_dtype, 0]
+
         @cute.struct
         class SharedStorage:
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             scheduler: SchedulerStorage
-            sC: cute.struct.Align[
-                cute.struct.MemRange[self.c_dtype, cute.cosize(self.c_smem_layout_staged.outer)],
-                self.buffer_align_bytes,
-            ]
+            sC: sC_field
             sD: cute.struct.Align[
                 cute.struct.MemRange[self.d_dtype, cute.cosize(self.d_smem_layout_staged.outer)],
                 self.buffer_align_bytes,
@@ -765,7 +768,7 @@ class MoEGroupedGemmBf16KernelSm90:
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
-        sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
+        sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner) if cutlass.const_expr(self.generate_c) else None
         sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
