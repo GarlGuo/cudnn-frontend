@@ -436,10 +436,9 @@ class MoEGroupedGemmWgradBF16KernelSm90:
             input_order=self.input_order,
         )
 
+        # Each setmaxnreg region must end at the next one: ptxas ignores a decrease that can reach the MMA code.
         if warp_idx >= self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
-        else:
-            cute.arch.setmaxregister_increase(self.mma_register_requirement)
 
         # ==== Scheduler warp ====
         if warp_idx == self.sched_warp_id:
@@ -547,6 +546,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
 
         # ==== MMA + epilogue warp groups ====
         if warp_idx < self.tma_warp_id:
+            cute.arch.setmaxregister_increase(self.mma_register_requirement)
             num_k_blocks = cute.size(tCrA, mode=[2])
             copy_atom_c = cute.make_copy_atom(warp.StMatrix8x8x16bOp(self.c_layout.is_m_major_c(), 4), self.c_dtype)
             tiled_copy_r2s = cute.make_tiled_copy_S(
