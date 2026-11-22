@@ -222,6 +222,14 @@ def test_sm90_pingpong_one_cluster_parity(monkeypatch, direction, counts, n):
 
 
 @pytest.mark.parametrize("direction", ["fwd", "dgrad"])
+def test_sm90_cooperative_one_cluster(monkeypatch, direction):
+    # One (2, 1) cluster of 128x256 tiles: 15 tiles per CTA, so the tile_info stages are reused (a racecheck target).
+    single_cluster(monkeypatch, (2, 1))
+    problem = make_problem((256, 0, 768, 0, 256), n=768, k=576, direction=direction, seed=43)
+    check(problem, run(problem, mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1), schedule="cooperative"))
+
+
+@pytest.mark.parametrize("direction", ["fwd", "dgrad"])
 def test_sm90_pingpong_matches_cooperative(direction):
     # A 128x128 tile is one warp group's in both schedules: the same WGMMAs per tile, so the same bytes.
     problem = make_problem((768, 0, 256, 1280), n=1408, k=704, direction=direction, seed=37)

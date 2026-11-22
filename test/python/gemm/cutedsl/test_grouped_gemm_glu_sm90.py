@@ -304,6 +304,16 @@ def test_sm90_dglu_tiles(act, b_major, tile, cluster):
     check_dglu(problem, run_dglu(problem, act, mma_tiler_mn=tile, cluster_shape_mn=cluster), act)
 
 
+def test_sm90_dglu_one_cluster(monkeypatch):
+    # One (2, 1) cluster of 128x256 tiles: 15 tiles per CTA, so the tile_info stages are reused (a racecheck target).
+    import cutlass
+
+    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+    monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", str(clusters - 1))
+    problem = make_problem((256, 0, 768, 0, 256), n=768, k=576, seed=45)
+    check_dglu(problem, run_dglu(problem, mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1)))
+
+
 @pytest.mark.parametrize("n,k", [(96, 256), (416, 288), (2048, 7168)], ids=["N96", "N416-K288", "N2048-K7168"])
 def test_sm90_dglu_edges(n, k):
     # N below one tile and off the 128 grid, K off the 64 grid, and the deepseek_v3 FC2 dgrad shape.
