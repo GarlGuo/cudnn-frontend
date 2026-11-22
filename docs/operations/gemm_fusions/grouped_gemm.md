@@ -177,7 +177,8 @@ weights (`b_major="n"`), with these limits:
 - `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
   `(256, 256)` on SM100. An explicit SM90 tile has M in `{64, 128}` and N a
   multiple of 32 up to 256. `cluster_shape_mn=None` selects `(2, 1)`; an
-  explicit cluster has power-of-two sides and at most 8 CTAs.
+  explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile
+  (`tile_m * cluster_m`) that divides 256.
 - `vector_f32` is accepted; Hopper has no packed FP32 arithmetic.
 
 ## Scheduling, caching, and errors

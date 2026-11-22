@@ -104,7 +104,7 @@ class MoEGroupedGemmBf16KernelSm90:
             and is_power_of_2(cluster_shape_mn[1])
             and cluster_shape_mn[0] * cluster_shape_mn[1] <= 8
             and m_aligned == fix_pad_size
-            and fix_pad_size % mma_tiler_mn[0] == 0
+            and fix_pad_size % (mma_tiler_mn[0] * cluster_shape_mn[0]) == 0
             and a_major == "k"
             and b_major in ("k", "n")
             and cd_major == "n"
@@ -127,8 +127,11 @@ class MoEGroupedGemmBf16KernelSm90:
         use_dynamic_sched: bool = True,
     ):
         mma_tile_m = mma_tiler_mn[0]
-        if self.FIX_PAD_SIZE % mma_tile_m != 0:
-            raise ValueError(f"FIX_PAD_SIZE ({self.FIX_PAD_SIZE}) must be divisible by mma_tiler_mn[0] ({mma_tile_m}).")
+        if self.FIX_PAD_SIZE % (mma_tile_m * cluster_shape_mn[0]) != 0:
+            # A cluster M tile past one padded expert segment would write the next expert's rows and read prob OOB.
+            raise ValueError(
+                f"FIX_PAD_SIZE ({self.FIX_PAD_SIZE}) must be divisible by mma_tiler_mn[0] * cluster_shape_mn[0] " f"({mma_tile_m} * {cluster_shape_mn[0]})."
+            )
         if expert_cnt > 1024:
             raise ValueError("Expert count > 1024 is not supported.")
         if not isinstance(weight_mode, MoEWeightMode):
