@@ -110,6 +110,12 @@ The wrapper return order is exactly `c_tensor`, `d_tensor`, `d_col_tensor`,
 `d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and `sfd_col_tensor` are
 always `None`; `c_tensor` is `None` unless `generate_c=True`.
 
+On SM100 the BF16 contract also accepts `mma_tiler_mn=(256, 512)` with
+`cluster_shape_mn=(2, 1)` and `glu_layout="interleaved_32"`: a 2-CTA tile
+issuing two N=256 MMAs per K block into one accumulator that uses all 512 TMEM
+columns. Any other N above 256 raises `ValueError`; `gate_then_up` keeps
+`TILE_N=256`. The default tile is unchanged.
+
 ## SM90 (Hopper)
 
 On an SM90 device, `GroupedGemmGluSm100` and `grouped_gemm_glu_wrapper_sm100`
@@ -675,6 +681,7 @@ Providing both or neither raises `ValueError`.
 - `mma_tiler_mn`: Kernel tile size `(TILE_M, TILE_N)`. Default: `(256, 256)`
   - `TILE_M ∈ {128, 256}`
   - `TILE_N = 256`; dense block-scaled weights on SM100 also accept `TILE_N = 128`
+  - BF16 on SM100 also accepts `(256, 512)` with `cluster_shape_mn=(2, 1)`
 - `cluster_shape_mn`: Thread Block cluster shape. Default: `(2, 1)` when `TILE_M=256`, `(1, 1)` otherwise
 - `sf_vec_size`: Scale factor vector size. `{16, 32}`. Default: `16`
 - `vector_f32`: Enable packed f32 operations. Default: `False`

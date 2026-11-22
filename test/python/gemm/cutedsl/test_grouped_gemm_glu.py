@@ -2525,3 +2525,102 @@ def test_rubin_mxfp8_glu_without_c_matches_with_c():
             for name in checked:
                 differing = (outputs[name].view(torch.uint8) != golden[name]).sum().item()
                 assert differing == 0, f"generate_c=False launch {launch}: {differing} bytes of {name} differ from generate_c=True"
+
+
+# Experts 1 and 4 get no rows; N = 1280 leaves a half-filled 512-wide N tile.
+GLU_RAGGED_GROUP_M = (512, 0, 256, 768, 0, 256)
+GLU_RAGGED_ALPHA = (0.75, -1.25, 0.5, 1.5, -0.25, 1.0)
+
+
+def _run_glu_bf16_tile(problem, tile, generate_c, discrete, b_major, act_func, dynamic):
+    kwargs = dict(
+        a_tensor=problem["a"],
+        sfa_tensor=None,
+        padded_offsets=problem["offsets"],
+        alpha_tensor=problem["alpha"],
+        bias_tensor=problem["bias"],
+        prob_tensor=problem["prob"],
+        c_dtype=torch.bfloat16,
+        d_dtype=torch.bfloat16,
+        act_func=act_func,
+        generate_c=generate_c,
+        mma_tiler_mn=tile,
+        cluster_shape_mn=(2, 1),
+        use_dynamic_sched=dynamic,
+    )
+    if discrete:
+        kwargs.update(b_ptrs=problem["b_ptrs"], n=problem["n"], b_dtype=torch.bfloat16, b_major=b_major)
+    else:
+        kwargs.update(b_tensor=problem["b"], sfb_tensor=None)
+    return cudnn.grouped_gemm_glu_wrapper_sm100(**kwargs)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "n,generate_c,discrete,b_major,enable_bias,act_func,dynamic",
+    [
+        (1024, False, False, "k", False, "swiglu", False),
+        (1024, False, False, "k", False, "swiglu", True),
+        (1280, True, False, "k", False, "swiglu", False),
+        (1280, True, False, "k", False, "swiglu", True),
+        (1280, False, False, "k", True, "swiglu", True),
+        (1280, True, True, "n", True, "geglu", True),
+    ],
+    ids=["dense-n1024-noC", "dense-n1024-noC-dyn", "dense-n1280-C", "dense-n1280-C-dyn", "dense-n1280-bias-noC-dyn", "discrete-nmajor-n1280-C-bias-geglu-dyn"],
+)
+def test_grouped_gemm_glu_bf16_tile_256x512(n, generate_c, discrete, b_major, enable_bias, act_func, dynamic):
+    """The 2-CTA 256x512 GLU tile matches the reference, and the default 256x256 tile bit for bit."""
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
+    problem = make_grouped_gemm_glu_bf16_problem(
+        n=n, k=512, group_m=GLU_RAGGED_GROUP_M, alpha_values=GLU_RAGGED_ALPHA, discrete=discrete, b_major=b_major, enable_bias=enable_bias
+    )
+    expected_c, expected_d = grouped_gemm_glu_bf16_reference(problem, act_func=act_func, linear_offset=1.0 if act_func == "geglu" else 0.0)
+    wide = _run_glu_bf16_tile(problem, (256, 512), generate_c, discrete, b_major, act_func, dynamic)
+    assert_grouped_gemm_glu_bf16_close(wide["d_tensor"], expected_d)
+    names = ("d_tensor", "c_tensor") if generate_c else ("d_tensor",)
+    if generate_c:
+        assert_grouped_gemm_glu_bf16_close(wide["c_tensor"], expected_c)
+    # Each accumulator element still sums its K blocks in the same order: bitwise the 256x256 result.
+    narrow = _run_glu_bf16_tile(problem, (256, 256), generate_c, discrete, b_major, act_func, dynamic)
+    again = _run_glu_bf16_tile(problem, (256, 512), generate_c, discrete, b_major, act_func, dynamic)
+    for name in names:
+        assert torch.equal(wide[name].view(torch.int16), narrow[name].view(torch.int16)), name
+        assert torch.equal(wide[name].view(torch.int16), again[name].view(torch.int16)), name
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize(
+    "tile,cluster,glu_layout,error",
+    [
+        ((128, 512), (1, 1), "interleaved_32", ValueError),
+        ((256, 512), (1, 1), "interleaved_32", ValueError),
+        ((256, 512), (2, 2), "interleaved_32", ValueError),
+        ((256, 384), (2, 1), "interleaved_32", ValueError),
+        ((256, 512), (2, 1), "gate_then_up", NotImplementedError),
+    ],
+    ids=["1cta-c11", "2cta-c11", "c22", "n384", "gate_then_up"],
+)
+def test_grouped_gemm_glu_bf16_tile_n_above_256_rejected(tile, cluster, glu_layout, error):
+    from cudnn.tensor_adapter import has_tcgen05
+
+    if not has_tcgen05(torch.cuda.get_device_capability()[0]):
+        pytest.skip("Requires SM100+ for grouped GEMM GLU BF16 kernel.")
+    problem = make_grouped_gemm_glu_bf16_problem(n=1024)
+    with pytest.raises(error, match="tile"):
+        cudnn.grouped_gemm_glu_wrapper_sm100(
+            a_tensor=problem["a"],
+            sfa_tensor=None,
+            padded_offsets=problem["offsets"],
+            alpha_tensor=problem["alpha"],
+            b_tensor=problem["b"],
+            sfb_tensor=None,
+            prob_tensor=problem["prob"],
+            c_dtype=torch.bfloat16,
+            d_dtype=torch.bfloat16,
+            mma_tiler_mn=tile,
+            cluster_shape_mn=cluster,
+            glu_layout=glu_layout,
+        )

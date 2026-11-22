@@ -161,6 +161,11 @@ For a discrete class instance, replace `sample_b` with
 `num_experts=L`, `b_shape=(N, K)`, `b_dtype=torch.bfloat16`, and pass
 `b_ptrs` to `execute()`.
 
+On SM100, `mma_tiler_mn=(256, 512)` with `cluster_shape_mn=(2, 1)` is also
+accepted: a 2-CTA tile issuing two N=256 MMAs per K block into one accumulator
+that uses all 512 TMEM columns (one accumulator stage). Any other N above 256
+raises `ValueError`. The default tile is unchanged.
+
 ## SM90 (Hopper)
 
 On an SM90 device the same `GroupedGemmSm100` and `grouped_gemm_wrapper_sm100`

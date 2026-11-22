@@ -20,9 +20,12 @@ def make_grouped_gemm_glu_bf16_problem(
     b_major: str = "k",
     enable_bias: bool = False,
     alpha_values: tuple[float, ...] = (0.75, -1.25),
+    group_m: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Create source-compatible BF16 inputs for GLU forward."""
-    if m % (256 * experts) != 0:
+    if group_m is not None:  # per-expert 256-aligned rows (0 = an empty expert)
+        m, experts = sum(group_m), len(group_m)
+    elif m % (256 * experts) != 0:
         raise ValueError("m must give every expert a 256-aligned token count")
     if n % 64 != 0:
         raise ValueError("n must contain paired 32-column gate/up blocks")
@@ -48,8 +51,9 @@ def make_grouped_gemm_glu_bf16_problem(
         device="cuda",
     )
 
-    group_m = m // experts
-    offsets = torch.arange(group_m, m + 1, group_m, dtype=torch.int32, device="cuda")
+    if group_m is None:
+        group_m = (m // experts,) * experts
+    offsets = torch.tensor(group_m, dtype=torch.int64).cumsum(0).to(dtype=torch.int32, device="cuda")
     alpha = torch.tensor(alpha_values[:experts], dtype=torch.float32, device="cuda")
     probability = torch.linspace(0.25, 0.875, m, dtype=torch.float32, device="cuda").view(m, 1, 1)
     bias = None

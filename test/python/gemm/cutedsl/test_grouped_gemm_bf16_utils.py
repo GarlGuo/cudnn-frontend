@@ -19,9 +19,12 @@ def make_grouped_gemm_bf16_problem(
     discrete: bool = False,
     enable_bias: bool = False,
     alpha_values: tuple[float, ...] = (0.75, -1.25),
+    group_m: tuple[int, ...] | None = None,
 ) -> dict[str, Any]:
     """Create source-compatible K-major A/B and N-major output inputs."""
-    if m % (256 * experts) != 0:
+    if group_m is not None:  # per-expert 256-aligned rows (0 = an empty expert)
+        m, experts = sum(group_m), len(group_m)
+    elif m % (256 * experts) != 0:
         raise ValueError("m must give every expert a 256-aligned token count")
 
     generator = torch.Generator(device="cuda").manual_seed(20260716 + m + int(discrete))
@@ -36,8 +39,9 @@ def make_grouped_gemm_bf16_problem(
         device="cuda",
     )
 
-    group_m = m // experts
-    offsets = torch.arange(group_m, m + 1, group_m, dtype=torch.int32, device="cuda")
+    if group_m is None:
+        group_m = (m // experts,) * experts
+    offsets = torch.tensor(group_m, dtype=torch.int64).cumsum(0).to(dtype=torch.int32, device="cuda")
     alpha = torch.tensor(alpha_values[:experts], dtype=torch.float32, device="cuda")
     prob = torch.linspace(0.25, 0.875, m, dtype=torch.float32, device="cuda").view(m, 1, 1)
     bias = None
