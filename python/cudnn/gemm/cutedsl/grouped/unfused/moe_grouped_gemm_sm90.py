@@ -321,6 +321,7 @@ class MoEGroupedGemmBf16KernelSm90:
             self.occupancy,
             self.generate_c,
             self.num_epi_groups,
+            self.fused_glu,
         )
 
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
@@ -368,6 +369,7 @@ class MoEGroupedGemmBf16KernelSm90:
         occupancy,
         generate_c,
         num_epi_groups=1,
+        fused_glu=False,
     ):
         """A/B, C, D and tile-info stage counts; C/D stages are per epilogue group (each has its own buffers)."""
         num_tile_stage = 2
@@ -385,10 +387,17 @@ class MoEGroupedGemmBf16KernelSm90:
 
         free_bytes = num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + d_bytes + sinfo_bytes)
         num_ab_stage = free_bytes // ab_bytes_per_stage
-        # Bytes the A/B stages leave buy a second D, then C, store stage (no subtile waits for its own TMA store).
+        # The bytes the A/B stages leave become D and C store stages in turn (up to one per subtile), so subtiles rarely wait on TMA stores.
         spare_bytes = free_bytes % ab_bytes_per_stage
-        num_d_stage = 2 if spare_bytes >= d_bytes else 1
-        num_c_stage = 2 if generate_c and spare_bytes >= c_bytes + d_bytes else 1
+        num_c_subtiles = -(-mma_tiler_mnk[0] // epi_tile[0]) * -(-mma_tiler_mnk[1] // epi_tile[1])
+        num_d_subtiles = num_c_subtiles // 2 if fused_glu else num_c_subtiles
+        num_c_stage, num_d_stage, grew = 1, 1, True
+        while grew:
+            grew = False
+            if num_d_stage < num_d_subtiles and spare_bytes >= d_bytes:
+                num_d_stage, spare_bytes, grew = num_d_stage + 1, spare_bytes - d_bytes, True
+            if generate_c and num_c_stage < num_c_subtiles and spare_bytes >= c_bytes:
+                num_c_stage, spare_bytes, grew = num_c_stage + 1, spare_bytes - c_bytes, True
         return num_ab_stage, num_c_stage, num_d_stage, num_tile_stage
 
     # ------------------------------------------------------------------
