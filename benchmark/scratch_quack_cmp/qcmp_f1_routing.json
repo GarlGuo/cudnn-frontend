@@ -1,0 +1,904 @@
+{
+ "source": "s3 marin-us-east-02a/users/wg0420/claude-home-h100/h100/quack_cmp_1122/f1/<model>/<op>_bf16.json (h100-coordinator qcmp.py, EP8 rank 0, 8192 tok/GPU, bench_data routing)",
+ "rows_per_expert": {
+  "deepseek_v3": [
+   2023,
+   2059,
+   2082,
+   2011,
+   2037,
+   2129,
+   2091,
+   2090,
+   1967,
+   2015,
+   2056,
+   2051,
+   2066,
+   2019,
+   2042,
+   2107,
+   2039,
+   2010,
+   1994,
+   2058,
+   2011,
+   1994,
+   2051,
+   2092,
+   2106,
+   2017,
+   2032,
+   2072,
+   2027,
+   2086,
+   2125,
+   2059
+  ],
+  "glm53_flash": [
+   1820,
+   1874,
+   1824,
+   1764,
+   1816,
+   1892,
+   1783,
+   1789,
+   1770,
+   1876,
+   1899,
+   1809,
+   1832,
+   1781,
+   1814,
+   1800,
+   1921,
+   1875,
+   1810,
+   1779,
+   1831,
+   1787,
+   1789,
+   1757,
+   1822,
+   1898,
+   1813,
+   1834,
+   1856,
+   1793,
+   1725,
+   1775,
+   1844,
+   1827,
+   1767,
+   1868
+  ],
+  "qwen35_122b": [
+   2023,
+   2059,
+   2082,
+   2011,
+   2037,
+   2129,
+   2091,
+   2090,
+   1967,
+   2015,
+   2056,
+   2051,
+   2066,
+   2019,
+   2042,
+   2107,
+   2039,
+   2010,
+   1994,
+   2058,
+   2011,
+   1994,
+   2051,
+   2092,
+   2106,
+   2017,
+   2032,
+   2072,
+   2027,
+   2086,
+   2125,
+   2059
+  ],
+  "qwen35_397b": [
+   1257,
+   1235,
+   1300,
+   1294,
+   1297,
+   1295,
+   1290,
+   1301,
+   1311,
+   1289,
+   1296,
+   1231,
+   1266,
+   1274,
+   1297,
+   1322,
+   1247,
+   1238,
+   1262,
+   1295,
+   1339,
+   1257,
+   1267,
+   1272,
+   1324,
+   1300,
+   1249,
+   1285,
+   1246,
+   1290,
+   1224,
+   1304,
+   1232,
+   1276,
+   1297,
+   1274,
+   1322,
+   1331,
+   1297,
+   1272,
+   1275,
+   1328,
+   1271,
+   1263,
+   1272,
+   1215,
+   1278,
+   1253,
+   1277,
+   1338,
+   1331,
+   1271,
+   1264,
+   1307,
+   1291,
+   1275,
+   1313,
+   1274,
+   1319,
+   1316,
+   1307,
+   1251,
+   1278,
+   1299
+  ],
+  "qwen38_2p4t": [
+   1257,
+   1235,
+   1300,
+   1294,
+   1297,
+   1295,
+   1290,
+   1301,
+   1311,
+   1289,
+   1296,
+   1231,
+   1266,
+   1274,
+   1297,
+   1322,
+   1247,
+   1238,
+   1262,
+   1295,
+   1339,
+   1257,
+   1267,
+   1272,
+   1324,
+   1300,
+   1249,
+   1285,
+   1246,
+   1290,
+   1224,
+   1304,
+   1232,
+   1276,
+   1297,
+   1274,
+   1322,
+   1331,
+   1297,
+   1272,
+   1275,
+   1328,
+   1271,
+   1263,
+   1272,
+   1215,
+   1278,
+   1253,
+   1277,
+   1338,
+   1331,
+   1271,
+   1264,
+   1307,
+   1291,
+   1275,
+   1313,
+   1274,
+   1319,
+   1316,
+   1307,
+   1251,
+   1278,
+   1299
+  ]
+ },
+ "f1_reference": {
+  "deepseek_v3.fc2_dglu": {
+   "their_op": "dglu",
+   "results_us": {
+    "ours": 2942.7520036697388,
+    "torch": 2676.752326488495,
+    "quack": 2867.43328332901,
+    "quack_static": 2878.768312931061,
+    "quack_pad": 2857.5475192070007
+   },
+   "best_quack": "quack_pad",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_dglu_stock (MoEGroupedGemmDgluBf16KernelSm90), recompute_h=True, tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_dgated(dY (M,H), B (E,H,I), PreAct (M,2I) interleaved, activation='swiglu', dx_out, postact_out, colvec_scale=prob, colvec_reduce=True, cu_seqlens_m) [tuned=True; default dynamic_scheduler=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "deepseek_v3.fc1_dgrad": {
+   "their_op": "fc1_dgrad",
+   "results_us": {
+    "ours": 5061.917104721069,
+    "torch": 5238.104295730591,
+    "quack": 5078.757748603821,
+    "quack_dyn": 4953.31072807312,
+    "quack_pad": 5048.82719039917
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via SplitWgradLayer GemmVariant none@66 (FC1 dgrad)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "deepseek_v3.fc1_glu": {
+   "their_op": "fc1_fwd",
+   "results_us": {
+    "ours": 4959.21567440033,
+    "torch": 5142.1440076828,
+    "quack": 5001.25536441803,
+    "quack_dyn": 4939.607653617859,
+    "quack_pad": 5045.231351852417
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmGluBf16KernelSm90 (fused SwiGLU epilogue, stock dynamic scheduler, no signal), tile (128, 256) cluster (2, 1), store C_pre=False, h BF16",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_gated(A, B (E,H,2I) gate/up column-interleaved, activation='swiglu', store_preact=False, postact_out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "deepseek_v3.fc1_wgrad": {
+   "their_op": "fc1_wgrad",
+   "results_us": {
+    "ours": 4942.020792961121,
+    "torch": 4814.460163116455,
+    "quack": 4689.536318778992,
+    "quack_dyn": 4640.46594619751,
+    "quack_pad": 4848.304629325867
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc1_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "g5c0474",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "deepseek_v3.fc2_fwd": {
+   "their_op": "fc2_fwd",
+   "results_us": {
+    "ours": 2605.4403233528137,
+    "torch": 2685.2095913887024,
+    "quack": 2501.6777658462524,
+    "quack_dyn": 2603.309428691864,
+    "quack_pad": 2577.1286392211914
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via Fc2Layer GemmVariant none@66 (FC2 fwd, prob epilogue)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "deepseek_v3.fc2_wgrad": {
+   "their_op": "fc2_wgrad",
+   "results_us": {
+    "ours": 2740.752317905426,
+    "torch": 2664.2534351348877,
+    "quack": 2479.5155262947083,
+    "quack_dyn": 2449.296009540558,
+    "quack_pad": 2575.8748841285706
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc2_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "g5c0474",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "glm53_flash.fc2_dglu": {
+   "their_op": "dglu",
+   "results_us": {
+    "ours": 1888.387200832367,
+    "torch": 1533.1593561172485,
+    "quack": 1815.0352013111115,
+    "quack_static": 1838.6995208263397,
+    "quack_pad": 1824.532161951065
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_dglu_stock (MoEGroupedGemmDgluBf16KernelSm90), recompute_h=True, tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_dgated(dY (M,H), B (E,H,I), PreAct (M,2I) interleaved, activation='swiglu', dx_out, postact_out, colvec_scale=prob, colvec_reduce=True, cu_seqlens_m) [tuned=True; default dynamic_scheduler=True]"
+   },
+   "host": "gb975c0",
+   "real_rows": 65514,
+   "padded_rows": 70656
+  },
+  "glm53_flash.fc1_dgrad": {
+   "their_op": "fc1_dgrad",
+   "results_us": {
+    "ours": 2933.175358772278,
+    "torch": 3048.418881893158,
+    "quack": 3008.6073637008667,
+    "quack_dyn": 2979.67200756073,
+    "quack_pad": 2943.9052724838257
+   },
+   "best_quack": "quack_pad",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via SplitWgradLayer GemmVariant none@66 (FC1 dgrad)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "gb975c0",
+   "real_rows": 65514,
+   "padded_rows": 70656
+  },
+  "glm53_flash.fc1_glu": {
+   "their_op": "fc1_fwd",
+   "results_us": {
+    "ours": 2899.435522556305,
+    "torch": 2978.5500717163086,
+    "quack": 2924.0630412101746,
+    "quack_dyn": 2850.90847492218,
+    "quack_pad": 2988.8636779785156
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmGluBf16KernelSm90 (fused SwiGLU epilogue, stock dynamic scheduler, no signal), tile (128, 256) cluster (2, 1), store C_pre=False, h BF16",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_gated(A, B (E,H,2I) gate/up column-interleaved, activation='swiglu', store_preact=False, postact_out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "gb975c0",
+   "real_rows": 65514,
+   "padded_rows": 70656
+  },
+  "glm53_flash.fc1_wgrad": {
+   "their_op": "fc1_wgrad",
+   "results_us": {
+    "ours": 3103.5462474823,
+    "torch": 2991.961281299591,
+    "quack": 2894.676489830017,
+    "quack_dyn": 2831.918396949768,
+    "quack_pad": 3036.991033554077
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc1_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "gb975c0",
+   "real_rows": 65514,
+   "padded_rows": 70656
+  },
+  "glm53_flash.fc2_fwd": {
+   "their_op": "fc2_fwd",
+   "results_us": {
+    "ours": 1511.3584053516388,
+    "torch": 1559.2268800735474,
+    "quack": 1450.7910418510437,
+    "quack_dyn": 1509.166077375412,
+    "quack_pad": 1495.438083410263
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via Fc2Layer GemmVariant none@66 (FC2 fwd, prob epilogue)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "gb975c0",
+   "real_rows": 65514,
+   "padded_rows": 70656
+  },
+  "glm53_flash.fc2_wgrad": {
+   "their_op": "fc2_wgrad",
+   "results_us": {
+    "ours": 1560.919679403305,
+    "torch": 1504.2908811569214,
+    "quack": 1414.6723139286041,
+    "quack_dyn": 1410.9286332130432,
+    "quack_pad": 1478.5814416408539
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc2_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "gb975c0",
+   "real_rows": 65514,
+   "padded_rows": 70656
+  },
+  "qwen35_122b.fc2_dglu": {
+   "their_op": "dglu",
+   "results_us": {
+    "ours": 809.4393610954285,
+    "torch": 604.7824025154114,
+    "quack": 717.2367972135544,
+    "quack_static": 733.8022375106812,
+    "quack_pad": 758.3564794063568
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_dglu_stock (MoEGroupedGemmDgluBf16KernelSm90), recompute_h=True, tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_dgated(dY (M,H), B (E,H,I), PreAct (M,2I) interleaved, activation='swiglu', dx_out, postact_out, colvec_scale=prob, colvec_reduce=True, cu_seqlens_m) [tuned=True; default dynamic_scheduler=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "qwen35_122b.fc1_dgrad": {
+   "their_op": "fc1_dgrad",
+   "results_us": {
+    "ours": 1109.7193562984467,
+    "torch": 1147.766399383545,
+    "quack": 1105.8025598526,
+    "quack_dyn": 1059.7894394397736,
+    "quack_pad": 1098.9491176605225
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via SplitWgradLayer GemmVariant none@66 (FC1 dgrad)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "qwen35_122b.fc1_glu": {
+   "their_op": "fc1_fwd",
+   "results_us": {
+    "ours": 1116.0003221035004,
+    "torch": 1169.6396780014038,
+    "quack": 1067.1689641475677,
+    "quack_dyn": 1074.9286425113678,
+    "quack_pad": 1101.6054391860962
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmGluBf16KernelSm90 (fused SwiGLU epilogue, stock dynamic scheduler, no signal), tile (128, 256) cluster (2, 1), store C_pre=False, h BF16",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_gated(A, B (E,H,2I) gate/up column-interleaved, activation='swiglu', store_preact=False, postact_out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g5c0474",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "qwen35_122b.fc1_wgrad": {
+   "their_op": "fc1_wgrad",
+   "results_us": {
+    "ours": 1155.7436776161194,
+    "torch": 1130.632643699646,
+    "quack": 1075.7920026779175,
+    "quack_dyn": 1058.9913630485535,
+    "quack_pad": 1112.2521579265594
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc1_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "qwen35_122b.fc2_fwd": {
+   "their_op": "fc2_fwd",
+   "results_us": {
+    "ours": 611.1520010232925,
+    "torch": 640.9958386421204,
+    "quack": 547.9513609409332,
+    "quack_dyn": 557.1465599536896,
+    "quack_pad": 558.9030420780182
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via Fc2Layer GemmVariant none@66 (FC2 fwd, prob epilogue)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g5c0474",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "qwen35_122b.fc2_wgrad": {
+   "their_op": "fc2_wgrad",
+   "results_us": {
+    "ours": 626.316157579422,
+    "torch": 605.1712018251419,
+    "quack": 561.4694404602051,
+    "quack_dyn": 535.9055972099304,
+    "quack_pad": 563.1248021125793
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc2_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "gb978d0",
+   "real_rows": 65618,
+   "padded_rows": 69888
+  },
+  "qwen35_397b.fc2_dglu": {
+   "their_op": "dglu",
+   "results_us": {
+    "ours": 1278.6396777629852,
+    "torch": 1017.4838411808014,
+    "quack": 1165.7369601726532,
+    "quack_static": 1177.2611117362976,
+    "quack_pad": 1231.6422498226166
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_dglu_stock (MoEGroupedGemmDgluBf16KernelSm90), recompute_h=True, tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_dgated(dY (M,H), B (E,H,I), PreAct (M,2I) interleaved, activation='swiglu', dx_out, postact_out, colvec_scale=prob, colvec_reduce=True, cu_seqlens_m) [tuned=True; default dynamic_scheduler=True]"
+   },
+   "host": "g463dd6",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen35_397b.fc1_dgrad": {
+   "their_op": "fc1_dgrad",
+   "results_us": {
+    "ours": 1956.7814362049103,
+    "torch": 2066.106560230255,
+    "quack": 1847.7529573440552,
+    "quack_dyn": 1845.5631947517395,
+    "quack_pad": 1957.0313549041748
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via SplitWgradLayer GemmVariant none@66 (FC1 dgrad)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g463dd6",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen35_397b.fc1_glu": {
+   "their_op": "fc1_fwd",
+   "results_us": {
+    "ours": 1911.8483221530914,
+    "torch": 2024.636151790619,
+    "quack": 1870.275526046753,
+    "quack_dyn": 1866.9840025901794,
+    "quack_pad": 1944.2886435985565
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmGluBf16KernelSm90 (fused SwiGLU epilogue, stock dynamic scheduler, no signal), tile (128, 256) cluster (2, 1), store C_pre=False, h BF16",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_gated(A, B (E,H,2I) gate/up column-interleaved, activation='swiglu', store_preact=False, postact_out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g463dd6",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen35_397b.fc1_wgrad": {
+   "their_op": "fc1_wgrad",
+   "results_us": {
+    "ours": 2040.6982326507568,
+    "torch": 1958.1331193447113,
+    "quack": 1841.4124727249146,
+    "quack_dyn": 1814.8668789863586,
+    "quack_pad": 1936.1583983898163
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc1_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "g5c0474",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen35_397b.fc2_fwd": {
+   "their_op": "fc2_fwd",
+   "results_us": {
+    "ours": 1027.761914730072,
+    "torch": 1088.341760635376,
+    "quack": 904.6064007282257,
+    "quack_dyn": 933.2028818130493,
+    "quack_pad": 994.2406415939331
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via Fc2Layer GemmVariant none@66 (FC2 fwd, prob epilogue)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g463dd6",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen35_397b.fc2_wgrad": {
+   "their_op": "fc2_wgrad",
+   "results_us": {
+    "ours": 1093.663682937622,
+    "torch": 1065.7919991016388,
+    "quack": 960.7385581731796,
+    "quack_dyn": 930.5811184644699,
+    "quack_pad": 1011.8521595001221
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc2_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "g5c0474",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen38_2p4t.fc2_dglu": {
+   "their_op": "dglu",
+   "results_us": {
+    "ours": 4159.401893615723,
+    "torch": 4033.258225917816,
+    "quack": 4176.212148666382,
+    "quack_static": 4185.023040771484,
+    "quack_pad": 4138.260807991028
+   },
+   "best_quack": "quack_pad",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_dglu_stock (MoEGroupedGemmDgluBf16KernelSm90), recompute_h=True, tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_dgated(dY (M,H), B (E,H,I), PreAct (M,2I) interleaved, activation='swiglu', dx_out, postact_out, colvec_scale=prob, colvec_reduce=True, cu_seqlens_m) [tuned=True; default dynamic_scheduler=True]"
+   },
+   "host": "g1cc872",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen38_2p4t.fc1_dgrad": {
+   "their_op": "fc1_dgrad",
+   "results_us": {
+    "ours": 7328.996167182922,
+    "torch": 7933.318095207214,
+    "quack": 7818.765759468079,
+    "quack_dyn": 7437.725119590759,
+    "quack_pad": 7541.121296882629
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via SplitWgradLayer GemmVariant none@66 (FC1 dgrad)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g1cc872",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen38_2p4t.fc1_glu": {
+   "their_op": "fc1_fwd",
+   "results_us": {
+    "ours": 7471.899194717407,
+    "torch": 8012.465596199036,
+    "quack": 8281.25470161438,
+    "quack_dyn": 7565.085787773132,
+    "quack_pad": 7724.349761009216
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmGluBf16KernelSm90 (fused SwiGLU epilogue, stock dynamic scheduler, no signal), tile (128, 256) cluster (2, 1), store C_pre=False, h BF16",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm_gated(A, B (E,H,2I) gate/up column-interleaved, activation='swiglu', store_preact=False, postact_out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g1cc872",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen38_2p4t.fc1_wgrad": {
+   "their_op": "fc1_wgrad",
+   "results_us": {
+    "ours": 8131.746530532837,
+    "quack": 7377.968616485596,
+    "quack_dyn": 7399.249591827393,
+    "quack_pad": 7834.711990356445
+   },
+   "best_quack": "quack",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc1_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "g1cc872",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen38_2p4t.fc2_fwd": {
+   "their_op": "fc2_fwd",
+   "results_us": {
+    "ours": 3884.3148827552795,
+    "torch": 4063.613748550415,
+    "quack": 3711.017916202545,
+    "quack_dyn": 3672.6316833496094,
+    "quack_pad": 3848.9900851249695
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "MoEGroupedGemmBf16KernelSm90 via Fc2Layer GemmVariant none@66 (FC2 fwd, prob epilogue)",
+    "torch": "torch._grouped_mm(A (M_real, K), B (E, K, N), offs) plain GEMM only (no epilogue)",
+    "quack": "quack.gemm_interface.gemm(A (M,K), B (E,K,N), out, cu_seqlens_m) [tuned=True]"
+   },
+   "host": "g1cc872",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  },
+  "qwen38_2p4t.fc2_wgrad": {
+   "their_op": "fc2_wgrad",
+   "results_us": {
+    "ours": 4179.187498092651,
+    "torch": 4011.0016107559204,
+    "quack": 3639.9635219573975,
+    "quack_dyn": 3538.8249611854553,
+    "quack_pad": 3855.397765636444
+   },
+   "best_quack": "quack_dyn",
+   "quack": {
+    "version": "0.6.5"
+   },
+   "arms": {
+    "ours": "SplitWgradLayer.launch_fc2_wgrad (bwd_common.MoEGroupedGemmWgradSm90 -> MoEGroupedGemmWgradBf16KernelSm90, static, all clusters) tile (128, 256) cluster (2, 1)",
+    "torch": "torch._grouped_mm(A (Mo, M_real) M-major view, B (M_real, N), offs) -> (E, Mo, N)",
+    "quack": "quack.gemm_interface.gemm(A (Mo, M_real) M-major (quack's varlen_k requires it; ours' layout too), B (M_real, N), out (E,Mo,N), cu_seqlens_k) [tuned=True]"
+   },
+   "host": "g1cc872",
+   "real_rows": 82121,
+   "padded_rows": 90112
+  }
+ }
+}
