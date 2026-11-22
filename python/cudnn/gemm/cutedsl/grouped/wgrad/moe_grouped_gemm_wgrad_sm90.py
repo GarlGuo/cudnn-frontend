@@ -151,7 +151,8 @@ class MoEGroupedGemmWgradBF16KernelSm90:
         self.tma_warp_id = self.num_mma_warp_groups * 4
         self.sched_warp_id = self.tma_warp_id + 1
         self.threads_per_cta = self.num_mma_threads + self.num_threads_per_warp_group
-        self.sched_consumer_threads = self.num_mma_threads + 32
+        # Every MMA warp and the TMA warp read each tile_info entry; one elected lane per warp releases it.
+        self.sched_consumer_warps = self.num_mma_threads // 32 + 1
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
 
@@ -390,7 +391,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
             barrier_storage=sched_storage.tile_info_mbar.data_ptr(),
             num_stages=self.num_tile_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.sched_consumer_threads),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.sched_consumer_warps),
         )
 
         scheduler = MoEPersistentTileScheduler.create(
@@ -479,7 +480,9 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                 tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
             work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
             cute.arch.fence_proxy("async.shared", space="cta")
-            sched_pipeline.consumer_release(sched_consumer_state)
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
             while work_tile_info.is_valid_tile:
                 k_tile_cnt = work_tile_info.k_tile_cnt
@@ -536,7 +539,9 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                     tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                 work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                sched_pipeline.consumer_release(sched_consumer_state)
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    sched_pipeline.consumer_release(sched_consumer_state)
                 sched_consumer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
 
@@ -569,7 +574,9 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                 tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
             work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
             cute.arch.fence_proxy("async.shared", space="cta")
-            sched_pipeline.consumer_release(sched_consumer_state)
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             while work_tile_info.is_valid_tile:
@@ -626,7 +633,9 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                     tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                 work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                sched_pipeline.consumer_release(sched_consumer_state)
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    sched_pipeline.consumer_release(sched_consumer_state)
                 sched_consumer_state.advance()
             c_pipeline.producer_tail()
 
