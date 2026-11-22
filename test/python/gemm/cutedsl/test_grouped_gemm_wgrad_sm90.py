@@ -114,6 +114,17 @@ def test_sm90_wgrad_pingpong_one_cluster(monkeypatch, tile_n, cluster):
     assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
 
 
+@pytest.mark.parametrize("tile,cluster", [((128, 256), (2, 1)), ((128, 192), (1, 2)), ((128, 128), (1, 1))], ids=["128x256-c21", "128x192-c12", "128x128-c11"])
+def test_sm90_wgrad_cooperative_one_cluster(monkeypatch, tile, cluster):
+    # One cluster makes each CTA reuse its tile_info stages many times (the case racecheck needs).
+    monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", one_cluster_margin(cluster))
+    m = 640 if cluster == (2, 1) else 384
+    problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=PINGPONG_GROUPS, m=m, n=tile[1], a_major="m", b_major="n", initial_value=3.0)
+    actual = run_wrapper(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster, schedule="cooperative")
+    torch.cuda.synchronize()
+    assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
+
+
 # id: (group_k_list, m, n, a_major, b_major, wgrad dtype, mma_tiler_mn, cluster_shape_mn, one cluster); None takes the
 # pingpong default tile (128, 192) and the (2, 1) cluster.
 PINGPONG_CASES = {
