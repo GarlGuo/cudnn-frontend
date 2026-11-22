@@ -36,7 +36,7 @@ from ..backend_utils import debug_validate_offsets, debug_validate_pointer_value
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
-from .moe_grouped_gemm_sm90 import MoEGroupedGemmBf16KernelSm90
+from .moe_grouped_gemm_sm90 import MoEGroupedGemmBf16KernelSm90, check_kernel_schedule, sm90_default_mma_tiler
 
 
 def _output_dtypes():
@@ -99,6 +99,7 @@ class GroupedGemmBf16API(APIBase):
         generate_c: bool = False,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        kernel_schedule: Optional[str] = None,
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -153,7 +154,9 @@ class GroupedGemmBf16API(APIBase):
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: tile M <= 128, a (2, 1) cluster by default and the dynamic scheduler always.
         self._is_sm90 = is_sm90_device()
-        self.mma_tiler_mn = tuple(mma_tiler_mn or ((128, 256) if self._is_sm90 else (256, 256)))
+        self.kernel_schedule = kernel_schedule
+        self._pingpong = self._is_sm90 and kernel_schedule == "pingpong"
+        self.mma_tiler_mn = tuple(mma_tiler_mn or (sm90_default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.vector_f32 = vector_f32
@@ -211,6 +214,10 @@ class GroupedGemmBf16API(APIBase):
             launch_stream = as_torch_stream(int(current_stream), b_ptrs.device)
             self._launch_stream_cache[key] = launch_stream
         b_ptrs.record_stream(launch_stream)
+
+    def _schedule_kwargs(self) -> dict:
+        """The SM90 kernel's schedule flag; empty for the cooperative default and the SM100 kernels."""
+        return {"pingpong": True} if self._pingpong else {}
 
     def check_support(self) -> bool:
         if self.a_desc.ndim != 3:
@@ -287,6 +294,7 @@ class GroupedGemmBf16API(APIBase):
 
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
+        check_kernel_schedule(self.kernel_schedule, self._is_sm90, self.mma_tiler_mn)
         if self._is_sm90:
             if self.weight_mode != MoEWeightMode.DENSE:
                 raise NotImplementedError("SM90 grouped GEMM supports dense weights (sample_b) only, not discrete b_ptrs")
@@ -322,6 +330,7 @@ class GroupedGemmBf16API(APIBase):
             self.b_major,
             "n",
             self.m_aligned,
+            **self._schedule_kwargs(),
         ):
             raise ValueError("Unsupported BF16 grouped GEMM tile, cluster, alignment, or layout configuration")
 
@@ -351,6 +360,7 @@ class GroupedGemmBf16API(APIBase):
             expert_cnt=self.expert_cnt,
             weight_mode=self.weight_mode,
             use_dynamic_sched=self.use_dynamic_sched,
+            **self._schedule_kwargs(),
         )
 
         hardware_info = cutlass.utils.HardwareInfo()

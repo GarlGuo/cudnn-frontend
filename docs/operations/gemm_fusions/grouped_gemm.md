@@ -180,6 +180,13 @@ weights (`b_major="n"`), with these limits:
   explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile
   (`tile_m * cluster_m`) that divides 256.
 - `vector_f32` is accepted; Hopper has no packed FP32 arithmetic.
+- `kernel_schedule` (SM90 only; other GPUs need `None`) picks the warp-group
+  schedule. `None` (the default) and `"cooperative"` split each tile's M across
+  the two MMA warp groups. `"pingpong"` gives each warp group whole tiles,
+  alternate tiles of the scheduler's sequence, so one warp group's epilogue
+  overlaps the other's mainloop. This helps short-K GEMMs. Pingpong needs tile
+  `M * N <= 128 * 192`, and `mma_tiler_mn=None` then selects `(128, 192)`.
+  The default stays cooperative until H100 measurements choose a heuristic.
 
 ## Scheduling, caching, and errors
 

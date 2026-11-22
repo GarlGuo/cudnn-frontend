@@ -13,6 +13,7 @@ rep, each rep behind an L2 flush.
 
   python benchmark/gemm/benchmark_grouped_gemm_sm90.py --list-items
   python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --ep 8 --out perf.json
+  python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --kernel-schedule pingpong --tile 128,192 --cluster 2,1
 """
 
 from __future__ import annotations
@@ -97,8 +98,11 @@ def torch_dswiglu(g, c, prob):
     return torch.stack((d1.view(m, n // BLOCK, BLOCK), d2.view(m, n // BLOCK, BLOCK)), dim=2).reshape(m, 2 * n).to(torch.bfloat16)
 
 
-def backends(p, t, names):
+def backends(p, t, names, config=None):
+    """``config``: kernel_schedule / mma_tiler_mn / cluster_shape_mn for the GEMM and GLU ops (None keeps the defaults)."""
     import cudnn
+
+    config = config or {}
 
     def ours_glu():
         return cudnn.grouped_gemm_glu_wrapper_sm100(
@@ -111,6 +115,7 @@ def backends(p, t, names):
             c_dtype=torch.bfloat16,
             d_dtype=torch.bfloat16,
             act_func="swiglu",
+            **config,
         )["d_tensor"]
 
     def ours_dglu():
@@ -140,6 +145,7 @@ def backends(p, t, names):
             d_tensor=t["d"],
             c_dtype=torch.bfloat16,
             d_dtype=torch.bfloat16,
+            **config,
         )
         return t["d"]
 
@@ -195,6 +201,10 @@ def main(argv=None):
     parser.add_argument("--reps", type=int, default=100)
     parser.add_argument("--l2-flush", type=float, default=2.0, help="flush buffer size in multiples of L2")
     parser.add_argument("--out", default=None)
+    pair = lambda text: tuple(int(v) for v in text.split(","))
+    parser.add_argument("--kernel-schedule", choices=("cooperative", "pingpong"), default=None, help="SM90 schedule (GEMM and GLU ops)")
+    parser.add_argument("--tile", type=pair, default=None, help="mma_tiler_mn as M,N (GEMM and GLU ops)")
+    parser.add_argument("--cluster", type=pair, default=None, help="cluster_shape_mn as M,N (GEMM and GLU ops)")
     args = parser.parse_args(argv)
     if args.list_items:
         print("\n".join(ITEMS))
@@ -206,7 +216,11 @@ def main(argv=None):
 
     p = item_problem(args.item, args.ep, args.tokens)
     t = make_tensors(p)
-    runs = backends(p, t, set(filter(None, args.baselines.split(","))))
+    names = {"kernel_schedule": args.kernel_schedule, "mma_tiler_mn": args.tile, "cluster_shape_mn": args.cluster}
+    config = {key: value for key, value in names.items() if value is not None}
+    if config and p["op"] == "fc2_dglu":
+        parser.error("--kernel-schedule / --tile / --cluster apply to the GEMM and GLU ops, not fc2_dglu")
+    runs = backends(p, t, set(filter(None, args.baselines.split(","))), config)
     outputs = {name: fn().float().view(p["m"], -1) for name, fn in runs.items()}
     torch.cuda.synchronize()
     check = {}
@@ -227,6 +241,7 @@ def main(argv=None):
         device=torch.cuda.get_device_name(),
         torch=torch.__version__,
         args=dict(runs=args.runs, warmup=args.warmup, reps=args.reps, l2_flush=args.l2_flush),
+        config={key: list(value) if isinstance(value, tuple) else value for key, value in config.items()},
     )
     if "torch_grouped_mm" in timing:
         record["speedup_vs_torch"] = timing["torch_grouped_mm"]["us_median"] / timing["cudnn_sm90"]["us_median"]
