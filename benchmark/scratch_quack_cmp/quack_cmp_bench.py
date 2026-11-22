@@ -43,6 +43,7 @@ import gc
 import glob
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -61,11 +62,49 @@ MODEL_SHAPES = {
 OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad", "fc1_glu", "fc1_glu_c", "fc2_dglu", "fc1_wgrad", "fc2_wgrad")
 ITEMS = [f"{model}.{op}" for model in MODEL_SHAPES for op in OPS]
 QUACK_ARMS = ("quack", "quack_dyn", "quack_static", "quack_pad", "quack_default", "quack_tile")
-# name -> (SM100 mma_tiler_mn or None for the default, use_dynamic_sched); explicit tiles use cluster (2, 1)
-CUDNN_ARMS = {"cudnn": (None, False), "cudnn_dyn": (None, True), "cudnn_512": ((256, 512), False), "cudnn_512_dyn": ((256, 512), True)}
+# name -> (SM100 mma_tiler_mn or None for the default, cluster_shape_mn or None for the default, use_dynamic_sched)
+CUDNN_ARMS = {"cudnn": (None, None, False), "cudnn_dyn": (None, None, True), "cudnn_512": ((256, 512), (2, 1), False),
+              "cudnn_512_dyn": ((256, 512), (2, 1), True)}
+# Generic tile arms: cudnn[_dyn]_<tile_m>x<tile_n>_c<cluster_m><cluster_n>, e.g. cudnn_dyn_256x192_c21 = mma_tiler_mn=(256, 192),
+# cluster_shape_mn=(2, 1), use_dynamic_sched=True. Every SM100 BF16 op takes them (wgrad always runs its CLC dynamic scheduler,
+# so the _dyn flag is moot there). Combinations an op cannot take (GLU / wgrad: tile_n % 64; fwd / dgrad / dGLU: tile_n % 32)
+# are skipped and listed under "skipped" in the JSON, not counted as errors.
+TILE_ARM_RE = re.compile(r"^cudnn(_dyn)?_(\d+)x(\d+)_c(\d)(\d)$")
 QUACK_ARMS = QUACK_ARMS + ("quack_tile512",)
 ALL_ARMS = tuple(CUDNN_ARMS) + QUACK_ARMS + ("torch",)
 DEFAULT_ARMS = ",".join(ALL_ARMS)
+#: --arms sweep: dynamic-scheduler 2-CTA tiles, the static default (256x256 c2x1) and the quack / torch references
+TILE_SWEEP_ARMS = ("cudnn_dyn_256x128_c21", "cudnn_dyn_256x192_c21", "cudnn_dyn_256x224_c21", "cudnn_dyn_256x256_c21",
+                   "cudnn_dyn_256x256_c22")
+SWEEP_ARMS = TILE_SWEEP_ARMS + ("cudnn", "quack_tile", "torch")
+SWEEP_BASELINE = "cudnn_dyn_256x256_c21"
+
+
+def cudnn_arm_spec(name):
+    """(tile or None, cluster or None, dyn) of a cudnn arm name, or None when it is not one."""
+    if name in CUDNN_ARMS:
+        return CUDNN_ARMS[name]
+    m = TILE_ARM_RE.match(name)
+    if not m:
+        return None
+    return (int(m[2]), int(m[3])), (int(m[4]), int(m[5])), bool(m[1])
+
+
+def is_cudnn_arm(name):
+    return cudnn_arm_spec(name) is not None
+
+
+def tile_skip_reason(kind, tile):
+    """Why this op cannot take the tile (None: run it; the API's own checks still apply)."""
+    if tile is None:
+        return None
+    tile_n = tile[1]
+    align = 64 if kind in ("glu", "glu_c", "wgrad") else 32
+    if tile_n % align:
+        return f"tile_n {tile_n} % {align} != 0 ({kind} needs a multiple of {align})"
+    if tile_n > 256 and kind in ("dglu", "wgrad"):
+        return f"tile_n {tile_n} > 256 ({kind} supports tile_n <= 256)"
+    return None
 BLOCK = 32  # our interleaved_32 gate/up column blocks
 ROUTING_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qcmp_f1_routing.json")
 
@@ -289,7 +328,7 @@ def build_arms(p, t, names, cap):
     kind, idx = p["kind"], t["idx"]
     sel = (lambda x: x) if idx is None else (lambda x: x[idx])
     noop = lambda: None
-    arms, ref = {}, {}
+    arms, ref, skipped = {}, {}, {}
 
     # torch reference / baseline, real rows (as qcmp.py)
     if kind == "wgrad":
@@ -317,18 +356,26 @@ def build_arms(p, t, names, cap):
     if "torch" in names:
         arms["torch"] = (noop, torch_fn, lambda r: dict(out=diff(r, ref["out"])))
 
-    def cudnn_arm(tile, dyn):
+    wgrad_out = []  # one (E, M, N) output shared by the cudnn wgrad arms (up to 8 GiB; each arm is checked right after its call)
+
+    def cudnn_arm(tile, cluster, dyn):
         import cudnn
 
-        tile_kw = {} if tile is None else dict(mma_tiler_mn=tile, cluster_shape_mn=(2, 1))
-        if dyn:
+        tile_kw = {}
+        if tile is not None:
+            tile_kw["mma_tiler_mn"] = tile
+        if cluster is not None:
+            tile_kw["cluster_shape_mn"] = cluster
+        if dyn and kind != "wgrad":  # the SM100 wgrad wrapper has no flag: it always runs its CLC dynamic scheduler
             tile_kw["use_dynamic_sched"] = True
         reset = noop
         if kind == "wgrad":
-            out = torch.empty((p["experts"], p["m"], p["n"]), device="cuda", dtype=torch.bfloat16)
+            if not wgrad_out:
+                wgrad_out.append(torch.empty((p["experts"], p["m"], p["n"]), device="cuda", dtype=torch.bfloat16))
+            out = wgrad_out[0]
             fn = lambda: cudnn.grouped_gemm_wgrad_wrapper_sm100(
                 a_tensor=t["a_p"], b_tensor=t["b_p"], sfa_tensor=None, sfb_tensor=None, offsets_tensor=t["offs_p"],
-                wgrad_tensor=out, acc_dtype=torch.float32, wgrad_dtype=torch.bfloat16,
+                wgrad_tensor=out, acc_dtype=torch.float32, wgrad_dtype=torch.bfloat16, **tile_kw,
             )["wgrad_tensor"]
             check = lambda r: dict(out=diff(r, ref["out"]))
         elif kind in ("glu", "glu_c"):
@@ -348,7 +395,7 @@ def build_arms(p, t, names, cap):
             fn = lambda: cudnn.grouped_gemm_dglu_wrapper_sm100(
                 a_tensor=t["a_p"], c_tensor=t["c_p"], sfa_tensor=None, padded_offsets=t["offs_p"], alpha_tensor=t["alpha"],
                 beta_tensor=t["alpha"], prob_tensor=t["prob_p"], dprob_tensor=t["dprob"], b_tensor=t["b"], b_major=p["b_major"],
-                d_dtype=torch.bfloat16, act_func="dswiglu",
+                d_dtype=torch.bfloat16, act_func="dswiglu", **tile_kw,
             )
             check = lambda r: dict(out=diff(sel(r["d_row_tensor"].view(p["m_padded"], -1)), ref["out"]),
                                    dprob=diff(sel(t["dprob"]), ref["dprob"]))
@@ -365,9 +412,18 @@ def build_arms(p, t, names, cap):
             check = lambda r: dict(out=diff(sel(r), ref["out"]))
         return reset, fn, check
 
-    for name, (tile, dyn) in CUDNN_ARMS.items():
-        if name in names and (name == "cudnn" or kind in ("fwd", "glu", "glu_c")):
-            arms[name] = cudnn_arm(tile, dyn)
+    for name in names:
+        spec = cudnn_arm_spec(name)
+        if spec is None:
+            continue
+        tile, cluster, dyn = spec
+        if name in ("cudnn_dyn", "cudnn_512", "cudnn_512_dyn") and kind not in ("fwd", "glu", "glu_c"):
+            continue  # the 256x512 A/B's arms: unfused and GLU only, as before
+        why = tile_skip_reason(kind, tile)
+        if why:
+            skipped[name] = why
+            continue
+        arms[name] = cudnn_arm(tile, cluster, dyn)
 
     qnames = [n for n in QUACK_ARMS if n in names]
     # gemm_dgated defaults to the dynamic scheduler, so its flipped arm is quack_static; the others flip to quack_dyn
@@ -456,7 +512,7 @@ def build_arms(p, t, names, cap):
                 return lambda r: dict(out=diff(s(r), ref["out"]))
         for name in qnames:
             arms[name] = (noop, make(name), check(name))
-    return arms, ref
+    return arms, ref, skipped
 
 
 # ---------------------------------------------------------------------------- timing
@@ -594,10 +650,14 @@ def run_item(args):
         override = dict(hidden=h, experts=e, top_k=k, intermediate=i)
     counts = [int(x) for x in args.real_counts.split(",")] if args.real_counts else None
     p = item_problem(args.item, args.ep, args.tokens, args.routing, override, counts)
-    names = [n for n in args.arms.split(",") if n]
-    unknown = set(names) - set(ALL_ARMS)
+    names = []
+    for n in args.arms.split(","):
+        for m in (SWEEP_ARMS if n == "sweep" else (n,)):
+            if m and m not in names:
+                names.append(m)
+    unknown = [n for n in names if n not in ALL_ARMS and not is_cudnn_arm(n)]
     if unknown:
-        raise SystemExit(f"unknown arms {sorted(unknown)}; known {ALL_ARMS}")
+        raise SystemExit(f"unknown arms {unknown}; known {ALL_ARMS}, 'sweep' or cudnn[_dyn]_<M>x<N>_c<cm><cn>")
     errors = {}
     if any(n.startswith("quack") for n in names):
         try:
@@ -608,18 +668,18 @@ def run_item(args):
         except Exception as e:
             errors["quack_import"] = f"{type(e).__name__}: {e}"
             names = [n for n in names if not n.startswith("quack")]
-    if any(n in CUDNN_ARMS for n in names):
+    if any(is_cudnn_arm(n) for n in names):
         try:
             import cudnn  # noqa: F401
         except Exception as e:
             errors["cudnn_import"] = f"{type(e).__name__}: {e}"
-            names = [n for n in names if n not in CUDNN_ARMS]
+            names = [n for n in names if not is_cudnn_arm(n)]
     if "torch" not in names:
         names.append("torch")
 
     t = make_tensors(p)
-    built, ref = build_arms(p, t, set(names), cap)
-    order = [n for n in ALL_ARMS if n in built]
+    built, ref, skipped = build_arms(p, t, names, cap)
+    order = [n for n in names if n in built]  # --arms order
     arms, checks, first_call_s, tuned = {}, {}, {}, {}
     for name in order:  # first calls (compile, quack autotune) and checks, outside timing; a failing arm is dropped
         reset, fn, check = built[name]
@@ -656,6 +716,10 @@ def run_item(args):
                 tm, pr = time_bench(arms, args.runs, args.warmup, args.reps)
             for value in tm.values():
                 value["tflops"] = p["flops"] / (value["us_median"] * 1e-6) / 1e12
+            base = tm.get(SWEEP_BASELINE)
+            if base:
+                for value in tm.values():
+                    value[f"time_over_{SWEEP_BASELINE}"] = value["us_median"] / base["us_median"]
             timing_all[protocol] = dict(timing=tm, protocol=pr)
         first = args.protocol.split(",")[0]
         timing, proto = timing_all[first]["timing"], timing_all[first]["protocol"]
@@ -683,7 +747,8 @@ def run_item(args):
     f1 = data["f1_reference"].get(args.item) if data and p["routing"] == "qcmp" else None
     record = dict(
         item=args.item, ep=args.ep, tokens=args.tokens, problem=p, semantics=SEMANTICS[p["kind"]], timing=timing, ratios=ratios,
-        timing_protocol=proto, timing_all=timing_all, quack_tile_config=str(quack_tile_config(cap)) if "quack_tile" in timing else None,
+        timing_protocol=proto, timing_all=timing_all, skipped=skipped, checks=checks, first_call_s=first_call_s,
+        cudnn_arm_specs={n: dict(zip(("mma_tiler_mn", "cluster_shape_mn", "use_dynamic_sched"), cudnn_arm_spec(n))) for n in names if is_cudnn_arm(n)}, quack_tile_config=str(quack_tile_config(cap)) if "quack_tile" in timing else None,
         f1_reference=f1, errors=errors, env=env_info(), peak_mem_gib=round(torch.cuda.max_memory_allocated() / 2**30, 2),
         args=dict(runs=args.runs, warmup=args.warmup, reps=args.reps, arms=args.arms, protocol=args.protocol, routing=args.routing,
                   gate_ms=args.gate_ms, model_shape=args.model_shape, real_counts=args.real_counts, quack_tune_limit=args.quack_tune_limit),
@@ -698,7 +763,82 @@ def run_item(args):
 
 
 # ---------------------------------------------------------------------------- summary
-def summarize(directory):
+def max_rel(check):
+    return max((v["rel"] for v in check.values()), default=float("nan")) if check else float("nan")
+
+
+def summarize_tiles(directory, rows, peak_tflops=2500.0, noise=0.01):
+    """Tile sweep: every arm's time over the dynamic 256x256 c2x1 arm, per protocol -> summary_tiles.{md,json}."""
+    base = SWEEP_BASELINE
+    rows = [(path, r) for path, r in rows if any(base in (d.get("timing") or {}) for d in (r.get("timing_all") or {}).values())]
+    if not rows:
+        return
+    protocols = sorted({pr for _, r in rows for pr in r["timing_all"]}, key=lambda x: (x != "qcmp", x))
+    arm_order = []
+    for _, r in rows:
+        for pr in protocols:
+            for n in (r["timing_all"].get(pr) or {}).get("timing", {}):
+                if n not in arm_order:
+                    arm_order.append(n)
+    tile_arms = [n for n in arm_order if TILE_ARM_RE.match(n)]
+    short = lambda n: n.replace("cudnn_dyn_", "dyn ").replace("cudnn_", "static ").replace("_c", " c")
+    lines = [f"# cuDNN-FE SM100 BF16 grouped GEMM tile sweep: time / {base} (< 1: faster), per protocol", "",
+             f"TFLOPS count real rows only; % of {peak_tflops:.0f} TFLOPS dense BF16. best: the fastest dynamic tile arm and its margin "
+             f"over {base} (|margin| < {noise:.0%}: noise). skip: the op cannot take the tile.", ""]
+    out = []
+    for pr in protocols:
+        head = ["EP", "item", "M_real x N x K, E", f"{short(base)} us", f"{short(base)} TF (%peak)"]
+        head += [short(n) for n in arm_order if n != base] + ["best tile", "margin"]
+        lines += [f"## protocol {pr}", "", "| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+        for path, r in rows:
+            d = r["timing_all"].get(pr)
+            if not d or base not in d["timing"]:
+                continue
+            tm, p = d["timing"], r["problem"]
+            b = tm[base]["us_median"]
+            cells = [str(r["ep"]), r["item"], f"{p['m_real']}x{p['n']}x{p['k']}, {p['experts']}", f"{b:.1f}",
+                     f"{tm[base]['tflops']:.0f} ({100 * tm[base]['tflops'] / peak_tflops:.0f}%)"]
+            for n in arm_order:
+                if n == base:
+                    continue
+                if n in tm:
+                    cells.append(f"{tm[n]['us_median'] / b:.3f}")
+                elif n in (r.get("skipped") or {}):
+                    cells.append("skip")
+                else:
+                    cells.append("err" if n in (r.get("errors") or {}) else "-")
+            cand = {n: tm[n]["us_median"] for n in tile_arms if n in tm}
+            best = min(cand, key=cand.get) if cand else None
+            margin = 1 - cand[best] / b if best else float("nan")
+            cells += [short(best) if best and abs(margin) >= noise else f"{short(base)} (noise)", f"{100 * margin:+.1f}%"]
+            lines.append("| " + " | ".join(cells) + " |")
+            out.append(dict(protocol=pr, ep=r["ep"], item=r["item"], m_real=p["m_real"], n=p["n"], k=p["k"], experts=p["experts"],
+                            routing=p["routing"], base_us=b,
+                            arms={n: dict(us=tm[n]["us_median"], over_base=tm[n]["us_median"] / b, tflops=tm[n]["tflops"],
+                                          pct_peak=100 * tm[n]["tflops"] / peak_tflops, us_runs=tm[n].get("us_runs"),
+                                          late_reps=tm[n].get("late_reps")) for n in tm},
+                            best_tile=best, best_margin=margin, skipped=r.get("skipped") or {}, errors=sorted(r.get("errors") or {}),
+                            max_rel_diff={n: max_rel(c) for n, c in (r.get("checks") or {}).items()}))
+        lines.append("")
+    lines += ["## max rel diff vs torch (max over outputs)", "", "| EP | item | " + " | ".join(short(n) for n in arm_order) + " |",
+              "|" + "---|" * (len(arm_order) + 2)]
+    for path, r in rows:
+        ch = r.get("checks") or {}
+        lines.append(f"| {r['ep']} | {r['item']} | " + " | ".join(f"{max_rel(ch[n]):.1e}" if n in ch else "-" for n in arm_order) + " |")
+    skips = sorted({(n, why) for _, r in rows for n, why in (r.get("skipped") or {}).items()})
+    if skips:
+        lines += ["", "Skipped arms:", ""] + [f"- {n}: {why}" for n, why in skips]
+    errs = [(r["ep"], r["item"], k) for _, r in rows for k in (r.get("errors") or {})]
+    if errs:
+        lines += ["", "Errors:", ""] + [f"- EP{ep} {it}: {k}" for ep, it, k in errs]
+    with open(os.path.join(directory, "summary_tiles.md"), "w") as f:
+        f.write("\n".join(lines) + "\n")
+    with open(os.path.join(directory, "summary_tiles.json"), "w") as f:
+        json.dump(out, f, indent=1)
+    print("\n".join(lines))
+
+
+def summarize(directory, peak_tflops=2500.0):
     rows = []
     for path in sorted(glob.glob(os.path.join(directory, "**", "perf_*.json"), recursive=True)):
         try:
@@ -749,6 +889,7 @@ def summarize(directory):
     with open(os.path.join(directory, "summary.json"), "w") as f:
         json.dump(out, f, indent=1)
     print("\n".join(lines))
+    summarize_tiles(directory, rows, peak_tflops)
     return 0
 
 
@@ -767,6 +908,7 @@ def main(argv=None):
     parser.add_argument("--gate-ms", type=float, default=80.0, help="start-gate GPU sleep per fire (qcmp protocol)")
     parser.add_argument("--out", default=None)
     parser.add_argument("--summarize", metavar="DIR", default=None)
+    parser.add_argument("--peak-tflops", type=float, default=2500.0, help="dense BF16 peak for the %% of peak column (--summarize)")
     # smoke-test knobs (not used on H100)
     parser.add_argument("--allow-non-sm90", action="store_true")
     parser.add_argument("--model-shape", default=None, help="H,E,TOPK,I override of the item's model dims")
@@ -777,7 +919,7 @@ def main(argv=None):
         print("\n".join(ITEMS))
         return 0
     if args.summarize:
-        return summarize(args.summarize)
+        return summarize(args.summarize, args.peak_tflops)
     if args.item is None:
         parser.error("--item, --list-items or --summarize is required")
     return run_item(args)
