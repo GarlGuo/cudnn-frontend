@@ -857,11 +857,12 @@ class MoEPersistentTileScheduler:
         cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
         if const_expr(cluster_size == 1):
             # One CTA needs no DSMEM broadcast (compute-sanitizer rejects shared::cluster ops in a one-CTA cluster).
-            lane_idx = cute.arch.thread_idx(loc=loc, ip=ip)[0] % Int32(32)
-            atomic_idx = Int32(0)
-            if lane_idx == 0:
-                atomic_idx = atomic_add_i32(ds.counter_ptr.llvm_ptr, Int32(1), loc=loc, ip=ip)
-            cluster_idx = cute.arch.shuffle_sync(atomic_idx, offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
+            claim = cute.make_rmem_tensor((1,), Int32)
+            claim[0] = Int32(0)
+            with cute.arch.elect_one(loc=loc, ip=ip):
+                claim[0] = atomic_add_i32(ds.counter_ptr.llvm_ptr, Int32(1), loc=loc, ip=ip)
+            # The full-mask shuffle needs a converged warp, so elect.sync picked lane 0.
+            cluster_idx = cute.arch.shuffle_sync(claim[0], offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
         else:
             broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
             cluster_idx = Int32(0)
@@ -872,7 +873,6 @@ class MoEPersistentTileScheduler:
                 full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip)
                 tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
                 lane_idx = tidx % Int32(32)
-                cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
 
                 atomic_idx = Int32(0)
                 if lane_idx == 0:
