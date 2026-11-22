@@ -119,10 +119,9 @@ def test_sm90_golden(direction):
 
 
 @pytest.mark.parametrize("direction", DIRECTIONS)
-@pytest.mark.parametrize("tile,cluster", [(None, None), ((128, 128), (1, 2))], ids=["default", "128x128-c12"])
-def test_sm90_pingpong_replay_fresh_buffers_with_concurrent_work(direction, tile, cluster):
+def test_sm90_pingpong_replay_fresh_buffers_with_concurrent_work(direction):
     # The claim order moves tiles between CTAs and so between the two warp groups; the bytes must not move.
-    kwargs = dict(mma_tiler_mn=tile, cluster_shape_mn=cluster, schedule="pingpong")
+    kwargs = dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1), schedule="pingpong")
     problem = make_problem((1024, 0, 768, 256, 2048), n=2304, k=1536, direction=direction, seed=7)
     check(problem, run(problem, **kwargs))
     inputs = lambda: snapshot({"a": problem["a"], "weights": problem["weights"], "prob": problem["prob"]})

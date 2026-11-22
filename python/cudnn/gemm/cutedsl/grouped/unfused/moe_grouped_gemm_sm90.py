@@ -54,6 +54,20 @@ def _widen_for_cluster(tma_tensor, mode, tile, cluster_count):
 
 
 KERNEL_SCHEDULES = ("cooperative", "pingpong")
+# The one pingpong configuration (the H100 sweep's only competitive one); every other tile or cluster is cooperative.
+SM90_PINGPONG_TILE = (128, 192)
+SM90_PINGPONG_CLUSTER = (2, 1)
+
+
+def sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn, glu_generate_c: bool = False) -> Optional[str]:
+    """Why a pingpong configuration is unsupported, or None (None tile or cluster: the pingpong default)."""
+    if glu_generate_c:
+        return "a GLU with generate_c has no pingpong schedule (its 128x192 epilogue spills)"
+    tile = SM90_PINGPONG_TILE if mma_tiler_mn is None else tuple(mma_tiler_mn)
+    cluster = SM90_PINGPONG_CLUSTER if cluster_shape_mn is None else tuple(cluster_shape_mn)
+    if (tile, cluster) != (SM90_PINGPONG_TILE, SM90_PINGPONG_CLUSTER):
+        return f"pingpong runs only mma_tiler_mn={SM90_PINGPONG_TILE} with cluster_shape_mn={SM90_PINGPONG_CLUSTER}, got {tile} and {cluster}"
+    return None
 
 
 def check_register_split(load_regs: int, mma_regs: int, num_mma_warp_groups: int) -> None:
@@ -63,11 +77,9 @@ def check_register_split(load_regs: int, mma_regs: int, num_mma_warp_groups: int
         raise ValueError(f"setmaxnreg split {load_regs} + {num_mma_warp_groups} x {mma_regs} exceeds {num_mma_warp_groups + 1} x {launch_regs} registers")
 
 
-def sm90_default_mma_tiler(pingpong: bool, glu_generate_c: bool = False) -> Tuple[int, int]:
-    """The SM90 CTA tile when the caller gives none: (128, 256) cooperative; pingpong (128, 192), (128, 128) for a GLU with C."""
-    if not pingpong:
-        return (128, 256)
-    return (128, 128) if glu_generate_c else (128, 192)
+def sm90_default_mma_tiler(pingpong: bool) -> Tuple[int, int]:
+    """The SM90 CTA tile when the caller gives none: (128, 256) cooperative, (128, 192) pingpong."""
+    return SM90_PINGPONG_TILE if pingpong else (128, 256)
 
 
 # Tests and benchmarks only: "cooperative" or "pingpong" forces every SM90 BF16 grouped GEMM's schedule.
@@ -93,17 +105,19 @@ def sm90_pingpong_heuristic(n: int, k: int) -> bool:
     return k <= 2048 and n >= 2048
 
 
-def sm90_schedule_is_pingpong(n: int, k: int, mma_tiler_mn: Optional[Tuple[int, int]], glu_generate_c: bool = False) -> bool:
-    """The fwd / dgrad / GLU schedule for an (n, k) problem and an optional explicit tile."""
-    tile_ok = mma_tiler_mn is None or MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(tuple(mma_tiler_mn), glu_generate_c) is None
-    return sm90_pick_pingpong(sm90_pingpong_heuristic(n, k), tile_ok)
+def sm90_schedule_is_pingpong(
+    n: int, k: int, mma_tiler_mn: Optional[Tuple[int, int]], glu_generate_c: bool = False, cluster_shape_mn: Optional[Tuple[int, int]] = None
+) -> bool:
+    """The fwd / dgrad / GLU schedule for an (n, k) problem and an optional explicit tile and cluster."""
+    config_ok = sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn, glu_generate_c) is None
+    return sm90_pick_pingpong(sm90_pingpong_heuristic(n, k), config_ok)
 
 
-def check_pingpong_tile(pingpong: bool, mma_tiler_mn: Tuple[int, int], glu_generate_c: bool = False) -> None:
-    """A forced pingpong schedule with a tile it cannot run raises; the heuristic never picks one."""
-    error = MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(mma_tiler_mn, glu_generate_c) if pingpong else None
+def check_pingpong_tile(pingpong: bool, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Tuple[int, int], glu_generate_c: bool = False) -> None:
+    """A forced pingpong schedule with a configuration it cannot run raises; the heuristic never picks one."""
+    error = sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn, glu_generate_c) if pingpong else None
     if error is not None:
-        raise ValueError(f"SM90 pingpong: {error}, got mma_tiler_mn={tuple(mma_tiler_mn)}")
+        raise ValueError(f"SM90: {error}")
 
 
 class MoEGroupedGemmBf16KernelSm90:
@@ -123,25 +137,10 @@ class MoEGroupedGemmBf16KernelSm90:
     :param weight_mode: Must be ``MoEWeightMode.DENSE``.
     :param use_dynamic_sched: Must be True.
     :param pingpong: Each MMA warp group owns whole tiles (alternate tiles of the scheduler's sequence) and
-        the two overlap one's epilogue with the other's mainloop; tile M * N <= 128 * 192 (128 * 128 for a GLU with C).
+        the two overlap one's epilogue with the other's mainloop; a 128x192 tile, a (2, 1) cluster, no GLU with C.
     """
 
     FIX_PAD_SIZE = 256
-    # A pingpong warp group holds the whole tile's accumulator: M * N / 128 fp32 registers per thread.
-    # A GLU that also stores C keeps gate and up C subtiles live too: 128x192 spills (ptxas -v), 128x128 does not.
-    PINGPONG_MAX_TILE_ELEMS = 128 * 192
-    PINGPONG_GLU_C_MAX_TILE_ELEMS = 128 * 128
-
-    @staticmethod
-    def _pingpong_tile_error(mma_tiler_mn: Tuple[int, int], glu_generate_c: bool = False) -> Optional[str]:
-        """Why a pingpong CTA tile is unsupported, or None."""
-        cls = MoEGroupedGemmBf16KernelSm90
-        tile = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
-        if mma_tiler_mn[0] * mma_tiler_mn[1] > cls.PINGPONG_MAX_TILE_ELEMS:
-            return f"a pingpong warp group holds the whole {tile} accumulator: tile M * N must be <= 128 * 192"
-        if glu_generate_c and mma_tiler_mn[0] * mma_tiler_mn[1] > cls.PINGPONG_GLU_C_MAX_TILE_ELEMS:
-            return f"a GLU with generate_c holds the {tile} accumulator plus C: tile M * N must be <= 128 * 128"
-        return None
 
     @staticmethod
     def can_implement(
@@ -162,7 +161,7 @@ class MoEGroupedGemmBf16KernelSm90:
         m_aligned: int,
         pingpong: bool = False,
     ) -> bool:
-        if pingpong and MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(mma_tiler_mn) is not None:
+        if pingpong and sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is not None:
             return False
         fix_pad_size = MoEGroupedGemmBf16KernelSm90.FIX_PAD_SIZE
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
@@ -224,9 +223,9 @@ class MoEGroupedGemmBf16KernelSm90:
             raise ValueError(f"SM90 CTA tile M must be 64 or 128, got {mma_tile_m}.")
         if mma_tiler_mn[1] not in range(32, 257, 32):
             raise ValueError(f"SM90 CTA tile N must be a multiple of 32 in [32, 256], got {mma_tiler_mn[1]}.")
-        pingpong_error = self._pingpong_tile_error(mma_tiler_mn, act_func is not None and generate_c) if pingpong else None
+        pingpong_error = sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn, act_func is not None and generate_c) if pingpong else None
         if pingpong_error is not None:
-            raise ValueError(f"SM90 pingpong: {pingpong_error}.")
+            raise ValueError(f"SM90: {pingpong_error}.")
 
         self.expert_cnt = expert_cnt
         self.acc_dtype = acc_dtype

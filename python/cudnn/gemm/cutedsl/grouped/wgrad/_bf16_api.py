@@ -37,6 +37,7 @@ from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug
 from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
+from ..unfused.moe_grouped_gemm_sm90 import sm90_pingpong_config_error
 from .moe_grouped_gemm_wgrad_sm90 import MoEGroupedGemmWgradBF16KernelSm90, sm90_wgrad_schedule_is_pingpong
 
 
@@ -106,7 +107,7 @@ class GroupedGemmWgradBf16API(APIBase):
         # SM90 runs the Hopper kernel: tile M <= 128 and a (2, 1) cluster by default.
         self._is_sm90 = is_sm90_device()
         # The SM90 schedule comes from the output N (wgrad_shape is (M, N)) and the tile.
-        self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and sm90_wgrad_schedule_is_pingpong(self.wgrad_shape[1], mma_tiler_mn)
+        self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and sm90_wgrad_schedule_is_pingpong(self.wgrad_shape[1], mma_tiler_mn, cluster_shape_mn)
         default_tile = ((128, 192) if self.pingpong else (128, 256)) if self._is_sm90 else (256, 256)
         self.mma_tiler_mn = tuple(mma_tiler_mn or default_tile)
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
@@ -254,6 +255,9 @@ class GroupedGemmWgradBf16API(APIBase):
         # Per-expert token counts are device data (Rule 3); can_implement gets a split with the right total.
         groups = [tokens_sum] + [0] * (self.expert_cnt - 1)
 
+        pingpong_error = sm90_pingpong_config_error(self.mma_tiler_mn, self.cluster_shape_mn) if self.pingpong else None
+        if pingpong_error is not None:
+            raise ValueError(f"SM90 wgrad: {pingpong_error}")
         if not self._kernel.can_implement(
             cutlass.BFloat16,
             _convert_to_cutlass_data_type(self.wgrad_dtype),

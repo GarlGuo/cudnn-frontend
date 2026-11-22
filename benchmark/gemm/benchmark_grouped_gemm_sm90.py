@@ -19,6 +19,7 @@ rep, each rep behind an L2 flush.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import statistics
 import sys
@@ -121,12 +122,15 @@ def forced_schedule(fn, schedule):
 
 
 def backends(p, t, names, config=None, schedules=(None,)):
-    """``config``: mma_tiler_mn / cluster_shape_mn for the GEMM and GLU ops; one cudnn arm per schedule (None: the heuristic's)."""
+    """``config``: mma_tiler_mn / cluster_shape_mn for the GEMM and GLU ops; one cudnn arm per schedule (None: the heuristic's).
+
+    The pingpong arm always runs its one configuration, a 128x192 tile on a (2, 1) cluster.
+    """
     import cudnn
 
     config = config or {}
 
-    def ours_glu():
+    def ours_glu(config):
         return cudnn.grouped_gemm_glu_wrapper_sm100(
             a_tensor=t["a"],
             sfa_tensor=None,
@@ -140,7 +144,7 @@ def backends(p, t, names, config=None, schedules=(None,)):
             **config,
         )["d_tensor"]
 
-    def ours_dglu():
+    def ours_dglu(config):
         return cudnn.grouped_gemm_dglu_wrapper_sm100(
             a_tensor=t["a"],
             c_tensor=t["c"],
@@ -156,7 +160,7 @@ def backends(p, t, names, config=None, schedules=(None,)):
             act_func="dswiglu",
         )["d_row_tensor"]
 
-    def ours():
+    def ours(config):
         cudnn.grouped_gemm_wrapper_sm100(
             a_tensor=t["a"],
             padded_offsets=t["offsets"],
@@ -180,7 +184,9 @@ def backends(p, t, names, config=None, schedules=(None,)):
         fn, reference = ours_dglu, lambda: torch_dswiglu(grouped_mm(), t["c"], t["prob"])
     else:
         fn, reference = ours, grouped_mm
-    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): forced_schedule(fn, s) for s in schedules}
+    pingpong_config = dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1))
+    arm = lambda s: functools.partial(fn, pingpong_config if s == "pingpong" else config)
+    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): forced_schedule(arm(s), s) for s in schedules}
     if "torch_grouped_mm" in names:
         runs["torch_grouped_mm"] = reference
     return runs
@@ -222,7 +228,12 @@ def main(argv=None):
     parser.add_argument("--l2-flush", type=float, default=2.0, help="flush buffer size in multiples of L2")
     parser.add_argument("--out", default=None)
     pair = lambda text: tuple(int(v) for v in text.split(","))
-    parser.add_argument("--schedules", default=None, help="comma list of forced SM90 schedules (cooperative, pingpong), one arm each; default: the heuristic's")
+    parser.add_argument(
+        "--schedules",
+        default=None,
+        help="comma list of forced SM90 schedules (cooperative, pingpong), one arm each; default: the heuristic's. "
+        "The pingpong arm always runs 128x192 on a (2, 1) cluster",
+    )
     parser.add_argument("--tile", type=pair, default=None, help="mma_tiler_mn as M,N (GEMM and GLU ops)")
     parser.add_argument("--cluster", type=pair, default=None, help="cluster_shape_mn as M,N (GEMM and GLU ops)")
     args = parser.parse_args(argv)

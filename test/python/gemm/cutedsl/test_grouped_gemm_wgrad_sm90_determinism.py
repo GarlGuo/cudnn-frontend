@@ -113,12 +113,12 @@ def test_sm90_wgrad_pingpong_replays_bitwise():
     assert_replays(lambda: run(slices, **PINGPONG), repeats=6)
 
 
-@pytest.mark.parametrize("tile", [(128, 128), (128, 160), (128, 192)], ids=["128x128", "128x160", "128x192"])
-def test_sm90_wgrad_pingpong_matches_cooperative_bytes(tile):
-    # Both schedules reduce each output element with the same WGMMA sequence, so at one tile the bytes agree.
+def test_sm90_wgrad_pingpong_matches_cooperative_bytes():
+    # Cooperative 128x192 (two warp groups on one tile) and pingpong run the same 64x192 WGMMAs per 64 rows.
     slices = expert_slices(GROUPS)
-    cooperative = run(slices, mma_tiler_mn=tile, schedule="cooperative")
-    assert_bitwise(run(slices, mma_tiler_mn=tile, **PINGPONG), cooperative, f"pingpong vs cooperative {tile}")
+    tile = dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1))
+    cooperative = run(slices, schedule="cooperative", **tile)
+    assert_bitwise(run(slices, **tile, **PINGPONG), cooperative, "pingpong vs cooperative 128x192")
 
 
 @pytest.mark.parametrize("remaining", ["half", "one"], ids=["half-clusters", "one-cluster"])

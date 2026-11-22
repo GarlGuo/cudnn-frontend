@@ -288,7 +288,9 @@ above with these limits:
 - Torch tensors only (no JAX entry).
 - The SM90 kernel picks its warp-group schedule from the problem shape, and
   `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 192)`
-  for output `N >= 2048`, else `(128, 256)`. SM100 uses `(256, 256)`.
+  for output `N >= 2048`, else `(128, 256)`. SM100 uses `(256, 256)`. The
+  `N >= 2048` schedule runs only on a `(128, 192)` tile with a `(2, 1)` cluster
+  (given or defaulted); any other tile or cluster runs the default schedule.
   An explicit SM90 tile has M in `{64, 128}` and N a multiple of 32 up to 256.
   `cluster_shape_mn=None` selects `(2, 1)`; an
   explicit cluster has power-of-two sides and at most 8 CTAs.

@@ -4,13 +4,16 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
-### H100 SM90 BF16 grouped GEMM wgrad pingpong (2026-11-22, pending)
+### H100 SM90 BF16 grouped GEMM pingpong (2026-11-22, pending)
 
+Pingpong runs only a 128x192 tile on a (2, 1) cluster, and a GLU only without C.
 Forced-pingpong cases (test-only schedule hook) in `gemm/cutedsl/test_grouped_gemm_wgrad_sm90_determinism.py`:
-replay, bytes equal to the cooperative schedule at each pingpong tile, claim-order
-invariance down to one persistent cluster, and expert batch invariance. No golden
-is recorded: the cooperative records below cover the bytes. Not yet run on an H100,
-so this is a coverage gap until the suite above passes there.
+replay, bytes equal to the cooperative 128x192 schedule, claim-order invariance
+down to one persistent cluster, and expert batch invariance. No wgrad golden is
+recorded: the cooperative records below cover the bytes. The pingpong goldens
+`grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` and `grouped_gemm_glu_sm90_bf16_pingpong_noc`
+(the GLU one replaces a 128x128 record with C) are still to be recorded on an H100,
+so this is a coverage gap until the suites pass there.
 
 ### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22)
 

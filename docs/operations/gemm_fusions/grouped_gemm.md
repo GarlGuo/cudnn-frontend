@@ -177,7 +177,9 @@ weights (`b_major="n"`), with these limits:
 - The SM90 kernel picks its warp-group schedule from the problem shape, and
   `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
   or `(128, 192)` for short K (`K <= 2048`, `N >= 2048`). SM100 uses
-  `(256, 256)`.
+  `(256, 256)`. The short-K schedule runs only on a `(128, 192)` tile with a
+  `(2, 1)` cluster (given or defaulted); any other tile or cluster runs the
+  default schedule.
   An explicit SM90 tile has M in `{64, 128}` and N a multiple of 32 up to 256.
   `cluster_shape_mn=None` selects `(2, 1)`; an
   explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile

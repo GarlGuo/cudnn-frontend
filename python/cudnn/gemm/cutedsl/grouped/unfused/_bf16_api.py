@@ -155,7 +155,7 @@ class GroupedGemmBf16API(APIBase):
         self._is_sm90 = is_sm90_device()
         # The SM90 schedule comes from the GEMM's (N, K) and the tile; B is (N, K, experts) here.
         dense_b = self.b_desc is not None and self.b_desc.ndim == 3
-        self._pingpong = self._is_sm90 and dense_b and sm90_schedule_is_pingpong(*self.b_desc.shape[:2], mma_tiler_mn)
+        self._pingpong = self._is_sm90 and dense_b and sm90_schedule_is_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
         self.mma_tiler_mn = tuple(mma_tiler_mn or (sm90_default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
@@ -294,7 +294,7 @@ class GroupedGemmBf16API(APIBase):
 
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
-        check_pingpong_tile(self._pingpong, self.mma_tiler_mn)
+        check_pingpong_tile(self._pingpong, self.mma_tiler_mn, self.cluster_shape_mn)
         if self._is_sm90:
             if self.weight_mode != MoEWeightMode.DENSE:
                 raise NotImplementedError("SM90 grouped GEMM supports dense weights (sample_b) only, not discrete b_ptrs")
