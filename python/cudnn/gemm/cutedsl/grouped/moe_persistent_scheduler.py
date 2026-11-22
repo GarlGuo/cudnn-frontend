@@ -872,6 +872,7 @@ class MoEPersistentTileScheduler:
                 full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip)
                 tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
                 lane_idx = tidx % Int32(32)
+                cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
 
                 atomic_idx = Int32(0)
                 if lane_idx == 0:
