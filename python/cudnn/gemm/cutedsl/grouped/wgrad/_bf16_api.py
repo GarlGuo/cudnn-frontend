@@ -16,6 +16,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import Workspace
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
@@ -119,6 +120,7 @@ class GroupedGemmWgradBf16API(APIBase):
         )
         self._kernel = MoEGroupedGemmWgradBF16KernelSm90 if self._is_sm90 else MoEGroupedGemmWgradBF16Kernel
         self._workspace: Optional[torch.Tensor] = None
+        self._scratch_nbytes = 0
         self._compile_wgrad_ptrs: Optional[torch.Tensor] = None
         self._single_expert_placeholder: Optional[torch.Tensor] = None
         self._live_wgrad_ptrs = None
@@ -320,6 +322,8 @@ class GroupedGemmWgradBf16API(APIBase):
         # Internal scratch in the caller's framework allocator; kernels write through its
         # raw pointer and it is never surfaced as a framework array.
         self._workspace = allocate_byte_workspace(self._framework, kernel.get_workspace_bytes(), self.a_desc.device)
+        # Bytes the wrapper allocates per call on the launch stream: overlapping calls must not share the SM90 tile counter.
+        self._scratch_nbytes = kernel.get_workspace_bytes() if self._is_sm90 else 0
         self._validate_data_alignment(self._workspace, "workspace", 128)
         workspace_fake = from_dlpack(self._workspace, assumed_align=128, enable_tvm_ffi=True)
         fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
@@ -377,14 +381,14 @@ class GroupedGemmWgradBf16API(APIBase):
         else:
             cached_single_expert = None
 
-        def tensor_api(a_tensor, b_tensor, output, offsets, stream) -> None:
+        def tensor_api(a_tensor, b_tensor, output, offsets, stream, workspace=None) -> None:
             out_arg = output if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(output))
             raw_compiled(
                 a_tensor,
                 b_tensor,
                 out_arg,
                 offsets,
-                cached_workspace,
+                cached_workspace if workspace is None else workspace,
                 stream,
                 cached_single_expert,
             )
@@ -488,7 +492,11 @@ class GroupedGemmWgradBf16API(APIBase):
         global_scale_a: Optional[torch.Tensor] = None,
         global_scale_b: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
+        """``workspace``: optional per-call device buffer of exactly ``_scratch_nbytes`` bytes, 128-byte aligned;
+        without it, calls share the plan's workspace and must not overlap."""
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
@@ -527,4 +535,11 @@ class GroupedGemmWgradBf16API(APIBase):
                 debug_validate_pointer_values(wgrad_ptrs, "wgrad_ptrs", stream=current_stream)
             self._record_pointer_stream(wgrad_ptrs, current_stream)
             output = wgrad_ptrs
-        self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream)
+        scratch = None
+        if workspace is not None and self._scratch_nbytes:
+            nbytes = self._scratch_nbytes
+            view = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8")
+            scratch = (
+                workspace if is_torch_tensor(workspace) and get_shape(workspace) == (nbytes,) else from_dlpack(view, assumed_align=128, enable_tvm_ffi=True)
+            )
+        self._compiled_kernel(a_tensor, b_tensor, output, offsets_tensor, current_stream, scratch)
