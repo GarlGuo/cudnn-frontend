@@ -9,6 +9,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from gemm.cutedsl.test_grouped_gemm_sm90 import forced_schedule
+
 pytestmark = pytest.mark.L0
 
 BLOCK = 32  # interleaved_32: accumulator column block 2q is gate, block 2q + 1 is up
@@ -87,21 +89,23 @@ def glu_reference(problem, act, linear_offset):
     return c, d * problem["prob"][:, None]
 
 
-def run_glu(problem, act="swiglu", **kwargs):
+def run_glu(problem, act="swiglu", schedule=None, **kwargs):
+    """``schedule`` forces the SM90 schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
     import cudnn
 
-    return cudnn.grouped_gemm_glu_wrapper_sm100(
-        a_tensor=problem["a"],
-        sfa_tensor=None,
-        padded_offsets=problem["offsets"],
-        alpha_tensor=problem["alpha"],
-        b_tensor=problem["weights"],
-        prob_tensor=problem["prob"],
-        c_dtype=problem["out_dtype"],
-        d_dtype=problem["out_dtype"],
-        act_func=act,
-        **{"generate_c": True, **kwargs},
-    )
+    with forced_schedule(schedule):
+        return cudnn.grouped_gemm_glu_wrapper_sm100(
+            a_tensor=problem["a"],
+            sfa_tensor=None,
+            padded_offsets=problem["offsets"],
+            alpha_tensor=problem["alpha"],
+            b_tensor=problem["weights"],
+            prob_tensor=problem["prob"],
+            c_dtype=problem["out_dtype"],
+            d_dtype=problem["out_dtype"],
+            act_func=act,
+            **{"generate_c": True, **kwargs},
+        )
 
 
 def check_glu(problem, result, act="swiglu", linear_offset=None):
@@ -175,7 +179,7 @@ def test_sm90_glu_rejects_unsupported():
 def test_sm90_glu_pingpong_tiles(act, tile, cluster):
     # Ragged experts with empty ones and enough tiles that CTAs run several, in odd and even counts.
     problem = make_problem((512, 0, 1280, 256, 0, 768, 1024), n=1536, k=320, seed=31)
-    check_glu(problem, run_glu(problem, act, mma_tiler_mn=tile, cluster_shape_mn=cluster, kernel_schedule="pingpong"), act)
+    check_glu(problem, run_glu(problem, act, mma_tiler_mn=tile, cluster_shape_mn=cluster, schedule="pingpong"), act)
 
 
 @pytest.mark.parametrize("act", ["swiglu", "geglu"])
@@ -183,7 +187,7 @@ def test_sm90_glu_pingpong_tiles(act, tile, cluster):
 def test_sm90_glu_pingpong_128x192_without_c(act, cluster):
     # 128x192 runs without the saved C only (with it the epilogue spills); D alone is checked.
     problem = make_problem((512, 0, 1280, 256, 0, 768, 1024), n=1536, k=320, seed=33)
-    result = run_glu(problem, act, mma_tiler_mn=(128, 192), cluster_shape_mn=cluster, kernel_schedule="pingpong", generate_c=False)
+    result = run_glu(problem, act, mma_tiler_mn=(128, 192), cluster_shape_mn=cluster, schedule="pingpong", generate_c=False)
     _, expected_d = glu_reference(problem, act, 1.0 if act == "geglu" else 0.0)
     rows = sum(problem["counts"])
     actual = result["d_tensor"][:rows].float()
@@ -199,19 +203,19 @@ def test_sm90_glu_pingpong_one_cluster_parity(monkeypatch, counts, n):
     clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
     monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", str(clusters - 1))
     problem = make_problem(counts, n=n, k=576, seed=len(counts) + n)
-    check_glu(problem, run_glu(problem, mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), kernel_schedule="pingpong"))
+    check_glu(problem, run_glu(problem, mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), schedule="pingpong"))
 
 
 def test_sm90_glu_pingpong_matches_cooperative_and_fp16():
     # A 128x128 tile is one warp group's in both schedules: the same WGMMAs per tile, so the same bytes.
     problem = make_problem((768, 0, 256, 1280), n=1408, k=704, seed=37)
-    cooperative = run_glu(problem, "geglu", mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), kernel_schedule="cooperative")
-    pingpong = run_glu(problem, "geglu", mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), kernel_schedule="pingpong")
+    cooperative = run_glu(problem, "geglu", mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), schedule="cooperative")
+    pingpong = run_glu(problem, "geglu", mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), schedule="pingpong")
     check_glu(problem, pingpong, "geglu")
     for name in ("c_tensor", "d_tensor"):
         assert torch.equal(pingpong[name], cooperative[name]), name
     fp16 = make_problem((256, 512), n=512, k=256, out_dtype=torch.float16)
-    check_glu(fp16, run_glu(fp16, "geglu", linear_offset=0.25, kernel_schedule="pingpong"), "geglu", 0.25)
+    check_glu(fp16, run_glu(fp16, "geglu", linear_offset=0.25, schedule="pingpong"), "geglu", 0.25)
 
 
 @pytest.mark.parametrize(
@@ -228,7 +232,7 @@ def test_sm90_glu_pingpong_rejects(kwargs):
     # Over the accumulator (plus C) register budget, a tile N off the 64-column gate/up pair, or past the expert pad.
     problem = make_problem((256, 256), n=256, k=256)
     with pytest.raises(ValueError):
-        run_glu(problem, kernel_schedule="pingpong", **kwargs)
+        run_glu(problem, schedule="pingpong", **kwargs)
 
 
 # ---- dGLU backward ----

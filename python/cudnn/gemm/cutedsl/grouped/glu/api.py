@@ -84,15 +84,15 @@ def _block_scaled_dtype_pairs():
 
 
 from ._bf16_api import GroupedGemmGluBf16API
-from ..unfused.moe_grouped_gemm_sm90 import sm90_default_mma_tiler
+from ..unfused.moe_grouped_gemm_sm90 import sm90_forced_schedule
 from ._blockscaled_api import GroupedGemmGluBlockScaledAPI
 
 
-def _default_mma_tiler(mma_tiler_mn: Optional[Tuple[int, int]], kernel_schedule: Optional[str] = None, generate_c: bool = False) -> Tuple[int, int]:
-    """The CTA tile when the caller gives none: the SM90 (Hopper) kernel's for its schedule, else (256, 256)."""
+def _default_mma_tiler(mma_tiler_mn: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    """The CTA tile when the caller gives none: (256, 256), or None on SM90, whose BF16 API picks it with the schedule."""
     if mma_tiler_mn is not None:
         return tuple(mma_tiler_mn)
-    return sm90_default_mma_tiler(kernel_schedule == "pingpong", generate_c) if get_device_type() == "hopper" else (256, 256)
+    return None if get_device_type() == "hopper" else (256, 256)
 
 
 @dataclass(frozen=True)
@@ -117,7 +117,7 @@ class GluCall:
     c_dtype: Optional[torch.dtype] = None
     d_dtype: Optional[torch.dtype] = None
     cd_major: str = "n"
-    mma_tiler_mn: Tuple[int, int] = (256, 256)
+    mma_tiler_mn: Optional[Tuple[int, int]] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
     sf_vec_size: int = 16
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None
@@ -140,7 +140,6 @@ class GluCall:
     num_experts: Optional[int] = None
     scheduler_counter_tensor: Optional[torch.Tensor] = None
     glu_layout: str = "interleaved_32"
-    kernel_schedule: Optional[str] = None
 
 
 class GroupedGemmGluSm100(APIBase):
@@ -217,12 +216,7 @@ class GroupedGemmGluSm100(APIBase):
         *,
         sample_scheduler_counter: Optional[torch.Tensor] = None,
         glu_layout: str = "interleaved_32",
-        kernel_schedule: Optional[str] = None,
     ) -> None:
-        """``kernel_schedule`` picks the SM90 BF16 kernel's warp-group schedule: None (the default, today cooperative),
-        "cooperative" or "pingpong"; with mma_tiler_mn=None, pingpong takes (128, 192), or (128, 128) with generate_c.
-        Other kernels need None.
-        """
         super().__init__()
         validate_glu_layout(glu_layout)
         self._pending_init_kwargs = dict(locals())
@@ -235,7 +229,7 @@ class GroupedGemmGluSm100(APIBase):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmGluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
             self._pending_init_kwargs["acc_dtype"] = cutlass.Float32
-        self._pending_init_kwargs["mma_tiler_mn"] = _default_mma_tiler(mma_tiler_mn, kernel_schedule, generate_c)
+        self._pending_init_kwargs["mma_tiler_mn"] = _default_mma_tiler(mma_tiler_mn)
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -290,15 +284,13 @@ class GroupedGemmGluSm100(APIBase):
                     act_func=kwargs["act_func"],
                     b_major=kwargs["b_major"],
                     use_dynamic_sched=kwargs["use_dynamic_sched"],
-                    kernel_schedule=kwargs["kernel_schedule"],
                 )
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
                     raise ValueError(_JAX_BLOCK_SCALED_ERROR)
-                self._value_error_if(kwargs["kernel_schedule"] is not None, "kernel_schedule selects an SM90 BF16 schedule; leave it None for block-scaled GLU")
                 block_kwargs = dict(kwargs)
                 block_kwargs.pop("generate_c", None)
-                block_kwargs.pop("kernel_schedule", None)
+                block_kwargs["mma_tiler_mn"] = block_kwargs["mma_tiler_mn"] or (256, 256)
                 # The block-scaled implementation is torch-native: hand it torch dtypes.
                 block_kwargs["acc_dtype"] = framework_dtype(block_kwargs["acc_dtype"], "torch")
                 if block_kwargs.get("b_dtype") is not None:
@@ -580,7 +572,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
     c_dtype = framework_dtype(call.c_dtype, "torch")
     d_dtype = framework_dtype(call.d_dtype, "torch")
     b_dtype = framework_dtype(call.b_dtype, "torch") if call.b_dtype is not None else None
-    mma_tiler_mn = call.mma_tiler_mn
+    mma_tiler_mn = call.mma_tiler_mn or (256, 256)
     cluster_shape_mn = call.cluster_shape_mn
     sf_vec_size = call.sf_vec_size
     sf_fp8_dtype_override = call.sf_fp8_dtype_override
@@ -1200,7 +1192,8 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
         call.generate_c,
         call.b_major,
         call.use_dynamic_sched,
-        call.kernel_schedule,
+        # The SM90 schedule is a function of the shapes and tile in this key plus the forced one.
+        sm90_forced_schedule(),
         workspace_bytes,
         ((get_device(call.a_tensor).type, get_device(call.a_tensor).index)),
         overlap_margin,
@@ -1240,7 +1233,6 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
             b_major=call.b_major,
             use_dynamic_sched=call.use_dynamic_sched,
             generate_c=call.generate_c,
-            kernel_schedule=call.kernel_schedule,
         )
         if not api.check_support():
             raise RuntimeError("Unsupported BF16 configuration")
@@ -1324,7 +1316,6 @@ def grouped_gemm_glu_wrapper_sm100(
     *,
     scheduler_counter_tensor: Optional[torch.Tensor] = None,
     glu_layout: str = "interleaved_32",
-    kernel_schedule: Optional[str] = None,
 ) -> TupleDict:
     """Dispatch grouped GEMM GLU with metadata caching.
 
@@ -1341,10 +1332,9 @@ def grouped_gemm_glu_wrapper_sm100(
     scheduler_counter_tensor optionally supplies a caller-owned CUDA int32 counter
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
-    kernel_schedule picks the SM90 BF16 kernel's schedule ("cooperative" or "pingpong"); None keeps the default.
     """
     validate_glu_layout(glu_layout)
-    mma_tiler_mn = _default_mma_tiler(mma_tiler_mn, kernel_schedule, generate_c)
+    mma_tiler_mn = _default_mma_tiler(mma_tiler_mn)
     if glu_layout != "interleaved_32" and detect_framework(a_tensor) != "torch":
         raise NotImplementedError("gate_then_up GLU currently supports torch inputs only")
     if glu_layout == "gate_then_up":
@@ -1357,8 +1347,6 @@ def grouped_gemm_glu_wrapper_sm100(
 
         if get_device_type() == "hopper":
             raise NotImplementedError("SM90 grouped GEMM GLU supports torch tensors only")
-        if kernel_schedule is not None:
-            raise ValueError("kernel_schedule selects an SM90 BF16 schedule; leave it None for JAX inputs")
         check_jax_wrapper_options(
             acc_dtype=acc_dtype,
             cd_major=cd_major,
@@ -1428,7 +1416,7 @@ def grouped_gemm_glu_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         sf_vec_size,
         sf_fp8_dtype_override,
@@ -1445,7 +1433,7 @@ def grouped_gemm_glu_wrapper_sm100(
         use_single_group_runtime_offsets,
         generate_c,
         glu_layout,
-        kernel_schedule,
+        sm90_forced_schedule(),
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
         os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
     )
@@ -1551,7 +1539,6 @@ def grouped_gemm_glu_wrapper_sm100(
         use_single_group_runtime_offsets=use_single_group_runtime_offsets,
         current_stream=current_stream,
         generate_c=generate_c,
-        kernel_schedule=kernel_schedule,
     )
     framework = detect_framework(a_tensor)
     if framework not in ("torch", "jax"):
@@ -1569,8 +1556,6 @@ def grouped_gemm_glu_wrapper_sm100(
     )
     if backend is GroupedGemmBackend.BF16:
         return _grouped_gemm_glu_bf16_call(call, memo_key)
-    if kernel_schedule is not None:
-        raise ValueError("kernel_schedule selects an SM90 BF16 schedule; leave it None for block-scaled GLU")
     if framework == "jax":
         raise ValueError(_JAX_BLOCK_SCALED_ERROR)
     return _grouped_gemm_glu_block_scaled_call(call, memo_key)

@@ -122,16 +122,14 @@ registers). The `_sm100` suffix is historical; no new names are added. Limits:
 - `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
 - Torch tensors only (no JAX entry); block-scaled inputs are SM100 only.
 - Always the dynamic scheduler: `use_dynamic_sched` is accepted and ignored.
-- `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
-  `(256, 256)` on SM100. An explicit SM90 tile has M in `{64, 128}` and N a
-  multiple of 64 up to 256. `cluster_shape_mn=None` selects `(2, 1)`; an
+- The SM90 kernel picks its warp-group schedule from the problem shape, and
+  `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
+  or for short K (`K <= 2048`, pre-activation `N >= 2048`) `(128, 192)`, or
+  `(128, 128)` with `generate_c=True`. SM100 uses `(256, 256)`.
+  An explicit SM90 tile has M in `{64, 128}` and N a multiple of 64 up to 256.
+  `cluster_shape_mn=None` selects `(2, 1)`; an
   explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile
   (`tile_m * cluster_m`) that divides 256.
-- `kernel_schedule="pingpong"` selects the pingpong warp-group schedule, as
-  in [grouped GEMM](grouped_gemm.md#sm90-hopper). With `generate_c=True` the
-  tile needs `M * N <= 128 * 128`, and the default tile is `(128, 128)`.
-  Without C it needs `M * N <= 128 * 192`, and the default is `(128, 192)`.
-  `None` keeps the cooperative default. Block-scaled and JAX calls need `None`.
 
 ## Block-scaled contract
 

@@ -122,7 +122,7 @@ def test_sm90_golden(direction):
 @pytest.mark.parametrize("tile,cluster", [(None, None), ((128, 128), (1, 2))], ids=["default", "128x128-c12"])
 def test_sm90_pingpong_replay_fresh_buffers_with_concurrent_work(direction, tile, cluster):
     # The claim order moves tiles between CTAs and so between the two warp groups; the bytes must not move.
-    kwargs = dict(mma_tiler_mn=tile, cluster_shape_mn=cluster, kernel_schedule="pingpong")
+    kwargs = dict(mma_tiler_mn=tile, cluster_shape_mn=cluster, schedule="pingpong")
     problem = make_problem((1024, 0, 768, 256, 2048), n=2304, k=1536, direction=direction, seed=7)
     check(problem, run(problem, **kwargs))
     inputs = lambda: snapshot({"a": problem["a"], "weights": problem["weights"], "prob": problem["prob"]})
@@ -134,9 +134,9 @@ def test_sm90_pingpong_replay_fresh_buffers_with_concurrent_work(direction, tile
 @pytest.mark.parametrize("direction", DIRECTIONS)
 def test_sm90_pingpong_batch_invariance(direction):
     target = (512, 11)
-    expected = snapshot(outputs(segment_problem(direction, [target]), kernel_schedule="pingpong"))
+    expected = snapshot(outputs(segment_problem(direction, [target]), schedule="pingpong"))
     for name, segments in (("packed", [(768, 3), target, (256, 5), (1280, 9)]), ("duplicated", [target, (256, 5), target])):
-        result = snapshot(outputs(segment_problem(direction, segments), kernel_schedule="pingpong"))
+        result = snapshot(outputs(segment_problem(direction, segments), schedule="pingpong"))
         for index, segment in enumerate(segments):
             if segment == target:
                 assert_bitwise(rows_of(result, segments, index), expected, f"{name} segment {index}")
@@ -145,7 +145,7 @@ def test_sm90_pingpong_batch_invariance(direction):
 @pytest.mark.parametrize("direction", DIRECTIONS)
 def test_sm90_pingpong_golden(direction):
     problem = make_problem((256, 0, 512), n=384, k=320, direction=direction, seed=21)
-    result = assert_replays(lambda: outputs(problem, kernel_schedule="pingpong"), repeats=2)
+    result = assert_replays(lambda: outputs(problem, schedule="pingpong"), repeats=2)
     check(problem, {"c_tensor": result["c"], "d_tensor": result["d"]})
     inputs = {"a": problem["a"], "weights": problem["weights"], "offsets": problem["offsets"], "alpha": problem["alpha"], "prob": problem["prob"]}
     assert_golden(f"grouped_gemm_sm90_bf16_{direction}_pingpong", inputs, result)

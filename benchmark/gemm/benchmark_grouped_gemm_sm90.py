@@ -13,7 +13,7 @@ rep, each rep behind an L2 flush.
 
   python benchmark/gemm/benchmark_grouped_gemm_sm90.py --list-items
   python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --ep 8 --out perf.json
-  python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --kernel-schedule pingpong --tile 128,192 --cluster 2,1
+  python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --schedules cooperative,pingpong --tile 128,192
 """
 
 from __future__ import annotations
@@ -56,7 +56,15 @@ def item_problem(item: str, ep: int, tokens: int):
     rows = -(-tokens * shape["top_k"] // experts)
     count = -(-rows // 256) * 256
     return dict(
-        model=model, op=op, experts=experts, n=n, k=k, rows_per_expert=rows, count=count, m=count * experts, b_major="n" if op in ("fc1_dgrad", "fc2_dgrad", "fc2_dglu") else "k"
+        model=model,
+        op=op,
+        experts=experts,
+        n=n,
+        k=k,
+        rows_per_expert=rows,
+        count=count,
+        m=count * experts,
+        b_major="n" if op in ("fc1_dgrad", "fc2_dgrad", "fc2_dglu") else "k",
     )
 
 
@@ -98,8 +106,22 @@ def torch_dswiglu(g, c, prob):
     return torch.stack((d1.view(m, n // BLOCK, BLOCK), d2.view(m, n // BLOCK, BLOCK)), dim=2).reshape(m, 2 * n).to(torch.bfloat16)
 
 
-def backends(p, t, names, config=None):
-    """``config``: kernel_schedule / mma_tiler_mn / cluster_shape_mn for the GEMM and GLU ops (None keeps the defaults)."""
+def forced_schedule(fn, schedule):
+    """``fn`` under a forced SM90 schedule (a test / benchmark hook; the library picks it by shape otherwise)."""
+    import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
+
+    def run():
+        saved, sm90._FORCE_SCHEDULE = sm90._FORCE_SCHEDULE, schedule
+        try:
+            return fn()
+        finally:
+            sm90._FORCE_SCHEDULE = saved
+
+    return run
+
+
+def backends(p, t, names, config=None, schedules=(None,)):
+    """``config``: mma_tiler_mn / cluster_shape_mn for the GEMM and GLU ops; one cudnn arm per schedule (None: the heuristic's)."""
     import cudnn
 
     config = config or {}
@@ -153,14 +175,12 @@ def backends(p, t, names, config=None):
     b_kn = t["b"].transpose(1, 2) if p["b_major"] == "k" else t["b"]
     grouped_mm = lambda: torch._grouped_mm(t["a"], b_kn, offs=t["offsets"], out_dtype=torch.bfloat16)
     if p["op"] == "fc1_glu":
-        runs = {"cudnn_sm90": ours_glu}
-        reference = lambda: torch_swiglu(grouped_mm(), t["prob"])
+        fn, reference = ours_glu, lambda: torch_swiglu(grouped_mm(), t["prob"])
     elif p["op"] == "fc2_dglu":
-        runs = {"cudnn_sm90": ours_dglu}
-        reference = lambda: torch_dswiglu(grouped_mm(), t["c"], t["prob"])
+        fn, reference = ours_dglu, lambda: torch_dswiglu(grouped_mm(), t["c"], t["prob"])
     else:
-        runs = {"cudnn_sm90": ours}
-        reference = grouped_mm
+        fn, reference = ours, grouped_mm
+    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): forced_schedule(fn, s) for s in schedules}
     if "torch_grouped_mm" in names:
         runs["torch_grouped_mm"] = reference
     return runs
@@ -202,7 +222,7 @@ def main(argv=None):
     parser.add_argument("--l2-flush", type=float, default=2.0, help="flush buffer size in multiples of L2")
     parser.add_argument("--out", default=None)
     pair = lambda text: tuple(int(v) for v in text.split(","))
-    parser.add_argument("--kernel-schedule", choices=("cooperative", "pingpong"), default=None, help="SM90 schedule (GEMM and GLU ops)")
+    parser.add_argument("--schedules", default=None, help="comma list of forced SM90 schedules (cooperative, pingpong), one arm each; default: the heuristic's")
     parser.add_argument("--tile", type=pair, default=None, help="mma_tiler_mn as M,N (GEMM and GLU ops)")
     parser.add_argument("--cluster", type=pair, default=None, help="cluster_shape_mn as M,N (GEMM and GLU ops)")
     args = parser.parse_args(argv)
@@ -216,16 +236,18 @@ def main(argv=None):
 
     p = item_problem(args.item, args.ep, args.tokens)
     t = make_tensors(p)
-    names = {"kernel_schedule": args.kernel_schedule, "mma_tiler_mn": args.tile, "cluster_shape_mn": args.cluster}
+    names = {"mma_tiler_mn": args.tile, "cluster_shape_mn": args.cluster}
     config = {key: value for key, value in names.items() if value is not None}
-    if config and p["op"] == "fc2_dglu":
-        parser.error("--kernel-schedule / --tile / --cluster apply to the GEMM and GLU ops, not fc2_dglu")
-    runs = backends(p, t, set(filter(None, args.baselines.split(","))), config)
+    schedules = tuple(args.schedules.split(",")) if args.schedules else (None,)
+    if (config or args.schedules) and p["op"] == "fc2_dglu":
+        parser.error("--schedules / --tile / --cluster apply to the GEMM and GLU ops, not fc2_dglu")
+    runs = backends(p, t, set(filter(None, args.baselines.split(","))), config, schedules)
+    ours_name = next(iter(runs))
     outputs = {name: fn().float().view(p["m"], -1) for name, fn in runs.items()}
     torch.cuda.synchronize()
     check = {}
     if "torch_grouped_mm" in outputs:
-        diff = (outputs["cudnn_sm90"] - outputs["torch_grouped_mm"]).abs().max().item()
+        diff = max((outputs[name] - outputs["torch_grouped_mm"]).abs().max().item() for name in runs if name.startswith("cudnn_sm90"))
         check = dict(max_abs_diff_vs_torch=diff, scale=outputs["torch_grouped_mm"].abs().max().item())
     timing = time_item(runs, args.runs, args.warmup, args.reps, args.l2_flush)
     flops = 2.0 * p["m"] * p["n"] * p["k"]
@@ -242,9 +264,10 @@ def main(argv=None):
         torch=torch.__version__,
         args=dict(runs=args.runs, warmup=args.warmup, reps=args.reps, l2_flush=args.l2_flush),
         config={key: list(value) if isinstance(value, tuple) else value for key, value in config.items()},
+        schedules=list(schedules),
     )
     if "torch_grouped_mm" in timing:
-        record["speedup_vs_torch"] = timing["torch_grouped_mm"]["us_median"] / timing["cudnn_sm90"]["us_median"]
+        record["speedup_vs_torch"] = timing["torch_grouped_mm"]["us_median"] / timing[ours_name]["us_median"]
     text = json.dumps(record, indent=2)
     print(text)
     if args.out:

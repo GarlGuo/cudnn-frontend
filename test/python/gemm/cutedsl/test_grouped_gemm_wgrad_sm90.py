@@ -9,6 +9,7 @@ import pytest
 import torch
 import cudnn
 
+from gemm.cutedsl.test_grouped_gemm_sm90 import forced_schedule
 from gemm.cutedsl.test_grouped_gemm_wgrad_bf16_utils import (
     assert_grouped_gemm_wgrad_close,
     grouped_gemm_wgrad_bf16_reference,
@@ -24,7 +25,8 @@ def require_sm90():
         pytest.skip("The SM90 grouped GEMM wgrad needs a cc 9.0 device")
 
 
-def run_wrapper(problem, **overrides):
+def run_wrapper(problem, schedule=None, **overrides):
+    """``schedule`` forces the SM90 schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
     kwargs = dict(
         a_tensor=problem["a"],
         b_tensor=problem["b"],
@@ -36,7 +38,8 @@ def run_wrapper(problem, **overrides):
         wgrad_dtype=problem["output_dtype"],
     )
     kwargs.update(overrides)
-    return cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs)["wgrad_tensor"]
+    with forced_schedule(schedule):
+        return cudnn.grouped_gemm_wgrad_wrapper_sm100(**kwargs)["wgrad_tensor"]
 
 
 # id: (group_k_list, m, n, a_major, b_major, wgrad dtype, mma_tiler_mn, cluster_shape_mn); None takes the SM90 default.
@@ -106,7 +109,7 @@ def test_sm90_wgrad_pingpong_one_cluster(monkeypatch, tile_n, cluster):
     monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", one_cluster_margin(cluster))
     m = 640 if cluster == (2, 1) else 384
     problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=PINGPONG_GROUPS, m=m, n=tile_n, a_major="m", b_major="n", initial_value=3.0)
-    actual = run_wrapper(problem, mma_tiler_mn=(128, tile_n), cluster_shape_mn=cluster, kernel_schedule="pingpong")
+    actual = run_wrapper(problem, mma_tiler_mn=(128, tile_n), cluster_shape_mn=cluster, schedule="pingpong")
     torch.cuda.synchronize()
     assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
 
@@ -127,7 +130,7 @@ def test_sm90_wgrad_pingpong_matches_reference(monkeypatch, case):
     if one_cluster:
         monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", one_cluster_margin(cluster or (2, 1)))
     problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=group_k_list, m=m, n=n, a_major=a_major, b_major=b_major, output_dtype=dtype, initial_value=3.0)
-    actual = run_wrapper(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster, kernel_schedule="pingpong")
+    actual = run_wrapper(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster, schedule="pingpong")
     torch.cuda.synchronize()
     assert_grouped_gemm_wgrad_close(actual, grouped_gemm_wgrad_bf16_reference(problem))
 
@@ -140,10 +143,10 @@ def test_sm90_wgrad_pingpong_matches_reference(monkeypatch, case):
         (dict(input_order="tensor_ragged"), NotImplementedError, "Tensor2D"),
         (dict(mma_tiler_mn=(256, 128)), ValueError, "Unsupported BF16 grouped GEMM wgrad configuration"),
         (dict(cluster_shape_mn=(4, 4)), ValueError, "Unsupported BF16 grouped GEMM wgrad configuration"),
-        (dict(kernel_schedule="pingpong", mma_tiler_mn=(128, 256)), ValueError, "kernel_schedule"),
-        (dict(kernel_schedule="pingpong", mma_tiler_mn=(64, 128)), ValueError, "kernel_schedule"),
-        (dict(kernel_schedule="pingpong", mma_tiler_mn=(128, 224)), ValueError, "kernel_schedule"),
-        (dict(kernel_schedule="stream-k"), ValueError, "kernel_schedule must be"),
+        (dict(schedule="pingpong", mma_tiler_mn=(128, 256)), ValueError, "SM90 schedule"),
+        (dict(schedule="pingpong", mma_tiler_mn=(64, 128)), ValueError, "SM90 schedule"),
+        (dict(schedule="pingpong", mma_tiler_mn=(128, 224)), ValueError, "SM90 schedule"),
+        (dict(schedule="stream-k"), ValueError, "forced SM90 schedule must be"),
     ],
     ids=["accumulate", "discrete", "ragged", "tile-m-256", "cluster-16", "pingpong-128x256", "pingpong-64x128", "pingpong-128x224", "schedule-name"],
 )

@@ -286,19 +286,12 @@ above with these limits:
 - `accumulate_on_output=True` raises `NotImplementedError`.
 - Block-scaled (FP8/FP4) inputs are not supported on SM90.
 - Torch tensors only (no JAX entry).
-- `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
-  `(256, 256)` on SM100. An explicit SM90 tile has M in `{64, 128}` and N a
-  multiple of 32 up to 256. `cluster_shape_mn=None` selects `(2, 1)`; an
+- The SM90 kernel picks its warp-group schedule from the problem shape, and
+  `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 192)`
+  for output `N >= 2048`, else `(128, 256)`. SM100 uses `(256, 256)`.
+  An explicit SM90 tile has M in `{64, 128}` and N a multiple of 32 up to 256.
+  `cluster_shape_mn=None` selects `(2, 1)`; an
   explicit cluster has power-of-two sides and at most 8 CTAs.
-- `kernel_schedule` (keyword-only, experimental) picks the SM90 warp-group
-  schedule. `None` (the default) and `"cooperative"` run today's kernel, where
-  the MMA warp groups share each tile. `"pingpong"` gives each of two MMA warp
-  groups whole tiles in turn, so one group's epilogue overlaps the other's
-  mainloop. Pingpong takes tiles `(128, 128)`, `(128, 160)` and `(128, 192)`;
-  with `mma_tiler_mn=None` it selects `(128, 192)`. Each output element is
-  reduced in the same order under both schedules, so at one tile they give
-  the same bytes. Any value other than `None` raises `ValueError` on SM100+
-  and for block-scaled inputs.
 
 Each output tile is computed by one CTA over the expert's whole token range
 (no split-K), so the result does not depend on the claim order.

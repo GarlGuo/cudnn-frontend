@@ -55,8 +55,10 @@ def make_tensors(p, seed=0):
     return dict(a=grad.t(), b=act, offsets=offsets, out=out)
 
 
-def backends(p, t, names):
+def backends(p, t, names, schedules=(None,)):
+    """One cudnn arm per forced SM90 schedule (None: the heuristic's)."""
     import cudnn
+    from benchmark_grouped_gemm_sm90 import forced_schedule
 
     def ours():
         return cudnn.grouped_gemm_wgrad_wrapper_sm100(
@@ -70,7 +72,7 @@ def backends(p, t, names):
             wgrad_dtype=torch.bfloat16,
         )["wgrad_tensor"]
 
-    runs = {"cudnn_sm90": ours}
+    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): forced_schedule(ours, s) for s in schedules}
     if "torch_grouped_mm" in names:
         # 2D x 2D grouped mm: offs splits the shared K (tokens) per expert.
         runs["torch_grouped_mm"] = lambda: torch._grouped_mm(t["a"], t["b"], offs=t["offsets"], out_dtype=torch.bfloat16)
@@ -112,6 +114,7 @@ def main(argv=None):
     parser.add_argument("--reps", type=int, default=100)
     parser.add_argument("--l2-flush", type=float, default=2.0, help="flush buffer size in multiples of L2")
     parser.add_argument("--out", default=None)
+    parser.add_argument("--schedules", default=None, help="comma list of forced SM90 schedules (cooperative, pingpong), one arm each; default: the heuristic's")
     args = parser.parse_args(argv)
     if args.list_items:
         print("\n".join(ITEMS))
@@ -123,12 +126,14 @@ def main(argv=None):
 
     p = item_problem(args.item, args.ep, args.tokens)
     t = make_tensors(p)
-    runs = backends(p, t, set(filter(None, args.baselines.split(","))))
+    schedules = tuple(args.schedules.split(",")) if args.schedules else (None,)
+    runs = backends(p, t, set(filter(None, args.baselines.split(","))), schedules)
+    ours_name = next(iter(runs))
     outputs = {name: fn().float() for name, fn in runs.items()}
     torch.cuda.synchronize()
     check = {}
     if "torch_grouped_mm" in outputs:
-        diff = (outputs["cudnn_sm90"] - outputs["torch_grouped_mm"]).abs().max().item()
+        diff = max((outputs[name] - outputs["torch_grouped_mm"]).abs().max().item() for name in runs if name.startswith("cudnn_sm90"))
         check = dict(max_abs_diff_vs_torch=diff, scale=outputs["torch_grouped_mm"].abs().max().item())
     timing = time_item(runs, args.runs, args.warmup, args.reps, args.l2_flush)
     flops = 2.0 * p["m"] * p["n"] * p["k"]
@@ -146,7 +151,7 @@ def main(argv=None):
         args=dict(runs=args.runs, warmup=args.warmup, reps=args.reps, l2_flush=args.l2_flush),
     )
     if "torch_grouped_mm" in timing:
-        record["speedup_vs_torch"] = timing["torch_grouped_mm"]["us_median"] / timing["cudnn_sm90"]["us_median"]
+        record["speedup_vs_torch"] = timing["torch_grouped_mm"]["us_median"] / timing[ours_name]["us_median"]
     text = json.dumps(record, indent=2)
     print(text)
     if args.out:

@@ -134,22 +134,22 @@ def test_sm90_glu_golden(op):
 
 def test_sm90_glu_pingpong_replay_fresh_buffers_with_concurrent_work():
     problem = make_problem((1024, 0, 768, 256, 2048), n=2304, k=1536, seed=7)
-    check("glu", problem, kernel_schedule="pingpong")
-    assert_replays(lambda: outputs("glu", problem, kernel_schedule="pingpong"), repeats=8)
+    check("glu", problem, schedule="pingpong")
+    assert_replays(lambda: outputs("glu", problem, schedule="pingpong"), repeats=8)
 
 
 def test_sm90_glu_pingpong_batch_invariance():
     target = (512, 11)
-    expected = snapshot(outputs("glu", segment_problem([target]), kernel_schedule="pingpong"))
+    expected = snapshot(outputs("glu", segment_problem([target]), schedule="pingpong"))
     segments = [(768, 3), target, (256, 5), target]
-    result = snapshot(outputs("glu", segment_problem(segments), kernel_schedule="pingpong"))
+    result = snapshot(outputs("glu", segment_problem(segments), schedule="pingpong"))
     for index in (1, 3):
         assert_bitwise(rows_of(result, segments, index), expected, f"packed segment {index}")
 
 
 def test_sm90_glu_pingpong_golden():
     problem = make_problem((256, 0, 512), n=384, k=320, seed=21)
-    result = assert_replays(lambda: outputs("glu", problem, kernel_schedule="pingpong"), repeats=2)
-    check("glu", problem, kernel_schedule="pingpong")
+    result = assert_replays(lambda: outputs("glu", problem, schedule="pingpong"), repeats=2)
+    check("glu", problem, schedule="pingpong")
     inputs = {name: problem[name] for name in ("a", "weights", "offsets", "alpha", "prob")}
     assert_golden("grouped_gemm_glu_sm90_bf16_pingpong", inputs, result)

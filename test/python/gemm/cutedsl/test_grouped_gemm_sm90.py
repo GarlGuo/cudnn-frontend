@@ -6,10 +6,24 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 import torch
 
 pytestmark = pytest.mark.L0
+
+
+@contextlib.contextmanager
+def forced_schedule(schedule):
+    """Force the SM90 BF16 grouped GEMMs' warp-group schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
+    import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
+
+    saved, sm90._FORCE_SCHEDULE = sm90._FORCE_SCHEDULE, schedule
+    try:
+        yield
+    finally:
+        sm90._FORCE_SCHEDULE = saved
 
 
 @pytest.fixture(autouse=True)
@@ -45,21 +59,23 @@ def reference(problem):
     return c, c * problem["prob"][:, None]
 
 
-def run(problem, **kwargs):
+def run(problem, schedule=None, **kwargs):
+    """``schedule`` forces the SM90 schedule ("cooperative" / "pingpong"); None keeps the heuristic."""
     import cudnn
 
-    return cudnn.grouped_gemm_wrapper_sm100(
-        a_tensor=problem["a"],
-        padded_offsets=problem["offsets"],
-        alpha_tensor=problem["alpha"],
-        b_tensor=problem["weights"],
-        b_major="k" if problem["direction"] == "fwd" else "n",
-        prob_tensor=problem["prob"],
-        c_dtype=problem["out_dtype"],
-        d_dtype=problem["out_dtype"],
-        generate_c=True,
-        **kwargs,
-    )
+    with forced_schedule(schedule):
+        return cudnn.grouped_gemm_wrapper_sm100(
+            a_tensor=problem["a"],
+            padded_offsets=problem["offsets"],
+            alpha_tensor=problem["alpha"],
+            b_tensor=problem["weights"],
+            b_major="k" if problem["direction"] == "fwd" else "n",
+            prob_tensor=problem["prob"],
+            c_dtype=problem["out_dtype"],
+            d_dtype=problem["out_dtype"],
+            generate_c=True,
+            **kwargs,
+        )
 
 
 def check(problem, result):
@@ -189,7 +205,7 @@ def single_cluster(monkeypatch, cluster):
 def test_sm90_pingpong_tiles(direction, tile, cluster):
     # Ragged experts with empty ones and enough tiles that CTAs run several, in odd and even counts.
     problem = make_problem((512, 0, 1280, 256, 0, 768, 1024), n=1536, k=320, direction=direction, seed=31)
-    check(problem, run(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster, kernel_schedule="pingpong"))
+    check(problem, run(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster, schedule="pingpong"))
 
 
 @pytest.mark.parametrize("direction", ["fwd", "dgrad"])
@@ -202,15 +218,15 @@ def test_sm90_pingpong_one_cluster_parity(monkeypatch, direction, counts, n):
     # One (2, 1) cluster of 128x192 tiles: per CTA 1, 15, 12 and 15 tiles; warp group 1 skips the odd tiles' A/B stages.
     single_cluster(monkeypatch, (2, 1))
     problem = make_problem(counts, n=n, k=576, direction=direction, seed=len(counts) + n)
-    check(problem, run(problem, mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1), kernel_schedule="pingpong"))
+    check(problem, run(problem, mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1), schedule="pingpong"))
 
 
 @pytest.mark.parametrize("direction", ["fwd", "dgrad"])
 def test_sm90_pingpong_matches_cooperative(direction):
     # A 128x128 tile is one warp group's in both schedules: the same WGMMAs per tile, so the same bytes.
     problem = make_problem((768, 0, 256, 1280), n=1408, k=704, direction=direction, seed=37)
-    cooperative = run(problem, mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), kernel_schedule="cooperative")
-    pingpong = run(problem, mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), kernel_schedule="pingpong")
+    cooperative = run(problem, mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), schedule="cooperative")
+    pingpong = run(problem, mma_tiler_mn=(128, 128), cluster_shape_mn=(2, 1), schedule="pingpong")
     check(problem, pingpong)
     for name in ("c_tensor", "d_tensor"):
         assert torch.equal(pingpong[name], cooperative[name]), name
@@ -220,25 +236,25 @@ def test_sm90_pingpong_fp16_genc_and_legacy_layout():
     import cudnn
 
     problem = make_problem((256, 0, 512), n=640, k=256, out_dtype=torch.float16, seed=41)
-    result = run(problem, kernel_schedule="pingpong")
+    result = run(problem, schedule="pingpong")
     check(problem, result)
     m, k = problem["a"].shape
-    legacy = cudnn.grouped_gemm_wrapper_sm100(
-        a_tensor=problem["a"].as_strided((m, k, 1), (k, 1, m * k)),
-        padded_offsets=problem["offsets"],
-        alpha_tensor=problem["alpha"],
-        b_tensor=problem["weights"].permute(1, 2, 0),
-        prob_tensor=problem["prob"].view(m, 1, 1),
-        c_dtype=torch.float16,
-        d_dtype=torch.float16,
-        kernel_schedule="pingpong",
-    )
+    with forced_schedule("pingpong"):
+        legacy = cudnn.grouped_gemm_wrapper_sm100(
+            a_tensor=problem["a"].as_strided((m, k, 1), (k, 1, m * k)),
+            padded_offsets=problem["offsets"],
+            alpha_tensor=problem["alpha"],
+            b_tensor=problem["weights"].permute(1, 2, 0),
+            prob_tensor=problem["prob"].view(m, 1, 1),
+            c_dtype=torch.float16,
+            d_dtype=torch.float16,
+        )
     assert torch.equal(legacy["d_tensor"].view(m, -1), result["d_tensor"])
 
 
 def test_sm90_pingpong_all_empty():
     problem = make_problem((0, 0, 0), n=256, k=256)
-    result = run(problem, kernel_schedule="pingpong")
+    result = run(problem, schedule="pingpong")
     torch.cuda.synchronize()
     assert result["d_tensor"].shape == (256, 256)
 
@@ -246,11 +262,11 @@ def test_sm90_pingpong_all_empty():
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        (dict(mma_tiler_mn=(128, 256), kernel_schedule="pingpong"), "pingpong"),
-        (dict(mma_tiler_mn=(128, 224), kernel_schedule="pingpong"), "pingpong"),
-        (dict(mma_tiler_mn=(192, 128), kernel_schedule="pingpong"), "tile"),
-        (dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(4, 1), kernel_schedule="pingpong"), "tile"),
-        (dict(kernel_schedule="stream_k"), "kernel_schedule"),
+        (dict(mma_tiler_mn=(128, 256), schedule="pingpong"), "pingpong"),
+        (dict(mma_tiler_mn=(128, 224), schedule="pingpong"), "pingpong"),
+        (dict(mma_tiler_mn=(192, 128), schedule="pingpong"), "tile"),
+        (dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(4, 1), schedule="pingpong"), "tile"),
+        (dict(schedule="stream_k"), "forced SM90 schedule"),
     ],
     ids=["128x256", "128x224", "192-row", "cluster-m-over-pad", "unknown-schedule"],
 )
@@ -259,3 +275,36 @@ def test_sm90_pingpong_rejects(kwargs, match):
     problem = make_problem((256, 256), n=256, k=256)
     with pytest.raises(ValueError, match=match):
         run(problem, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "n,k,tile,glu_c,expected",
+    [
+        (2048, 1024, None, False, (True, (128, 192))),
+        (2048, 2048, None, True, (True, (128, 128))),
+        (4096, 4096, None, False, (False, (128, 256))),
+        (1024, 1024, None, False, (False, (128, 256))),
+        (2048, 1024, (128, 256), False, (False, (128, 256))),
+    ],
+    ids=["N2048-K1024", "glu-c-N2048-K2048", "N4096-K4096", "N1024-K1024", "explicit-128x256"],
+)
+def test_sm90_schedule_heuristic(n, k, tile, glu_c, expected):
+    # Pingpong for K <= 2048 and N >= 2048 (the GLU's N is the pre-activation 2I) where the tile allows it.
+    from cudnn.gemm.cutedsl.grouped.glu._bf16_api import GroupedGemmGluBf16API
+    from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import GroupedGemmBf16API
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad_sm90 import sm90_wgrad_schedule_is_pingpong
+
+    m, dev = 256, "cuda"
+    a = torch.zeros((m, k), dtype=torch.bfloat16, device=dev)
+    b = torch.zeros((1, n, k), dtype=torch.bfloat16, device=dev)
+    c = torch.zeros((m, n), dtype=torch.bfloat16, device=dev)
+    d = torch.zeros((m, n // 2 if glu_c else n), dtype=torch.bfloat16, device=dev)
+    common = dict(sample_padded_offsets=torch.full((1,), m, dtype=torch.int32, device=dev), sample_alpha=torch.ones(1, device=dev))
+    common.update(sample_b=b, sample_prob=torch.ones((m,), device=dev), mma_tiler_mn=tile, generate_c=glu_c)
+    api = (GroupedGemmGluBf16API if glu_c else GroupedGemmBf16API)(a, c, d, **common)
+    assert (api._pingpong, api.mma_tiler_mn) == expected
+    # wgrad: pingpong for output N >= 2048 where the tile allows it.
+    assert sm90_wgrad_schedule_is_pingpong(2048, None) and not sm90_wgrad_schedule_is_pingpong(1024, None)
+    assert not sm90_wgrad_schedule_is_pingpong(4096, (128, 256))
+    with forced_schedule("cooperative"):
+        assert not sm90_wgrad_schedule_is_pingpong(4096, None)

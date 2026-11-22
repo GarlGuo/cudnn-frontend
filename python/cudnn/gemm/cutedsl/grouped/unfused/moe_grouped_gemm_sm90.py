@@ -70,15 +70,38 @@ def sm90_default_mma_tiler(pingpong: bool, glu_generate_c: bool = False) -> Tupl
     return (128, 128) if glu_generate_c else (128, 192)
 
 
-def check_kernel_schedule(kernel_schedule: Optional[str], is_sm90: bool, mma_tiler_mn: Tuple[int, int], glu_generate_c: bool = False) -> None:
-    """Validate an API's ``kernel_schedule``: None (the default), or an SM90 schedule on an SM90 device."""
-    if kernel_schedule is None:
-        return
-    if kernel_schedule not in KERNEL_SCHEDULES:
-        raise ValueError(f"kernel_schedule must be None, 'cooperative' or 'pingpong', got {kernel_schedule!r}")
-    if not is_sm90:
-        raise ValueError(f"kernel_schedule={kernel_schedule!r} selects an SM90 (Hopper) schedule; leave it None on other GPUs")
-    error = MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(mma_tiler_mn, glu_generate_c) if kernel_schedule == "pingpong" else None
+# Tests and benchmarks only: "cooperative" or "pingpong" forces every SM90 BF16 grouped GEMM's schedule.
+_FORCE_SCHEDULE: Optional[str] = None
+
+
+def sm90_forced_schedule() -> Optional[str]:
+    """The forced SM90 schedule (None: the heuristic's); wrapper memo and cache keys carry it."""
+    return _FORCE_SCHEDULE
+
+
+def sm90_pick_pingpong(heuristic: bool, tile_allows_pingpong: bool) -> bool:
+    """The SM90 schedule: the forced one if set, else pingpong where the heuristic and the CTA tile allow it."""
+    if _FORCE_SCHEDULE is not None:
+        if _FORCE_SCHEDULE not in KERNEL_SCHEDULES:
+            raise ValueError(f"the forced SM90 schedule must be 'cooperative' or 'pingpong', got {_FORCE_SCHEDULE!r}")
+        return _FORCE_SCHEDULE == "pingpong"
+    return heuristic and tile_allows_pingpong
+
+
+def sm90_pingpong_heuristic(n: int, k: int) -> bool:
+    """fwd / dgrad / GLU (n: the accumulator N, a GLU's 2I): pingpong for K <= 2048 and N >= 2048, from the s6 H100 sweep."""
+    return k <= 2048 and n >= 2048
+
+
+def sm90_schedule_is_pingpong(n: int, k: int, mma_tiler_mn: Optional[Tuple[int, int]], glu_generate_c: bool = False) -> bool:
+    """The fwd / dgrad / GLU schedule for an (n, k) problem and an optional explicit tile."""
+    tile_ok = mma_tiler_mn is None or MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(tuple(mma_tiler_mn), glu_generate_c) is None
+    return sm90_pick_pingpong(sm90_pingpong_heuristic(n, k), tile_ok)
+
+
+def check_pingpong_tile(pingpong: bool, mma_tiler_mn: Tuple[int, int], glu_generate_c: bool = False) -> None:
+    """A forced pingpong schedule with a tile it cannot run raises; the heuristic never picks one."""
+    error = MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(mma_tiler_mn, glu_generate_c) if pingpong else None
     if error is not None:
         raise ValueError(f"SM90 pingpong: {error}, got mma_tiler_mn={tuple(mma_tiler_mn)}")
 

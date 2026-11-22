@@ -12,6 +12,7 @@ import cudnn
 
 from cudnn.gemm.cutedsl.grouped.wgrad import api as wgrad_api
 from determinism_utils import assert_bitwise, assert_golden, assert_replays
+from gemm.cutedsl.test_grouped_gemm_sm90 import forced_schedule
 
 pytestmark = pytest.mark.L0
 
@@ -35,22 +36,23 @@ def expert_slices(group_k_list, seed=7):
     return slices
 
 
-def run(slices, order=None, **schedule):
+def run(slices, order=None, schedule=None, **kwargs):
     """dW for the experts in ``order`` (default all), from row-major dY (tokens, M) and X (tokens, N)."""
     order = list(range(len(slices))) if order is None else order
     dy = torch.cat([slices[e][0].t() for e in order]).contiguous()
     x = torch.cat([slices[e][1] for e in order]).contiguous()
     counts = torch.tensor([slices[e][0].shape[1] for e in order], dtype=torch.int32, device="cuda")
-    out = cudnn.grouped_gemm_wgrad_wrapper_sm100(
-        a_tensor=dy.t(),
-        b_tensor=x,
-        sfa_tensor=None,
-        sfb_tensor=None,
-        offsets_tensor=counts.cumsum(0, dtype=torch.int32),
-        acc_dtype=torch.float32,
-        wgrad_dtype=torch.bfloat16,
-        **schedule,
-    )["wgrad_tensor"]
+    with forced_schedule(schedule):
+        out = cudnn.grouped_gemm_wgrad_wrapper_sm100(
+            a_tensor=dy.t(),
+            b_tensor=x,
+            sfa_tensor=None,
+            sfb_tensor=None,
+            offsets_tensor=counts.cumsum(0, dtype=torch.int32),
+            acc_dtype=torch.float32,
+            wgrad_dtype=torch.bfloat16,
+            **kwargs,
+        )["wgrad_tensor"]
     return {"wgrad": out}
 
 
@@ -103,7 +105,7 @@ def test_sm90_wgrad_golden():
     assert_golden("grouped_gemm_wgrad_sm90_bf16", inputs, run(slices))
 
 
-PINGPONG = dict(kernel_schedule="pingpong")
+PINGPONG = dict(schedule="pingpong")
 
 
 def test_sm90_wgrad_pingpong_replays_bitwise():
@@ -115,7 +117,7 @@ def test_sm90_wgrad_pingpong_replays_bitwise():
 def test_sm90_wgrad_pingpong_matches_cooperative_bytes(tile):
     # Both schedules reduce each output element with the same WGMMA sequence, so at one tile the bytes agree.
     slices = expert_slices(GROUPS)
-    cooperative = run(slices, mma_tiler_mn=tile, kernel_schedule="cooperative")
+    cooperative = run(slices, mma_tiler_mn=tile, schedule="cooperative")
     assert_bitwise(run(slices, mma_tiler_mn=tile, **PINGPONG), cooperative, f"pingpong vs cooperative {tile}")
 
 

@@ -174,19 +174,15 @@ weights (`b_major="n"`), with these limits:
 - `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
 - Torch tensors only (no JAX entry).
 - Always the dynamic scheduler: `use_dynamic_sched` is accepted and ignored.
-- `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
-  `(256, 256)` on SM100. An explicit SM90 tile has M in `{64, 128}` and N a
-  multiple of 32 up to 256. `cluster_shape_mn=None` selects `(2, 1)`; an
+- The SM90 kernel picks its warp-group schedule from the problem shape, and
+  `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
+  or `(128, 192)` for short K (`K <= 2048`, `N >= 2048`). SM100 uses
+  `(256, 256)`.
+  An explicit SM90 tile has M in `{64, 128}` and N a multiple of 32 up to 256.
+  `cluster_shape_mn=None` selects `(2, 1)`; an
   explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile
   (`tile_m * cluster_m`) that divides 256.
 - `vector_f32` is accepted; Hopper has no packed FP32 arithmetic.
-- `kernel_schedule` (SM90 only; other GPUs need `None`) picks the warp-group
-  schedule. `None` (the default) and `"cooperative"` split each tile's M across
-  the two MMA warp groups. `"pingpong"` gives each warp group whole tiles,
-  alternate tiles of the scheduler's sequence, so one warp group's epilogue
-  overlaps the other's mainloop. This helps short-K GEMMs. Pingpong needs tile
-  `M * N <= 128 * 192`, and `mma_tiler_mn=None` then selects `(128, 192)`.
-  The default stays cooperative until H100 measurements choose a heuristic.
 
 ## Scheduling, caching, and errors
 

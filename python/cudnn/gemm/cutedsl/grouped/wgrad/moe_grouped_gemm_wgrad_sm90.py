@@ -44,6 +44,13 @@ from ..moe_persistent_scheduler import (
 )
 from ..moe_utils import MoEWeightMode, TensormapWorkspace, WGradInputOrder
 from ..moe_sched_extension import WgradGemmSchedExtension
+from ..unfused.moe_grouped_gemm_sm90 import sm90_pick_pingpong
+
+
+def sm90_wgrad_schedule_is_pingpong(n: int, mma_tiler_mn: Optional[Tuple[int, int]]) -> bool:
+    """The wgrad schedule: pingpong for output N >= 2048 (s6 H100 sweep) where the tile allows it, or the forced one."""
+    tile_ok = mma_tiler_mn is None or (mma_tiler_mn[0] == 128 and mma_tiler_mn[1] in MoEGroupedGemmWgradBF16KernelSm90.PINGPONG_TILE_N)
+    return sm90_pick_pingpong(n >= 2048, tile_ok)
 
 
 class MoEGroupedGemmWgradBF16KernelSm90:

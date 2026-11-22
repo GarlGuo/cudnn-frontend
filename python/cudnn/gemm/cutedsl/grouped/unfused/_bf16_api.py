@@ -36,7 +36,7 @@ from ..backend_utils import debug_validate_offsets, debug_validate_pointer_value
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm import MoEGroupedGemmBf16Kernel
-from .moe_grouped_gemm_sm90 import MoEGroupedGemmBf16KernelSm90, check_kernel_schedule, sm90_default_mma_tiler
+from .moe_grouped_gemm_sm90 import MoEGroupedGemmBf16KernelSm90, check_pingpong_tile, sm90_default_mma_tiler, sm90_schedule_is_pingpong
 
 
 def _output_dtypes():
@@ -99,7 +99,6 @@ class GroupedGemmBf16API(APIBase):
         generate_c: bool = False,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
-        kernel_schedule: Optional[str] = None,
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -154,8 +153,9 @@ class GroupedGemmBf16API(APIBase):
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: tile M <= 128, a (2, 1) cluster by default and the dynamic scheduler always.
         self._is_sm90 = is_sm90_device()
-        self.kernel_schedule = kernel_schedule
-        self._pingpong = self._is_sm90 and kernel_schedule == "pingpong"
+        # The SM90 schedule comes from the GEMM's (N, K) and the tile; B is (N, K, experts) here.
+        dense_b = self.b_desc is not None and self.b_desc.ndim == 3
+        self._pingpong = self._is_sm90 and dense_b and sm90_schedule_is_pingpong(*self.b_desc.shape[:2], mma_tiler_mn)
         self.mma_tiler_mn = tuple(mma_tiler_mn or (sm90_default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
@@ -294,7 +294,7 @@ class GroupedGemmBf16API(APIBase):
 
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
-        check_kernel_schedule(self.kernel_schedule, self._is_sm90, self.mma_tiler_mn)
+        check_pingpong_tile(self._pingpong, self.mma_tiler_mn)
         if self._is_sm90:
             if self.weight_mode != MoEWeightMode.DENSE:
                 raise NotImplementedError("SM90 grouped GEMM supports dense weights (sample_b) only, not discrete b_ptrs")
