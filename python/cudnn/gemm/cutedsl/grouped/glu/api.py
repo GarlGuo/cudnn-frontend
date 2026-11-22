@@ -1307,7 +1307,7 @@ def grouped_gemm_glu_wrapper_sm100(
     glu_clamp_min: float = -7.0,
     situ_beta1: float = 4.0,
     situ_beta2: float = 25.0,
-    use_dynamic_sched: bool = False,
+    use_dynamic_sched: Optional[bool] = None,
     use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
     generate_c: bool = False,
@@ -1328,6 +1328,7 @@ def grouped_gemm_glu_wrapper_sm100(
     glu_layout selects persistent branch order for B, bias, SFB, and saved C.
     The default interleaved_32 preserves the existing layout. gate_then_up accepts
     contiguous gate and up halves and remaps them inside the SM100/103 kernel.
+    use_dynamic_sched=None selects the dynamic scheduler for BF16 and the static one for block-scaled inputs.
     scheduler_counter_tensor optionally supplies a caller-owned CUDA int32 counter
     for dense dynamic scheduling. Initialize it to zero on the execution stream
     before each call; use distinct counters for overlapping invocations and GEMMs.
@@ -1538,10 +1539,12 @@ def grouped_gemm_glu_wrapper_sm100(
         if bias_tensor is not None:
             raise ValueError(_JAX_BIAS_ERROR)
     call, backend = _normalize_glu_call(call)
+    if call.use_dynamic_sched is None:
+        call = replace(call, use_dynamic_sched=backend is GroupedGemmBackend.BF16)
     validate_scheduler_counter(
         scheduler_counter_tensor,
         a_tensor,
-        backend is GroupedGemmBackend.BLOCK_SCALED and b_tensor is not None and use_dynamic_sched,
+        backend is GroupedGemmBackend.BLOCK_SCALED and b_tensor is not None and call.use_dynamic_sched,
     )
     if backend is GroupedGemmBackend.BF16:
         return _grouped_gemm_glu_bf16_call(call, memo_key)

@@ -322,7 +322,7 @@ def grouped_gemm_wrapper_sm100(
     vector_f32: bool = False,
     m_aligned: int = 256,
     generate_c: bool = False,
-    use_dynamic_sched: bool = False,
+    use_dynamic_sched: bool = True,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> TupleDict:
     # Hot-loop memo. Everything between here and op.execute() is derivation -- resolving

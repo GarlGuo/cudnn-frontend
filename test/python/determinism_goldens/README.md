@@ -4,6 +4,44 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### GB200 SM100 BF16 grouped GEMM determinism, static and dynamic scheduler (2026-11-22)
+
+`grouped_gemm_wrapper_sm100` (forward, dgrad), `grouped_gemm_glu_wrapper_sm100` and
+`grouped_gemm_dglu_wrapper_sm100` with BF16 inputs on SM100, which now default to the dynamic
+scheduler. The four goldens are in `ece09fd8ee066fa8/`.
+
+Runtime: NVIDIA GB200 (SM100, 152 SMs, aarch64 host), PyTorch 2.14.1+cu130, CUDA 13.0, driver
+API 13020, cuDNN 92400 (`nvidia-cudnn-cu13` 9.24.0.43), CuTe DSL 4.8.0, tvm-ffi 0.1.16. The
+frontend Python tree is the commit under test; its compiled core is stubbed, and `backend_version()`
+reports the installed cuDNN through `cudnnGetVersion`. The kernels under test do not use the core.
+
+```
+G=gemm/cutedsl
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=<new directory> pytest -m L0 $G/test_grouped_gemm_bf16_sm100_determinism.py
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS=$PWD/determinism_goldens pytest -m L0 \
+  $G/test_grouped_gemm_bf16_sm100_determinism.py $G/test_grouped_gemm_bf16_overlap.py   # sharded over 4 GPUs
+```
+
+- Recording run: 68 passed, 0 skipped. Check run against the recorded goldens: 69 passed (the
+  added default-scheduler case included), 0 skipped; the overlap suite: 14 passed, its 5 SM90
+  cases skipped.
+- Replays: 8 fresh-buffer launches against concurrent second-stream work for forward, dgrad, GLU
+  and dGLU, static and dynamic, at 256x256 c2x1 (default), 128x256 c1x1, c1x2 and c2x1.
+- Static and dynamic outputs are byte-identical for every op and tile above.
+- Batch invariance covers a segment alone, packed, reordered, duplicated and with changed
+  neighbors, under both schedulers.
+- Warm stress (M = 8 x 512, N = 2048, K = 4096, 152 CTAs, one per SM): 0 wrong of 3000 warm and
+  3000 poisoned launches for each op and scheduler; the unsafe control failed 200 of 200.
+- dGLU's `dprob` is an atomic per-row sum across N tiles and is excluded from the byte checks.
+- `test_grouped_gemm_bf16_overlap.py`: two same-signature wrapper calls on two streams, 40
+  overlapped iterations, bitwise against serial results. At 3efba178 dynamic forward, dgrad and
+  GLU raised an illegal instruction; with only the counter made per call (2d8cf32f), static
+  discrete forward and GLU wrote wrong bytes. With all scratch per call, every case passes.
+- compute-sanitizer 2025.3.1: memcheck reports 0 device errors (20 host `cuGetProcAddress`
+  probes); racecheck reports 0 hazards. synccheck reports a divergent-barrier error in every SM100
+  BF16 kernel (forward, GLU, dGLU), static and dynamic, at 3efba178 as well; it is not scheduler
+  related and is unresolved.
+
 ### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22)
 
 New SM90 (Hopper) kernels behind `grouped_gemm_wrapper_sm100` (forward, dgrad),

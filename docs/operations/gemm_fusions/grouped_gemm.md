@@ -183,10 +183,15 @@ weights (`b_major="n"`), with these limits:
 
 ## Scheduling, caching, and errors
 
-- `use_dynamic_sched=False` uses the static scheduler (SM100; SM90 is always dynamic).
-- `use_dynamic_sched=True` compiles a dynamic-M callable and reuses it for
-  compatible M values; discrete mode also allocates the per-expert tensor-map
-  workspace. Wrapper cache keys retain dtype, layout, expert count, optional
+- The wrapper defaults to `use_dynamic_sched=True`, the dynamic scheduler;
+  `use_dynamic_sched=False` selects the static one (SM100; SM90 is always
+  dynamic). Both reuse one dynamic-M callable for compatible M values; discrete
+  mode also allocates the per-expert tensor-map workspace.
+- Each wrapper call allocates its scheduler counter and discrete-mode tensor
+  maps on the launch stream, so same-signature calls may overlap on different
+  streams. A class-API object keeps one internal workspace; do not overlap its
+  `execute()` calls on different streams.
+- Wrapper cache keys retain dtype, layout, expert count, optional
   features, scheduler choice, output policy, tile/cluster shape, and overlap
   margin.
 - Dense and discrete weight arguments are mutually exclusive. Invalid shapes,

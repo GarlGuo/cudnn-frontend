@@ -1380,7 +1380,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     situ_beta1: float = 4.0,
     situ_beta2: float = 25.0,
     epilogue_op: Optional[str] = None,
-    use_dynamic_sched: bool = False,
+    use_dynamic_sched: Optional[bool] = None,
     use_single_group_runtime_offsets: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
     round_dgrad_to_input_dtype: bool = False,
@@ -1391,7 +1391,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     """Dispatch grouped GEMM dGLU once from an immutable normalized call.
 
     ``deterministic=True`` makes ``dprob`` bit-identical run to run (block-scaled kernel, torch,
-    no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
+    no dbias). ``use_dynamic_sched=None`` selects the dynamic scheduler for BF16, the static one for block-scaled. See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
     ``glu_layout="gate_then_up"`` consumes canonical C and returns canonical
     gate/up halves in D, dbias and both D scale buffers. It is independent of
     the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
@@ -1607,6 +1607,8 @@ def grouped_gemm_dglu_wrapper_sm100(
     if framework == "jax" and b_tensor is not None:
         raise ValueError(_JAX_DENSE_B_ERROR)
     normalized, backend = _normalize_dglu_call(call)
+    if normalized.use_dynamic_sched is None:
+        normalized = replace(normalized, use_dynamic_sched=backend is GroupedGemmBackend.BF16)
     if deterministic and (framework != "torch" or backend is GroupedGemmBackend.BF16):
         raise NotImplementedError("deterministic=True is implemented only for the block-scaled kernel with torch tensors")
     if backend is GroupedGemmBackend.BF16:

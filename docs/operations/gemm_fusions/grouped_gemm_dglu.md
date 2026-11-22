@@ -502,8 +502,9 @@ op.execute(
 )
 ```
 
-`use_dynamic_sched=False` selects static scheduling; `True` caches a dynamic-M
-callable for compatible shapes. Cache keys retain compile-sensitive layouts,
+The wrapper's default `use_dynamic_sched=None` selects the dynamic scheduler for
+BF16 and keeps block-scaled inputs static; `False` selects static scheduling.
+Either caches a dynamic-M callable for compatible shapes. Cache keys retain compile-sensitive layouts,
 dtypes, activation, dbias policy, scheduler, tiles/clusters, features, and
 overlap margin.
 
