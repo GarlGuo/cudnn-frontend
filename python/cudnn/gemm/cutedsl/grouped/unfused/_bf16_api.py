@@ -15,7 +15,7 @@ from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
+from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
@@ -26,6 +26,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -152,7 +153,8 @@ class GroupedGemmBf16API(APIBase):
         self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: tile M <= 128, a (2, 1) cluster by default and the dynamic scheduler always.
-        self._is_sm90 = is_sm90_device()
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        self._is_sm90 = has_wgmma(major)
         # The SM90 schedule comes from the GEMM's (N, K) and the tile; B is (N, K, experts) here.
         dense_b = self.b_desc is not None and self.b_desc.ndim == 3
         self._pingpong = self._is_sm90 and dense_b and sm90_schedule_is_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn=cluster_shape_mn)
@@ -338,7 +340,7 @@ class GroupedGemmBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
-        if not (has_tcgen05(major) or major == 9):
+        if not (has_tcgen05(major) or has_wgmma(major)):
             raise RuntimeError(f"GroupedGemmSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         self._is_supported = True

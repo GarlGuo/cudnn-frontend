@@ -12,6 +12,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from cudnn.tensor_adapter import has_wgmma
+
 from determinism_utils import assert_bitwise, assert_golden, assert_replays, snapshot
 from gemm.cutedsl.test_grouped_gemm_glu_sm90 import check_dglu, check_glu, make_problem, run_dglu, run_glu
 
@@ -22,7 +24,7 @@ OPS = ["glu", "dglu"]
 
 @pytest.fixture(autouse=True)
 def require_sm90():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+    if not torch.cuda.is_available() or not has_wgmma(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM90 is required")
 
 

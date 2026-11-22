@@ -242,7 +242,10 @@ def main(argv=None):
         return 0
     if args.item is None:
         parser.error("--item or --list-items is required")
-    if torch.cuda.get_device_capability() != (9, 0):
+    from cudnn.tensor_adapter import has_wgmma
+
+    major, _ = torch.cuda.get_device_capability()
+    if not has_wgmma(major):
         raise SystemExit(f"SM90 is required, found {torch.cuda.get_device_capability()}")
 
     p = item_problem(args.item, args.ep, args.tokens)

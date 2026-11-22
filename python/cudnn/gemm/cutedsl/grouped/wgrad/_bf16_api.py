@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
+from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
@@ -26,6 +26,7 @@ from cudnn.tensor_adapter import (
     framework_dtype,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -105,7 +106,8 @@ class GroupedGemmWgradBf16API(APIBase):
 
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: tile M <= 128 and a (2, 1) cluster by default.
-        self._is_sm90 = is_sm90_device()
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        self._is_sm90 = has_wgmma(major)
         # The SM90 schedule comes from the output N (wgrad_shape is (M, N)) and the tile.
         self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and sm90_wgrad_schedule_is_pingpong(self.wgrad_shape[1], mma_tiler_mn, cluster_shape_mn)
         default_tile = ((128, 192) if self.pingpong else (128, 256)) if self._is_sm90 else (256, 256)
@@ -280,7 +282,7 @@ class GroupedGemmWgradBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         capability = major * 10 + minor
-        if not (has_tcgen05(major) or capability == 90):
+        if not (has_tcgen05(major) or has_wgmma(major)):
             raise RuntimeError(f"GroupedGemmWgradSm100 requires SM90 or SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
         return True

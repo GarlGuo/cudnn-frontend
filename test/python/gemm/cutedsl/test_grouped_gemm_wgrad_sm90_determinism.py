@@ -8,6 +8,8 @@ so neither the counter's claim order nor the other experts may change an expert'
 import cutlass
 import pytest
 import torch
+
+from cudnn.tensor_adapter import has_wgmma
 import cudnn
 
 from cudnn.gemm.cutedsl.grouped.wgrad import api as wgrad_api
@@ -21,7 +23,7 @@ M, N = 512, 384
 
 @pytest.fixture(autouse=True)
 def require_sm90():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+    if not torch.cuda.is_available() or not has_wgmma(torch.cuda.get_device_capability()[0]):
         pytest.skip("The SM90 grouped GEMM wgrad needs a cc 9.0 device")
 
 

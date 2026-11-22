@@ -19,7 +19,7 @@ from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import make_fake_stream, make_ptr
 
-from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
+from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.frost import buffers
@@ -33,6 +33,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -164,7 +165,8 @@ class GroupedGemmDgluBf16API(APIBase):
         self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: a (128, 256) tile, a (2, 1) cluster by default and the dynamic scheduler always.
-        self._is_sm90 = is_sm90_device()
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        self._is_sm90 = has_wgmma(major)
         self.mma_tiler_mn = tuple(mma_tiler_mn or ((128, 256) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
@@ -402,7 +404,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 raise NotImplementedError("gate_then_up BF16 dGLU requires dswiglu with BF16 C/D")
             if self.c_desc.shape[1] % 256 != 0:
                 raise ValueError("gate_then_up BF16 dGLU requires each gate/up branch N divisible by 128")
-        if not (has_tcgen05(major) or capability == 90):
+        if not (has_tcgen05(major) or has_wgmma(major)):
             raise RuntimeError(f"GroupedGemmDgluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
         return True

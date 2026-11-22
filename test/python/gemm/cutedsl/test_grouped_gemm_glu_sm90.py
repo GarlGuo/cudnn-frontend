@@ -9,6 +9,8 @@ from __future__ import annotations
 import pytest
 import torch
 
+from cudnn.tensor_adapter import has_wgmma
+
 from gemm.cutedsl.test_grouped_gemm_sm90 import forced_schedule
 
 pytestmark = pytest.mark.L0
@@ -18,7 +20,7 @@ BLOCK = 32  # interleaved_32: accumulator column block 2q is gate, block 2q + 1 
 
 @pytest.fixture(autouse=True)
 def require_sm90():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+    if not torch.cuda.is_available() or not has_wgmma(torch.cuda.get_device_capability()[0]):
         pytest.skip("SM90 is required")
 
 

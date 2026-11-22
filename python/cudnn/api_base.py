@@ -82,15 +82,8 @@ def is_sm107_device() -> bool:
     return cuda_is_available() and get_compute_capability() == (10, 7)
 
 
-def is_sm90_device() -> bool:
-    """Return True when the current CUDA device is Hopper (SM90)."""
-    return cuda_is_available() and get_compute_capability() == (9, 0)
-
-
 def get_device_type() -> str:
     """Return the architecture family used by SM100 grouped GEMM wrappers."""
-    if is_sm90_device():
-        return "hopper"
     return "rubin" if is_sm107_device() else "blackwell"
 
 
