@@ -42,6 +42,7 @@ from ..moe_sched_extension import (
     ContiguousGroupedGemmSchedExtension,
 )
 from ..moe_kernel_helpers import (
+    _fold_mma_n,
     can_implement_bf16_grouped_gemm,
     compute_grid,
     epilog_gmem_copy_and_partition,
@@ -106,6 +107,7 @@ class MoEGroupedGemmBf16Kernel:
             fix_pad_size=MoEGroupedGemmBf16Kernel.FIX_PAD_SIZE,
             n_align=32,
             tile_n_align=32,
+            allow_tile_n_512=True,
         )
 
     def __init__(
@@ -194,7 +196,7 @@ class MoEGroupedGemmBf16Kernel:
             self.b_major_mode,
             self.acc_dtype,
             self.cta_group,
-            self.mma_tiler[:2],
+            (self.mma_tiler[0], min(self.mma_tiler[1], 256)),
         )
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
         mma_inst_tile_k = 4
@@ -298,7 +300,7 @@ class MoEGroupedGemmBf16Kernel:
         generate_c,
         bias_dtype,
     ):
-        num_acc_stage = 2
+        num_acc_stage = 1 if mma_tiler_mnk[1] > 256 else 2
         num_c_stage = 1
         num_d_stage = 1
         num_tile_stage = 2
@@ -483,7 +485,7 @@ class MoEGroupedGemmBf16Kernel:
             self.b_major_mode,
             self.acc_dtype,
             self.cta_group,
-            self.mma_tiler[:2],
+            (self.mma_tiler[0], min(self.mma_tiler[1], 256)),
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
@@ -954,6 +956,13 @@ class MoEGroupedGemmBf16Kernel:
                         tBs_sBias[(None, 0, bias_producer_state.index)],
                         pred=bias_pred_tensor,
                     )
+                    for r in cutlass.range_constexpr(1, cute.size(bias_partitioned_by_g2s, mode=[1])):
+                        bias_pred_r = cute.make_rmem_tensor(bias_coord_partitioned_by_g2s[(None, r)].shape, cutlass.Boolean)
+                        for vi in cutlass.range_constexpr(cute.size(bias_pred_r)):
+                            bias_pred_r[vi] = cute.elem_less(bias_coord_partitioned_by_g2s[(vi, r)], (residue_n,))
+                        cute.copy(
+                            bias_g2s_tiled, bias_partitioned_by_g2s[(None, r)], tBs_sBias[(None, r, bias_producer_state.index)], pred=bias_pred_r[((0, None),)]
+                        )
                     bias_pipeline.producer_commit(bias_producer_state)
                     bias_producer_state.advance()
 
@@ -1129,12 +1138,12 @@ class MoEGroupedGemmBf16Kernel:
             tmem.allocate(self.num_tmem_alloc_cols)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            tCtAcc_base = _fold_mma_n(cute.make_tensor(tmem_ptr, tCtAcc_fake.layout))
 
             epi_tidx = tidx
             thr_mma_epi = tiled_mma.get_slice(mma_tile_coord_v)
             gD_mnl_shape = cute.local_tile(mD_mnl, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
-            tCgD_shape = thr_mma_epi.partition_C(gD_mnl_shape)
+            tCgD_shape = _fold_mma_n(thr_mma_epi.partition_C(gD_mnl_shape))
             tiled_copy_t2r, tTR_tAcc_base, tTR_rAcc = self.epilog_tmem_copy_and_partition(
                 epi_tidx,
                 tCtAcc_base,
@@ -1203,7 +1212,7 @@ class MoEGroupedGemmBf16Kernel:
                 thr_mma_epi_loop = tiled_mma.get_slice(mma_tile_coord_v)
 
                 gD_mnl_loop = cute.local_tile(real_d, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
-                tCgD_loop = thr_mma_epi_loop.partition_C(gD_mnl_loop)
+                tCgD_loop = _fold_mma_n(thr_mma_epi_loop.partition_C(gD_mnl_loop))
                 _, bSG_sD, bSG_gD_partitioned = epilog_gmem_copy_and_partition(
                     epi_tidx,
                     tma_atom_d,
@@ -1213,7 +1222,7 @@ class MoEGroupedGemmBf16Kernel:
                 )
 
                 gC_mnl_loop = cute.local_tile(real_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
-                tCgC_loop = thr_mma_epi_loop.partition_C(gC_mnl_loop)
+                tCgC_loop = _fold_mma_n(thr_mma_epi_loop.partition_C(gC_mnl_loop))
                 _, bSG_sC, bSG_gC_partitioned = epilog_gmem_copy_and_partition(
                     epi_tidx,
                     tma_atom_c,

@@ -46,6 +46,7 @@ from ..moe_kernel_helpers import (
     fmax,
     silu_f32,
     silu_f32_geglu_scaled,
+    _fold_mma_n,
     can_implement_bf16_grouped_gemm,
     compute_grid,
     epilog_gmem_copy_and_partition,
@@ -107,6 +108,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             cd_major,
             m_aligned,
             fix_pad_size=MoEGroupedGemmGluBiasBf16Kernel.FIX_PAD_SIZE,
+            allow_tile_n_512=True,
         )
 
     def __init__(
@@ -218,7 +220,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             self.b_major_mode,
             self.acc_dtype,
             self.cta_group,
-            self.mma_tiler[:2],
+            (self.mma_tiler[0], min(self.mma_tiler[1], 256)),
         )
 
         # Compute mma/cluster/tile shapes
@@ -360,7 +362,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
         Stage counts are chosen for the BF16 A/B mainloop and the GLU epilogue
         shared-memory footprint.
         """
-        num_acc_stage = 2
+        num_acc_stage = 1 if mma_tiler_mnk[1] > 256 else 2
         num_c_stage = 1
         num_d_stage = 1
         num_tile_stage = 2
@@ -564,7 +566,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             self.b_major_mode,
             self.acc_dtype,
             self.cta_group,
-            self.mma_tiler[:2],
+            (self.mma_tiler[0], min(self.mma_tiler[1], 256)),
         )
         atom_thr_size = cute.size(tiled_mma.thr_id.shape)
 
@@ -1488,6 +1490,9 @@ class MoEGroupedGemmGluBiasBf16Kernel:
 
                     bias_pipeline.producer_acquire(bias_producer_state)
                     cute.copy(bias_g2s_tiled, tBs_gBias[(None, 0)], tBs_sBias[(None, 0, bias_producer_state.index)], pred=tBpBias)
+                    for r in cutlass.range_constexpr(1, cute.size(tBs_gBias, mode=[1])):
+                        tBpBias[0] = mma_n_coord * self.mma_tiler[1] + (r * self.threads_per_warp + cute.arch.lane_idx()) * bias_elems_per_thread < bias_n_total
+                        cute.copy(bias_g2s_tiled, tBs_gBias[(None, r)], tBs_sBias[(None, r, bias_producer_state.index)], pred=tBpBias)
                     bias_pipeline.producer_commit(bias_producer_state)
                     bias_producer_state.advance()
 
@@ -1521,7 +1526,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
             #
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             # (MMA, MMA_M, MMA_N, STAGE)
-            tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
+            tCtAcc_base = _fold_mma_n(cute.make_tensor(tmem_ptr, tCtAcc_fake.layout))
 
             #
             # Partition for epilogue (shape-only: use global tensor for invariant setup)
@@ -1623,7 +1628,7 @@ class MoEGroupedGemmGluBiasBf16Kernel:
                 # local_tile + partition on per-expert tensors
                 thr_mma_epi_loop = tiled_mma.get_slice(mma_tile_coord_v)
                 gC_mnl = cute.local_tile(real_c, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None))
-                tCgC = thr_mma_epi_loop.partition_C(gC_mnl)
+                tCgC = _fold_mma_n(thr_mma_epi_loop.partition_C(gC_mnl))
                 _, bSG_sC, bSG_gC_partitioned = epilog_gmem_copy_and_partition(epi_tidx, tma_atom_c, tCgC, self.epi_tile_c, sC)
 
                 gD_mnl_loop = cute.local_tile(real_d, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))

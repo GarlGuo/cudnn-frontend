@@ -795,6 +795,7 @@ def is_valid_bf16_grouped_gemm_mma_tiler_and_cluster_shape(
     m_aligned: int,
     fix_pad_size: int = FIX_PAD_SIZE,
     tile_n_align: int = 64,
+    allow_tile_n_512: bool = False,
 ) -> bool:
     """
     Check if the BF16 grouped GEMM MMA tiler and cluster shape are valid.
@@ -804,13 +805,15 @@ def is_valid_bf16_grouped_gemm_mma_tiler_and_cluster_shape(
         GLU needs 64 (its epilogue walks 32-column gate/up subtiles in pairs, so the
         per-tile subtile count must be even). Plain unfused / DGLU only need 32 (their
         epilogue walks independent 32-column subtiles). Default 64.
+    :param allow_tile_n_512: Also accept a 2-CTA (256, 512) tile in a (2, 1) cluster. Default False.
     :return: True if valid, False otherwise
     """
     is_valid = True
 
     if not ((not use_2cta_instrs and mma_tiler_mn[0] in [128]) or (use_2cta_instrs and mma_tiler_mn[0] in [256])):
         is_valid = False
-    if mma_tiler_mn[1] not in range(tile_n_align, 257, tile_n_align):
+    is_tile_512 = allow_tile_n_512 and use_2cta_instrs and tuple(mma_tiler_mn) == (256, 512) and tuple(cluster_shape_mn) == (2, 1)
+    if mma_tiler_mn[1] not in range(tile_n_align, 257, tile_n_align) and not is_tile_512:
         is_valid = False
     if cluster_shape_mn[0] % (2 if use_2cta_instrs else 1) != 0:
         is_valid = False
@@ -855,6 +858,7 @@ def can_implement_bf16_grouped_gemm(
     fix_pad_size: int = FIX_PAD_SIZE,
     n_align: int = 64,
     tile_n_align: int = 64,
+    allow_tile_n_512: bool = False,
 ) -> bool:
     """
     Check if the BF16 grouped GEMM can be implemented with the given parameters.
@@ -867,6 +871,7 @@ def can_implement_bf16_grouped_gemm(
     :param tile_n_align: Required alignment of the MMA tile N (mma_tiler_mn[1]).
         GLU needs 64 (subtiles consumed in gate/up pairs); unfused / DGLU need 32.
         Default 64.
+    :param allow_tile_n_512: Also accept a 2-CTA (256, 512) tile in a (2, 1) cluster. Default False.
     :return: True if implementable, False otherwise
     """
     result = True
@@ -887,6 +892,7 @@ def can_implement_bf16_grouped_gemm(
         m_aligned,
         fix_pad_size,
         tile_n_align=tile_n_align,
+        allow_tile_n_512=allow_tile_n_512,
     ):
         result = False
 
@@ -1295,6 +1301,16 @@ def quant_sfd_col(
             fp32x4[3] = acc_vec[ei + 3]
             fp8x4_i32 = cvt_f32x4_to_f8x4_pack_i32(fp32x4, d_dtype)
             tRSrD_i32[ei // 4] = cutlass.Int32(fp8x4_i32)
+
+
+def _fold_mma_n(t: cute.Tensor) -> cute.Tensor:
+    """(MMA, 1, MMA_N, ...) -> ((MMA_TILE_M, (MMA_TILE_N, MMA_N)), 1, 1, ...): one MMA mode spanning a tile wider
+    than its N=256 instructions. A tensor with MMA_N == 1 is returned unchanged."""
+    if cute.size(t, mode=[2]) == 1:
+        return t
+    s = t[((None, None), 0, None) + (None,) * (cute.rank(t) - 3)]
+    sh, st = s.layout.shape, s.layout.stride
+    return cute.make_tensor(s.iterator, cute.make_layout(((sh[0], (sh[1], sh[2])), 1, 1, *sh[3:]), stride=((st[0], (st[1], st[2])), 0, 0, *st[3:])))
 
 
 def epilog_gmem_copy_and_partition(
