@@ -1001,7 +1001,10 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` | `MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel` with `streaming_signal_capacity` (host / device layout, PDL) or `streaming_output_notify=N_CHUNK` | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
+| `gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py` | `BlockScaledMoEGroupedGemmQuantKernel` (SM100; the Rubin twin on SM107), MXFP8, with `streaming_output_notify=N_CHUNK` | BF16 D over the experts' rows | Unsupported (forward-only kernels) |
+| `gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py` | `BlockScaledMoEGroupedGemmGluBiasKernel` (SM100), MXFP8 SwiGLU, with `streaming_signal_capacity` (host / device layout, PDL trigger) | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
 | `gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` | `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel with `deterministic=True` | — | dprob and D_row: replay under concurrent work (both activations, dense/discrete, static/dynamic scheduler, ragged and empty experts), expert reorder, duplicate and neighbor isolation in both GLU orders; launch-stream ordering; D_row equal to the atomic path |
+| `gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal_determinism.py` | `MoEGroupedGemmDgluDbiasBf16Kernel`, `BlockScaledMoEGroupedGemmDgluDbiasKernel` (SM100, `deterministic=True`; the Rubin twin on SM107) with `streaming_signal_capacity` (host / device layout, PDL trigger; stock or compact SFA) | — | BF16 D and the FP32 dprob slots over the experts' rows: replay, producer release order, claim-slot warm stress |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -2630,6 +2633,104 @@ the strict 48 and the three sanitizer passes. The ordinary candidate-generator
 failure is a separate integration blocker; these explicit-plan results do
 not claim it is fixed. Existing measurements below are retained, not rerun
 as part of this addition.
+
+### Block-scaled grouped GEMM streaming input signal (FC1 GLU) — SM100, 2026-11-23
+
+`gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py` adds 14 L0 forward cases for
+`streaming_signal_capacity`, with stock SFA atoms and with `compact_sfa_sf_warp` (compact E8M0 rows, the SF warp builds
+the atoms), on the MXFP8 block-scaled SwiGLU kernel (E4M3 A/B with E8M0 SF atoms quantized once, BF16
+C/D, dense weights, 256 x 256 tile, cluster (2, 1), dynamic scheduler). The signal scheduler reorders tiles and waits
+only, so every case compares raw C and D bytes with the stock dynamic scheduler:
+
+- Replay (8 cases): host layout and `device_layout` with use_pdl and the all-slots-ready trigger, stock and compact
+  SFA, on 64 ragged experts and a 5000-row expert; three launches each on fresh NaN-filled C/D and workspace beside concurrent work.
+- Producer release order (4 cases): A codes, SFA atoms or compact SFA rows (the SF warp's batched cluster release, or
+  `compact_sfa_cta_release`) poisoned (NaN) until a producer stream writes each M tile's rows and SFA bytes and releases
+  it, in order, in reverse and in a seeded random order; all orders give identical bytes.
+- Batch invariance (2 cases): the 700-row target expert alone, with neighbors, behind empty experts, among 1/255/257-row
+  experts, reordered and duplicated, under host and device layout.
+- Claim-slot warm stress (2 cases, Rule 11; the compact case also covers the SF warp's tile_info release): 0 wrong of
+  500 warm and 0 of 500 poisoned launches each (8 thread blocks, 25 slot refills per launch, below the control's
+  geometry); the unsafe control failed 200 of 200.
+
+`test_grouped_gemm_blockscaled_glu_streaming_signal.py` holds the producer tests with A and SFA poisoned independently
+and together (a scheduler that ignores readiness fails all 20) and a check that the poison reaches D. No golden is
+recorded. The kernels have no backward.
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0 (CUDA 12.9), one GPU:
+both FC1 files with the two FC2 files at `-m "L0 or L1"`: **119 passed** (64 FC1, 55 FC2), 0 skipped; with the
+`compact_sfa_cta_release` and `generate_sfd_col=False` cases (bdb0ae19) the FC1 files give **82 passed**. SM103 is
+unverified; SM107 (the Rubin twin, stock SFA; the compact cases skip there) needs a Rubin run. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal.py -m "L0 or L1" -q -rs
+```
+
+### dGLU streaming input signal (BF16 and MXFP8) — SM100, 2026-11-23
+
+`gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal_determinism.py` adds 14 L0 backward cases for
+`streaming_signal_capacity` on the dSwiGLU kernels: `MoEGroupedGemmDgluDbiasBf16Kernel` (BF16 dY/W2/C/D) and
+`BlockScaledMoEGroupedGemmDgluDbiasKernel` (MXFP8 dY/W2 with E8M0 SF atoms or compact scale rows, BF16 C/D), both with
+`deterministic=True` (one FP32 dprob slot per 256-wide N tile), 256 x 256 tile, cluster (2, 1), dense weights, 64 ragged
+experts or a 5000-row expert. Every case compares raw D and dprob-slot bytes with the stock dynamic scheduler:
+
+- Replay (6 cases): host layout and `device_layout` with use_pdl and the all-slots-ready trigger, BF16 and MXFP8, stock
+  and compact SFA (cluster and CTA-scope SF release); three launches each on fresh buffers beside concurrent work.
+- Producer release order (5 cases): dY codes, SFA atoms or compact rows poisoned (NaN) until a producer stream writes
+  each M tile and releases it, in order, in reverse and in a seeded random order; all orders give identical bytes.
+- Claim-slot warm stress (3 cases, Rule 11; the compact case also covers the SF warp's tile_info release): 0 wrong of
+  500 warm and 0 of 500 poisoned launches each (8 thread blocks, 12 slot refills per launch, below the control's
+  geometry); the unsafe control failed 200 of 200.
+
+`test_grouped_gemm_dglu_streaming_signal.py` holds the functional cases (bytes equal to stock for the signal, device
+layout, entry-trigger and compact variants over three routings; producer tests with dY and its scales poisoned; poison
+detectors; rejected options). A scheduler that ignores readiness fails all 14 producer cases of the two files. No
+golden is recorded.
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0 (CUDA 12.9), one GPU:
+both files with `test_grouped_gemm_dglu_bf16_determinism.py` at `-m "L0 or L1"`: **72 passed**, 8 skipped (6 compact
+cases for BF16, one gate_then_up and one JAX case of the BF16 suite). compute-sanitizer memcheck 0 errors, racecheck
+0 hazards on the L0 cases without warm stress. SM103 is unverified. SM107 (the Rubin twin, stock SFA; the compact cases
+skip there): its dprob is an fp32 atomic sum in tile arrival order, not deterministic even across stock replays (Rubin job
+6803 saw last-bit differences), so the files compare D bit for bit and dprob within fp32 reassociation there. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal_determinism.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal.py -m "L0 or L1" -q -rs
+```
+
+### Block-scaled grouped GEMM N_CHUNK output notify — SM100, 2026-11-23
+
+`gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py` adds 8 L0 forward cases for
+`streaming_output_notify=N_CHUNK` on the MXFP8 block-scaled quant (FC2) kernel: E4M3 A/B with E8M0 SF atoms (quantized
+once, reused unchanged), BF16 D, dense weights, dynamic scheduler, cluster (2, 1) with the 256 x 256 2-CTA tile and
+(1, 1) with the 128 x 256 1-CTA tile. N_CHUNK reorders tiles only, so every case compares raw D bytes:
+
+- Replay (4 cases): N=768/chunk 512 (partial last chunk) and N=1024/chunk 256 at both cluster shapes, 64 ragged
+  experts. Three launches each on fresh NaN-filled D and workspace beside concurrent work, with one cluster beside the
+  consumer (extras stop early) and 1000 (none); both equal the stock dynamic scheduler, which also matches the
+  dequantized float reference.
+- Chunk-size invariance (1 case): chunk 256, 512 and 1024 (one chunk) on a 5000-row expert give identical bytes.
+- Batch invariance (2 cases): a 700-row target expert keeps its codes, scales, B, alpha and prob alone, with
+  neighbors, behind empty experts, among 1/255/257-row experts, reordered and duplicated, at both cluster shapes; each
+  copy equals the stock scheduler's bytes for the target alone.
+- Claim-slot warm stress (1 case, Rule 11): 0 wrong of 500 warm and 0 of 500 poisoned launches (8 thread blocks, 25
+  slot refills per launch, below the control's geometry, so the zero bounds little); the unsafe control failed 200 of
+  200.
+
+`test_grouped_gemm_blockscaled_streaming_signal.py` holds the independent float reference and a concurrent consumer
+that copies each chunk on publication (a variant that counts tiles before their D stores fails it). No golden is
+recorded: the claim is byte equality with the stock scheduler on the same runtime. The kernels have no backward.
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0 (CUDA 12.9), on a
+cuDNN-FE wheel overlaid with this change's sources, one GPU: both files at `-m "L0 or L1"` collected 55 cases and
+**55 passed**, 0 skipped. SM103 and SM107 (the Rubin kernel) remain unverified. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal.py -m "L0 or L1" -q -rs
+```
 
 ### Grouped GEMM streaming signal options — SM100, 2026-11-20
 
