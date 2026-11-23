@@ -1,30 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileContributor: Wentao Guo, Phuong Nguyen
+"""Time the SM90 (Hopper) BF16 grouped GEMM forward and dgrad against torch._grouped_mm.
 
-"""Time the SM90 BF16 grouped GEMMs (the *_wrapper_sm100 APIs on H100) against torch._grouped_mm on MoE shapes.
+One row is (model, op, arm) at one EP rank's sizes: --tokens per GPU times top_k
+routed rows, spread evenly over the rank's experts, each expert padded to 256 rows.
+This is a synthetic balanced-routing benchmark. Ops: fc1_fwd (N=2I, K=H), fc2_fwd
+(N=H, K=I), fc1_dgrad (N=H, K=2I) and fc2_dgrad (N=I, K=H); dgrad reads the forward
+weights N-major (b_major="n"). TFLOPs count the padded rows.
 
-One item is (model, op) at one EP rank's sizes: tokens per GPU x top_k routed rows spread evenly over the rank's
-experts, each expert padded to 256 rows. Ops: fc1_fwd (N=2I, K=H), fc2_fwd (N=H, K=I), fc1_dgrad (N=H, K=2I),
-fc2_dgrad (N=I, K=H); the dgrad ops read the forward weights N-major. Timings interleave the backends rep by rep,
-each rep behind an L2 flush.
+python benchmark/gemm/benchmark_grouped_gemm_sm90.py --model deepseek_v3 --ep 8 --arms default cooperative pingpong torch
 
-  python benchmark/gemm/benchmark_grouped_gemm_sm90.py --list-items
-  python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --ep 8 --out perf.json
-  python benchmark/gemm/benchmark_grouped_gemm_sm90.py --item deepseek_v3.fc2_fwd --schedules cooperative,pingpong --tile 128,192
+Arms: "default" is the library's own schedule (its shape rule); "cooperative" and
+"pingpong" force one through the test hook moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE
+(pingpong runs only its 128x192 tile on a (2, 1) cluster); "torch" is
+torch._grouped_mm, which allocates its output per call. Each cudnn arm is built
+through GroupedGemmSm100 (check_support, compile) outside timing and times the
+compiled plan's execute with fixed outputs and a preallocated workspace, so no
+wrapper allocation or dispatch. Graph timing is device time for an actual captured
+bundle, while eager timing includes host dispatch and synchronization. Every cudnn
+arm's output is checked against torch._grouped_mm outside timing.
 """
 
-from __future__ import annotations
-
 import argparse
+import contextlib
 import functools
+import importlib.metadata
 import json
 import statistics
-import sys
+import time
+from pathlib import Path
 
 import torch
+import cudnn
+from cudnn.tensor_adapter import has_wgmma
 
-#: hidden H, global experts E, top_k, expert intermediate I (FC1 N = 2I, gate + up): HF config.json dims.
+#: hidden H, global experts, top_k and expert intermediate I (FC1 N = 2I, gate + up), from the HF config.json.
 MODEL_SHAPES = {
     "deepseek_v3": dict(hidden=7168, experts=256, top_k=8, intermediate=2048),
     "qwen35_122b": dict(hidden=3072, experts=256, top_k=8, intermediate=1024),
@@ -33,195 +43,189 @@ MODEL_SHAPES = {
     "glm53_flash": dict(hidden=4096, experts=288, top_k=8, intermediate=2048),
 }
 OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad")
-ITEMS = [f"{model}.{op}" for model in MODEL_SHAPES for op in OPS]
+ARMS = ("default", "cooperative", "pingpong", "torch")
 
 
-def item_problem(item: str, ep: int, tokens: int):
-    model, op = item.split(".")
+def problem(args, model, op):
     shape = MODEL_SHAPES[model]
-    hidden, inter2 = shape["hidden"], 2 * shape["intermediate"]
-    if shape["experts"] % ep:
-        raise ValueError(f"{model}: {shape['experts']} experts do not divide over EP {ep}")
-    experts = shape["experts"] // ep
-    n, k = {
-        "fc1_fwd": (inter2, hidden),
-        "fc2_fwd": (hidden, shape["intermediate"]),
-        "fc1_dgrad": (hidden, inter2),
-        "fc2_dgrad": (shape["intermediate"], hidden),
-    }[op]
-    rows = -(-tokens * shape["top_k"] // experts)
-    count = -(-rows // 256) * 256
-    return dict(
-        model=model,
-        op=op,
-        experts=experts,
-        n=n,
-        k=k,
-        rows_per_expert=rows,
-        count=count,
-        m=count * experts,
-        b_major="n" if op in ("fc1_dgrad", "fc2_dgrad") else "k",
+    hidden, inter = shape["hidden"], shape["intermediate"]
+    n, k = dict(fc1_fwd=(2 * inter, hidden), fc2_fwd=(hidden, inter), fc1_dgrad=(hidden, 2 * inter), fc2_dgrad=(inter, hidden))[op]
+    groups = shape["experts"] // args.ep
+    valid_m = -(-args.tokens * shape["top_k"] // groups)
+    m = -(-valid_m // 256) * 256
+    b_major = "n" if op.endswith("dgrad") else "k"
+    torch.manual_seed(args.seed)
+    tensors = dict(
+        a=torch.randn(groups * m, k, device="cuda", dtype=torch.bfloat16) * 0.125,
+        # (E, N, K) K-major for fwd; dgrad reads the forward weights (E, K, N) N-major.
+        b=torch.randn((groups, n, k) if b_major == "k" else (groups, k, n), device="cuda", dtype=torch.bfloat16) * 0.125,
+        padded_offsets=torch.arange(1, groups + 1, device="cuda", dtype=torch.int32) * m,
+        alpha=torch.ones(groups, device="cuda"),
+        prob=torch.ones(groups * m, device="cuda"),
+        c=torch.empty(groups * m, n, device="cuda", dtype=torch.bfloat16),  # unused without generate_c
     )
+    metadata = dict(model=model, op=op, b_major=b_major, groups=groups, M=m, valid_M=valid_m, N=n, K=k, total_rows=groups * m)
+    return tensors, metadata
 
 
-def make_tensors(p, seed=0):
-    g = torch.Generator(device="cuda").manual_seed(seed)
-    a = torch.randn((p["m"], p["k"]), generator=g, device="cuda", dtype=torch.bfloat16) * 0.125
-    # (E, N, K) K-major for fwd; the forward weights (E, K, N) read N-major for dgrad.
-    shape = (p["experts"], p["n"], p["k"]) if p["b_major"] == "k" else (p["experts"], p["k"], p["n"])
-    b = torch.randn(shape, generator=g, device="cuda", dtype=torch.bfloat16) * 0.125
-    offsets = torch.arange(1, p["experts"] + 1, device="cuda", dtype=torch.int32) * p["count"]
-    alpha = torch.ones(p["experts"], device="cuda", dtype=torch.float32)
-    prob = torch.ones(p["m"], device="cuda", dtype=torch.float32)
-    d = torch.empty((p["m"], p["n"]), device="cuda", dtype=torch.bfloat16)
-    return dict(a=a, b=b, offsets=offsets, alpha=alpha, prob=prob, d=d)
+def grouped_mm(t, b_major):
+    b_kn = t["b"].transpose(1, 2) if b_major == "k" else t["b"]  # torch._grouped_mm takes (G, K, N)
+    return functools.partial(torch._grouped_mm, t["a"], b_kn, offs=t["padded_offsets"], out_dtype=torch.bfloat16)
 
 
-def override_schedule(fn, schedule):
-    """``fn`` under an SM90 schedule override (a test / benchmark hook; the library picks it by shape otherwise)."""
+@contextlib.contextmanager
+def forced_schedule(schedule):
+    """The SM90 schedule test hook: plans built inside run ``schedule`` (None: the shape rule's pick)."""
     import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
 
-    def run():
-        saved, sm90._SCHEDULE_OVERRIDE = sm90._SCHEDULE_OVERRIDE, schedule
-        try:
-            return fn()
-        finally:
-            sm90._SCHEDULE_OVERRIDE = saved
-
-    return run
+    saved, sm90._SCHEDULE_OVERRIDE = sm90._SCHEDULE_OVERRIDE, schedule
+    try:
+        yield
+    finally:
+        sm90._SCHEDULE_OVERRIDE = saved
 
 
-def backends(p, t, names, config=None, schedules=(None,)):
-    """``config``: mma_tiler_mn / cluster_shape_mn for the GEMM ops; one cudnn arm per schedule (None: the heuristic's).
-
-    The pingpong arm always runs its one configuration, a 128x192 tile on a (2, 1) cluster.
-    """
-    import cudnn
-
-    config = config or {}
-
-    def ours(config):
-        cudnn.grouped_gemm_wrapper_sm100(
-            a_tensor=t["a"],
-            padded_offsets=t["offsets"],
-            alpha_tensor=t["alpha"],
-            b_tensor=t["b"],
-            b_major=p["b_major"],
-            prob_tensor=t["prob"],
-            d_tensor=t["d"],
-            c_dtype=torch.bfloat16,
-            d_dtype=torch.bfloat16,
-            **config,
+def prepare(t, b_major, arm):
+    """One arm's timed call, its output buffer (None for torch) and its plan's configuration."""
+    if arm == "torch":
+        return grouped_mm(t, b_major), None, {}
+    d = torch.empty_like(t["c"])
+    with forced_schedule(None if arm == "default" else arm):
+        api = cudnn.GroupedGemmSm100(
+            sample_a=t["a"],
+            sample_c=t["c"],
+            sample_d=d,
+            sample_padded_offsets=t["padded_offsets"],
+            sample_alpha=t["alpha"],
+            sample_b=t["b"],
+            sample_prob=t["prob"],
+            b_major=b_major,
+            use_dynamic_sched=True,
         )
-        return t["d"]
-
-    # torch._grouped_mm takes (G, K, N) weights: a view of either layout.
-    b_kn = t["b"].transpose(1, 2) if p["b_major"] == "k" else t["b"]
-    grouped_mm = lambda: torch._grouped_mm(t["a"], b_kn, offs=t["offsets"], out_dtype=torch.bfloat16)
-    fn, reference = ours, grouped_mm
-    pingpong_config = dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1))
-    arm = lambda s: functools.partial(fn, pingpong_config if s == "pingpong" else config)
-    runs = {"cudnn_sm90" + ("" if s is None else f"_{s}"): override_schedule(arm(s), s) for s in schedules}
-    if "torch_grouped_mm" in names:
-        runs["torch_grouped_mm"] = reference
-    return runs
-
-
-def time_item(runs, n_runs, warmup, reps, l2_flush):
-    flush = torch.empty(int(l2_flush * torch.cuda.get_device_properties(0).L2_cache_size), dtype=torch.uint8, device="cuda")
-    for fn in runs.values():
-        for _ in range(warmup):
-            fn()
+        if not api.check_support():
+            raise RuntimeError(f"Unsupported configuration for the {arm} arm")
+        api.compile()
+    # The backend plan directly, with its per-call workspace allocated once: no wrapper work in timing.
+    implementation = api._implementation
+    nbytes = implementation._scratch_nbytes
+    workspace = torch.empty(nbytes, device="cuda", dtype=torch.uint8) if nbytes else None
+    run = functools.partial(
+        implementation.execute,
+        a_tensor=t["a"],
+        c_tensor=t["c"],
+        d_tensor=d,
+        padded_offsets=t["padded_offsets"],
+        alpha_tensor=t["alpha"],
+        b_tensor=t["b"],
+        prob_tensor=t["prob"],
+        workspace=workspace,
+    )
+    run()
     torch.cuda.synchronize()
-    medians = {name: [] for name in runs}
-    for _ in range(n_runs):
-        events = {name: [] for name in runs}
-        for _ in range(reps):
-            for name, fn in runs.items():  # A/B interleaved within the item
-                flush.zero_()
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                start.record()
-                fn()
-                end.record()
-                events[name].append((start, end))
+    schedule = "pingpong" if implementation._pingpong else "cooperative"
+    return run, d, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
+
+
+def distribution(samples):
+    quartiles = statistics.quantiles(samples, n=4, method="inclusive") if len(samples) > 1 else [samples[0]] * 3
+    return dict(median=statistics.median(samples), q25=quartiles[0], q75=quartiles[2], samples=samples)
+
+
+def measure(runs, args):
+    # Every arm is compiled before any is warmed or sampled. Adjacent repeats
+    # alternate AB/BA so clock drift cannot separate the arms' measurement windows.
+    graphs, events = {}, {}
+    samples = {arm: dict(graph_device_us=[], eager_wall_us=[]) for arm in runs}
+    for arm, run in runs.items():
+        for _ in range(args.warmup):
+            run()
         torch.cuda.synchronize()
-        for name, pairs in events.items():
-            medians[name].append(statistics.median(s.elapsed_time(e) * 1e3 for s, e in pairs))
-    return {name: dict(us_median=statistics.median(v), us_runs=v) for name, v in medians.items()}
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--list-items", action="store_true")
-    parser.add_argument("--item", choices=ITEMS)
-    parser.add_argument("--ep", type=int, default=8)
-    parser.add_argument("--tokens", type=int, default=8192, help="tokens per GPU")
-    parser.add_argument("--baselines", default="torch_grouped_mm")
-    parser.add_argument("--runs", type=int, default=5)
-    parser.add_argument("--warmup", type=int, default=10)
-    parser.add_argument("--reps", type=int, default=100)
-    parser.add_argument("--l2-flush", type=float, default=2.0, help="flush buffer size in multiples of L2")
-    parser.add_argument("--out", default=None)
-    pair = lambda text: tuple(int(v) for v in text.split(","))
-    parser.add_argument(
-        "--schedules",
-        default=None,
-        help="comma list of SM90 schedule overrides (cooperative, pingpong), one arm each; default: the heuristic's. "
-        "The pingpong arm always runs 128x192 on a (2, 1) cluster",
-    )
-    parser.add_argument("--tile", type=pair, default=None, help="mma_tiler_mn as M,N")
-    parser.add_argument("--cluster", type=pair, default=None, help="cluster_shape_mn as M,N")
-    args = parser.parse_args(argv)
-    if args.list_items:
-        print("\n".join(ITEMS))
-        return 0
-    if args.item is None:
-        parser.error("--item or --list-items is required")
-    from cudnn.tensor_adapter import has_wgmma
-
-    major, _ = torch.cuda.get_device_capability()
-    if not has_wgmma(major):
-        raise SystemExit(f"SM90 is required, found {torch.cuda.get_device_capability()}")
-
-    p = item_problem(args.item, args.ep, args.tokens)
-    t = make_tensors(p)
-    names = {"mma_tiler_mn": args.tile, "cluster_shape_mn": args.cluster}
-    config = {key: value for key, value in names.items() if value is not None}
-    schedules = tuple(args.schedules.split(",")) if args.schedules else (None,)
-    runs = backends(p, t, set(filter(None, args.baselines.split(","))), config, schedules)
-    ours_name = next(iter(runs))
-    outputs = {name: fn().float().view(p["m"], -1) for name, fn in runs.items()}
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(args.bundle):
+                run()
+        graphs[arm] = graph
+        events[arm] = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+    for _ in range(args.warmup):
+        for graph in graphs.values():
+            graph.replay()
     torch.cuda.synchronize()
-    check = {}
-    if "torch_grouped_mm" in outputs:
-        diff = max((outputs[name] - outputs["torch_grouped_mm"]).abs().max().item() for name in runs if name.startswith("cudnn_sm90"))
-        check = dict(max_abs_diff_vs_torch=diff, scale=outputs["torch_grouped_mm"].abs().max().item())
-    timing = time_item(runs, args.runs, args.warmup, args.reps, args.l2_flush)
-    flops = 2.0 * p["m"] * p["n"] * p["k"]
-    for value in timing.values():
-        value["tflops"] = flops / (value["us_median"] * 1e-6) / 1e12
-    record = dict(
-        item=args.item,
-        ep=args.ep,
-        tokens=args.tokens,
-        problem=p,
-        check=check,
-        timing=timing,
-        device=torch.cuda.get_device_name(),
+    for repeat in range(args.repeats):
+        order = tuple(runs) if repeat % 2 == 0 else tuple(reversed(runs))
+        for arm in order:
+            begin, end = events[arm]
+            begin.record()
+            graphs[arm].replay()
+            end.record()
+            end.synchronize()
+            samples[arm]["graph_device_us"].append(begin.elapsed_time(end) * 1000 / args.bundle)
+        for arm in order:
+            start = time.perf_counter()
+            for _ in range(args.bundle):
+                runs[arm]()
+            torch.cuda.synchronize()
+            samples[arm]["eager_wall_us"].append((time.perf_counter() - start) * 1e6 / args.bundle)
+    measurements = {}
+    for arm, metrics in samples.items():
+        measurements[arm] = {name: statistics.median(values) for name, values in metrics.items()}
+        measurements[arm]["distributions"] = {name: distribution(values) for name, values in metrics.items()}
+    return measurements
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", nargs="+", choices=tuple(MODEL_SHAPES), default=["deepseek_v3"], metavar="MODEL", help=", ".join(MODEL_SHAPES))
+    parser.add_argument("--op", nargs="+", choices=OPS, default=list(OPS), metavar="OP", help=", ".join(OPS))
+    parser.add_argument("--arms", nargs="+", choices=ARMS, default=["default", "torch"], metavar="ARM", help=", ".join(ARMS))
+    parser.add_argument("--ep", type=int, default=8)
+    parser.add_argument("--tokens", type=int, default=8192, help="Tokens per GPU")
+    parser.add_argument("--seed", type=int, default=401)
+    parser.add_argument("--warmup", type=int, default=8)
+    parser.add_argument("--bundle", type=int, default=20)
+    parser.add_argument("--repeats", type=int, default=8)
+    parser.add_argument("--json", type=Path)
+    args = parser.parse_args()
+    if args.ep < 1 or any(MODEL_SHAPES[model]["experts"] % args.ep for model in args.model):
+        parser.error("EP must divide every selected model's expert count")
+    if min(args.tokens, args.warmup, args.bundle, args.repeats) < 1:
+        parser.error("tokens and timing counts must be positive")
+    capability = torch.cuda.get_device_capability()
+    if not has_wgmma(capability[0]):
+        raise SystemExit(f"This benchmark requires an SM90 (Hopper) GPU, found compute capability {capability}")
+    runtime = dict(
+        gpu=torch.cuda.get_device_name(),
+        capability=capability,
         torch=torch.__version__,
-        args=dict(runs=args.runs, warmup=args.warmup, reps=args.reps, l2_flush=args.l2_flush),
-        config={key: list(value) if isinstance(value, tuple) else value for key, value in config.items()},
-        schedules=list(schedules),
+        cuda=torch.version.cuda,
+        cudnn_source=cudnn.__file__,
+        cudnn_frontend=cudnn.__version__,
+        cutlass=importlib.metadata.version("nvidia-cutlass-dsl"),
     )
-    if "torch_grouped_mm" in timing:
-        record["speedup_vs_torch"] = timing["torch_grouped_mm"]["us_median"] / timing[ours_name]["us_median"]
-    text = json.dumps(record, indent=2)
-    print(text)
-    if args.out:
-        with open(args.out, "w") as file:
-            file.write(text + "\n")
-    return 0
+    print(json.dumps(dict(runtime=runtime, configuration=vars(args)), default=str), flush=True)
+    rows = []
+    for model in args.model:
+        for op in args.op:
+            tensors, shape = problem(args, model, op)
+            reference = grouped_mm(tensors, shape["b_major"])().float()
+            runs, cases = {}, {}
+            for arm in args.arms:
+                run, d, plan = prepare(tensors, shape["b_major"], arm)
+                cases[arm] = dict(**shape, arm=arm, **plan)
+                if d is not None:
+                    cases[arm]["max_abs_diff_vs_torch"] = (d.float() - reference).abs().max().item()
+                    torch.testing.assert_close(d.float(), reference, rtol=2e-2, atol=2e-2)
+                runs[arm] = run
+            measurements = measure(runs, args)
+            flops = 2.0 * shape["total_rows"] * shape["N"] * shape["K"]
+            for arm, case in cases.items():
+                row = {**case, **measurements[arm], "tflops": flops / measurements[arm]["graph_device_us"] / 1e6}
+                rows.append(row)
+                print(json.dumps(row), flush=True)
+            del tensors, reference, run, d, runs, cases
+    report = dict(runtime=runtime, configuration=vars(args), measurements=rows)
+    if args.json:
+        args.json.write_text(json.dumps(report, indent=2, default=str) + "\n")
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
