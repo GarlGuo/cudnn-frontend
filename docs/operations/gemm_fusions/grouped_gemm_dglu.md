@@ -1,4 +1,4 @@
-# Grouped GEMM + dGLU (SM100)
+# Grouped GEMM + dGLU (SM100 and SM90 BF16)
 
 **This is an experimental API and subject to change.**
 
@@ -207,6 +207,30 @@ out = cudnn.grouped_gemm_dglu_wrapper_sm100(
 )
 assert out["activation_tensor"] is activation
 ```
+
+## SM90 (Hopper)
+
+On an SM90 device, `GroupedGemmDgluSm100` and `grouped_gemm_dglu_wrapper_sm100`
+run a Hopper kernel for the BF16 contract (WGMMA and TMA, accumulator in
+registers, a C-load warp). The `_sm100` suffix is historical; no new names are
+added. Limits:
+
+- `act_func` is `"dswiglu"` or `"dgeglu"` with `glu_layout="interleaved_32"`;
+  `geglu_alpha`, the clamps, `linear_offset` and `round_dgrad_to_input_dtype`
+  behave as on SM100.
+- Dense `B` (`b_major="k"` or `"n"`) only; discrete `b_ptrs`,
+  `generate_dbias=True` and `activation_tensor` raise `NotImplementedError`.
+- `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
+- `dprob` is an atomic per-row sum over N tiles, as on SM100; zero it before each
+  call. `deterministic=True` makes it bit-exact with one slot per SM90 N tile (see
+  [Deterministic dprob](#deterministic-dprob)). Torch tensors only (no JAX entry);
+  block-scaled inputs are SM100 only.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
+- `mma_tiler_mn=None` (the default) selects `(128, 256)` on SM90 and
+  `(256, 256)` on SM100. An explicit SM90 tile is `(128, 128)` or `(128, 256)`.
+  `cluster_shape_mn=None` selects `(2, 1)`; an explicit cluster has power-of-two
+  sides, at most 8 CTAs, and `128 * cluster_m` dividing 256.
 
 ## Block-scaled contract
 
@@ -740,8 +764,14 @@ partial goes to its own fp32 slot, and the slots are summed in a fixed order int
 launch stream; `use_dynamic_sched` stays supported and the other outputs are unchanged.
 
 Cost per call: a zeroed `valid_m x ceil(N / 256)` fp32 workspace (default tile and cluster) and a
-two-op reduction. Supported for the SM100 block-scaled kernel (dense or discrete weights) with
-torch tensors and without dbias; other configurations raise when the flag is set.
+two-op reduction. Supported for the SM100 block-scaled kernel and for the SM100-family BF16 kernel
+(dSwiGLU or dGeGLU, either `glu_layout`), each with dense or discrete weights, torch tensors and
+no dbias; other configurations raise when the flag is set. The SM90 BF16 kernel is supported with
+the same limits as its other SM90 options; its workspace is `valid_m x ceil(N / tile_n)` with tile N
+128 or 256, rounded up to whole clusters along N. The BF16 kernels sum a tile's subtiles
+in a fixed order already, so only the slots change. On SM100, at the DeepSeek-V3, Qwen3.5-397B and
+Qwen3-2.4T FC2 shapes (EP4 and EP8, 8192 tokens), the flag adds 8-10 us (0.4-1.6%) of GPU time and
+10-19 us (0.6-2.0%) back to back.
 
 ### Wrapper Return Values
 

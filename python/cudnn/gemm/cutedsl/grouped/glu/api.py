@@ -29,6 +29,7 @@ from ..backend_utils import (
     row_major_layout,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
+    wrapper_workspace,
 )
 from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
 from ..moe_utils import MoEWeightMode
@@ -45,10 +46,12 @@ from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     cuda_is_available,
+    default_stream,
     detect_framework,
     framework_dtype,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_device,
     get_shape,
     get_strides,
@@ -84,7 +87,16 @@ def _block_scaled_dtype_pairs():
 
 
 from ._bf16_api import GroupedGemmGluBf16API
+from ..unfused.moe_grouped_gemm_sm90 import schedule_override
 from ._blockscaled_api import GroupedGemmGluBlockScaledAPI
+
+
+def _default_mma_tiler(mma_tiler_mn: Optional[Tuple[int, int]]) -> Optional[Tuple[int, int]]:
+    """The CTA tile when the caller gives none: (256, 256), or None on SM90, whose BF16 API picks it with the schedule."""
+    if mma_tiler_mn is not None:
+        return tuple(mma_tiler_mn)
+    major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+    return None if has_wgmma(major) else (256, 256)
 
 
 @dataclass(frozen=True)
@@ -109,7 +121,7 @@ class GluCall:
     c_dtype: Optional[torch.dtype] = None
     d_dtype: Optional[torch.dtype] = None
     cd_major: str = "n"
-    mma_tiler_mn: Tuple[int, int] = (256, 256)
+    mma_tiler_mn: Optional[Tuple[int, int]] = (256, 256)
     cluster_shape_mn: Optional[Tuple[int, int]] = None
     sf_vec_size: int = 16
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None
@@ -192,7 +204,7 @@ class GroupedGemmGluSm100(APIBase):
         sample_norm_const: Optional[torch.Tensor] = None,
         sample_prob: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -221,6 +233,7 @@ class GroupedGemmGluSm100(APIBase):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmGluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
             self._pending_init_kwargs["acc_dtype"] = cutlass.Float32
+        self._pending_init_kwargs["mma_tiler_mn"] = _default_mma_tiler(mma_tiler_mn)
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -281,6 +294,7 @@ class GroupedGemmGluSm100(APIBase):
                     raise ValueError(_JAX_BLOCK_SCALED_ERROR)
                 block_kwargs = dict(kwargs)
                 block_kwargs.pop("generate_c", None)
+                block_kwargs["mma_tiler_mn"] = block_kwargs["mma_tiler_mn"] or (256, 256)
                 # The block-scaled implementation is torch-native: hand it torch dtypes.
                 block_kwargs["acc_dtype"] = framework_dtype(block_kwargs["acc_dtype"], "torch")
                 if block_kwargs.get("b_dtype") is not None:
@@ -562,7 +576,7 @@ def _grouped_gemm_glu_block_scaled_call(call: GluCall, memo_key: Optional[tuple]
     c_dtype = framework_dtype(call.c_dtype, "torch")
     d_dtype = framework_dtype(call.d_dtype, "torch")
     b_dtype = framework_dtype(call.b_dtype, "torch") if call.b_dtype is not None else None
-    mma_tiler_mn = call.mma_tiler_mn
+    mma_tiler_mn = call.mma_tiler_mn or (256, 256)
     cluster_shape_mn = call.cluster_shape_mn
     sf_vec_size = call.sf_vec_size
     sf_fp8_dtype_override = call.sf_fp8_dtype_override
@@ -1089,8 +1103,8 @@ def _normalize_glu_call(call: GluCall) -> tuple[GluCall, GroupedGemmBackend]:
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if not has_tcgen05(major):
-        raise RuntimeError(f"GroupedGemmGluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
+    if not (has_tcgen05(major) or has_wgmma(major)):
+        raise RuntimeError(f"GroupedGemmGluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
     return normalized, backend
 
 
@@ -1135,6 +1149,16 @@ def _glu_tensor_signature(tensor: Optional[torch.Tensor], *, dynamic_m: bool = F
         _convert_to_cutlass_data_type(tensor.dtype),
         (device.type, device.index),
     )
+
+
+def _glu_bf16_execute(api, framework, current_stream, linear_offset, **operands):
+    """Run a cached BF16 plan with its per-call scratch, allocated on the launch stream."""
+    implementation = api._implementation
+    if linear_offset is None:
+        linear_offset = 1.0 if implementation.act_func == "geglu" else 0.0
+    launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, implementation._scratch_nbytes, operands["a_tensor"].device, launch_stream) as workspace:
+        implementation.execute(linear_offset=linear_offset, current_stream=launch_stream, workspace=workspace, **operands)
 
 
 def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None) -> TupleDict:
@@ -1182,6 +1206,8 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
         call.generate_c,
         call.b_major,
         call.use_dynamic_sched,
+        # The SM90 schedule is a function of the shapes and tile in this key plus the forced one.
+        schedule_override(),
         workspace_bytes,
         ((get_device(call.a_tensor).type, get_device(call.a_tensor).index)),
         overlap_margin,
@@ -1230,29 +1256,20 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
     if memo_key is not None:
         _glu_wrapper_memo[memo_key] = (api, framework, valid_m, n_full, n_out, call.c_dtype, call.d_dtype)
 
-    api.execute(
+    _glu_bf16_execute(
+        api,
+        framework,
+        call.current_stream,
+        call.linear_offset,
         a_tensor=call.a_tensor,
         c_tensor=c_tensor,
         d_tensor=d_tensor,
-        sfa_tensor=None,
         padded_offsets=call.padded_offsets,
         alpha_tensor=call.alpha_tensor,
         b_tensor=call.b_tensor,
-        sfb_tensor=None,
-        bias_tensor=call.bias_tensor,
         b_ptrs=call.b_ptrs,
-        sfb_ptrs=None,
-        d_col_tensor=None,
-        sfd_row_tensor=None,
-        sfd_col_tensor=None,
-        amax_tensor=None,
-        norm_const_tensor=None,
+        bias_tensor=call.bias_tensor,
         prob_tensor=call.prob_tensor,
-        linear_offset=call.linear_offset,
-        geglu_alpha=call.geglu_alpha,
-        glu_clamp_max=call.glu_clamp_max,
-        glu_clamp_min=call.glu_clamp_min,
-        current_stream=call.current_stream,
     )
     return TupleDict(
         c_tensor=c_tensor if call.generate_c else None,
@@ -1283,7 +1300,7 @@ def grouped_gemm_glu_wrapper_sm100(
     c_dtype: Optional[torch.dtype] = None,
     d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     vector_f32: bool = False,
@@ -1322,6 +1339,7 @@ def grouped_gemm_glu_wrapper_sm100(
     before each call; use distinct counters for overlapping invocations and GEMMs.
     """
     validate_glu_layout(glu_layout)
+    mma_tiler_mn = _default_mma_tiler(mma_tiler_mn)
     if glu_layout != "interleaved_32" and detect_framework(a_tensor) != "torch":
         raise NotImplementedError("gate_then_up GLU currently supports torch inputs only")
     if glu_layout == "gate_then_up":
@@ -1332,6 +1350,9 @@ def grouped_gemm_glu_wrapper_sm100(
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_glu_jax_sm100
 
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        if has_wgmma(major):
+            raise NotImplementedError("SM90 grouped GEMM GLU supports torch tensors only")
         check_jax_wrapper_options(
             acc_dtype=acc_dtype,
             cd_major=cd_major,
@@ -1401,7 +1422,7 @@ def grouped_gemm_glu_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         sf_vec_size,
         sf_fp8_dtype_override,
@@ -1418,6 +1439,7 @@ def grouped_gemm_glu_wrapper_sm100(
         use_single_group_runtime_offsets,
         generate_c,
         glu_layout,
+        schedule_override(),
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
         os.getenv("CUDNN_FE_GROUPED_GEMM_DYNAMIC_MNKL", "1") != "0",
     )
@@ -1427,29 +1449,20 @@ def grouped_gemm_glu_wrapper_sm100(
         canonical = len(get_shape(a_tensor)) == 2
         c_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_full, canonical), memo_c_dtype, a_tensor.device)
         d_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_out, canonical), memo_d_dtype, a_tensor.device)
-        api.execute(
+        _glu_bf16_execute(
+            api,
+            framework,
+            current_stream,
+            linear_offset,
             a_tensor=a_tensor,
             c_tensor=c_out,
             d_tensor=d_out,
-            sfa_tensor=None,
             padded_offsets=padded_offsets,
             alpha_tensor=alpha_tensor,
             b_tensor=b_tensor,
-            sfb_tensor=None,
-            bias_tensor=bias_tensor,
             b_ptrs=b_ptrs,
-            sfb_ptrs=None,
-            d_col_tensor=None,
-            sfd_row_tensor=None,
-            sfd_col_tensor=None,
-            amax_tensor=None,
-            norm_const_tensor=None,
+            bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
-            linear_offset=linear_offset,
-            geglu_alpha=geglu_alpha,
-            glu_clamp_max=glu_clamp_max,
-            glu_clamp_min=glu_clamp_min,
-            current_stream=current_stream,
         )
         return TupleDict(
             c_tensor=c_out if generate_c else None,

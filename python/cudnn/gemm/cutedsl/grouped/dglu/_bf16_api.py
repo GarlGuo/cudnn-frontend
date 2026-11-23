@@ -33,6 +33,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -44,6 +45,7 @@ from ..backend_utils import debug_validate_offsets, debug_validate_pointer_value
 from ..canonical import canonical_b_fake, canonical_mx_fake, canonical_prob_fake, live_kernel_view, normalize_b, normalize_mx, normalize_prob, validate_once
 from ..moe_utils import MoEWeightMode
 from .moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
+from .moe_grouped_gemm_dglu_sm90 import MoEGroupedGemmDgluBf16KernelSm90
 from ..glu_layout import GLU_LAYOUTS, validate_glu_layout
 
 
@@ -72,7 +74,7 @@ class GroupedGemmDgluBf16API(APIBase):
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
@@ -85,6 +87,7 @@ class GroupedGemmDgluBf16API(APIBase):
         round_dgrad_to_input_dtype: bool = False,
         sample_activation: Optional[torch.Tensor] = None,
         glu_layout: str = "interleaved_32",
+        _deterministic: bool = False,
     ) -> None:
         if acc_dtype is None:
             acc_dtype = cutlass.Float32
@@ -162,9 +165,12 @@ class GroupedGemmDgluBf16API(APIBase):
         self.b_shape = tuple(b_shape) if b_shape is not None else None
         self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
-        self.mma_tiler_mn = tuple(mma_tiler_mn)
+        # SM90 runs the Hopper kernel: a (128, 256) tile, a (2, 1) cluster by default and the dynamic scheduler always.
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        self._is_sm90 = has_wgmma(major)
+        self.mma_tiler_mn = tuple(mma_tiler_mn or ((128, 256) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
-        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs else (1, 1)))
+        self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.vector_f32 = vector_f32
         self.m_aligned = m_aligned
         self.glu_layout = validate_glu_layout(glu_layout)
@@ -174,9 +180,13 @@ class GroupedGemmDgluBf16API(APIBase):
         self.glu_clamp_min = float(glu_clamp_min)
         self.round_dgrad_to_input_dtype = round_dgrad_to_input_dtype
         self.b_major = b_major
-        self.use_dynamic_sched = use_dynamic_sched
+        # SM90's only scheduler is the dynamic one (the gmem atomic-counter claim), so it is the default there.
+        self.use_dynamic_sched = True if self._is_sm90 else use_dynamic_sched
         self._has_dbias = self.dbias_desc is not None
-        self._kernel = MoEGroupedGemmDgluDbiasBf16Kernel
+        # Internal (set by grouped_gemm_dglu_wrapper_sm100): dprob is one slot per N-tile, (valid_m, n_slots, 1).
+        self._deterministic = _deterministic
+        self._dprob_slots = 1
+        self._kernel = MoEGroupedGemmDgluBf16KernelSm90 if self._is_sm90 else MoEGroupedGemmDgluDbiasBf16Kernel
         self._kernel_obj = None
         self._live_b_ptrs = None
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
@@ -213,6 +223,9 @@ class GroupedGemmDgluBf16API(APIBase):
                     other_begin, other_end = span(tensor)
                 if begin < other_end and other_begin < end:
                     raise ValueError(f"activation output must not overlap {name}")
+
+    def _dprob_stride(self, tensor_m: int) -> Tuple[int, ...]:
+        return canonicalize_unit_dim_strides((tensor_m, self._dprob_slots, 1), (self._dprob_slots, 1, 1))
 
     @staticmethod
     def _expect_shape(desc: TensorDesc, expected: Tuple[int, ...], name: str) -> None:
@@ -278,13 +291,17 @@ class GroupedGemmDgluBf16API(APIBase):
             raise ValueError(f"N must be positive and divisible by 32, got {n}")
 
         two_n = 2 * n
+        if self._deterministic:
+            from ..dsrelu.api import _dprob_n_slots
+
+            self._dprob_slots = _dprob_n_slots(n, self.mma_tiler_mn, self.cluster_shape_mn, True)
         self._expect_shape(self.c_desc, (tensor_m, two_n, 1), "sample_c")
         self._expect_shape(self.d_row_desc, (tensor_m, two_n, 1), "sample_d_row")
         self._expect_shape(self.padded_offsets_desc, (self.expert_cnt,), "sample_padded_offsets")
         self._expect_shape(self.alpha_desc, (self.expert_cnt,), "sample_alpha")
         self._expect_shape(self.beta_desc, (self.expert_cnt,), "sample_beta")
         self._expect_shape(self.prob_desc, (tensor_m, 1, 1), "sample_prob")
-        self._expect_shape(self.dprob_desc, (tensor_m, 1, 1), "sample_dprob")
+        self._expect_shape(self.dprob_desc, (tensor_m, self._dprob_slots, 1), "sample_dprob")
 
         self._expect_stride(self.a_desc, (k, 1, tensor_m * k), "A tensor")
         self._expect_stride(self.c_desc, (two_n, 1, tensor_m * two_n), "sample_c")
@@ -293,7 +310,7 @@ class GroupedGemmDgluBf16API(APIBase):
         self._expect_stride(self.alpha_desc, (1,), "sample_alpha")
         self._expect_stride(self.beta_desc, (1,), "sample_beta")
         self._expect_stride(self.prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "sample_prob")
-        self._expect_stride(self.dprob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "sample_dprob")
+        self._expect_stride(self.dprob_desc, self._dprob_stride(tensor_m), "sample_dprob")
 
         self._check_dtype(self.a_desc, cutlass.BFloat16, "sample_a")
         if self.b_desc is not None:
@@ -355,8 +372,22 @@ class GroupedGemmDgluBf16API(APIBase):
             raise ValueError("dGeGLU requires finite positive alpha and ordered finite clamp bounds")
         if self.b_major not in ("k", "n"):
             raise ValueError(f"b_major must be 'k' or 'n', got {self.b_major}")
+        if self._is_sm90:
+            if self.weight_mode != MoEWeightMode.DENSE:
+                raise NotImplementedError("SM90 grouped GEMM dGLU supports dense weights (sample_b) only, not discrete b_ptrs")
+            if self._has_dbias or self.activation_desc is not None:
+                raise NotImplementedError("SM90 grouped GEMM dGLU writes neither dbias nor the activation output")
+            if self.glu_layout != "interleaved_32":
+                raise NotImplementedError("SM90 grouped GEMM dGLU supports glu_layout='interleaved_32' only")
+            for desc, name in ((self.c_desc, "sample_c"), (self.d_row_desc, "sample_d_row")):
+                if _convert_to_cutlass_data_type(desc.dtype) not in (cutlass.BFloat16, cutlass.Float16):
+                    raise NotImplementedError(f"SM90 grouped GEMM dGLU {name} must be BF16 or FP16, got {desc.dtype}")
         if self.expert_cnt <= 0 or self.expert_cnt > 1024:
             raise ValueError(f"expert count must be in [1, 1024], got {self.expert_cnt}")
+        self._not_implemented_error_if(
+            self._deterministic and (self._has_dbias or self._framework != "torch"),
+            "deterministic dprob is implemented only for torch tensors without dbias",
+        )
 
         if not self._kernel.can_implement(
             cutlass.BFloat16,
@@ -389,8 +420,8 @@ class GroupedGemmDgluBf16API(APIBase):
                 raise NotImplementedError("gate_then_up BF16 dGLU requires dswiglu with BF16 C/D")
             if self.c_desc.shape[1] % 256 != 0:
                 raise ValueError("gate_then_up BF16 dGLU requires each gate/up branch N divisible by 128")
-        if not has_tcgen05(major):
-            raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
+        if not (has_tcgen05(major) or has_wgmma(major)):
+            raise RuntimeError(f"GroupedGemmDgluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
         return True
 
@@ -411,6 +442,7 @@ class GroupedGemmDgluBf16API(APIBase):
                 glu_clamp_min=self.glu_clamp_min,
                 round_dgrad_to_input_dtype=self.round_dgrad_to_input_dtype,
                 glu_layout=self.glu_layout,
+                **({"deterministic": True} if self._deterministic else {}),
             )
         return self._kernel_obj
 
@@ -469,7 +501,7 @@ class GroupedGemmDgluBf16API(APIBase):
             else None
         )
         prob_fake = self._make_fake_cute_tensor(self.prob_desc.dtype, (valid_m, 1, 1), self.prob_desc.stride)
-        dprob_fake = self._make_fake_cute_tensor(self.dprob_desc.dtype, (valid_m, 1, 1), self.dprob_desc.stride)
+        dprob_fake = self._make_fake_cute_tensor(self.dprob_desc.dtype, (valid_m, *self.dprob_desc.shape[1:]), self.dprob_desc.stride)
 
         if self.weight_mode == MoEWeightMode.DENSE:
             b_fake = self._make_fake_cute_tensor_from_desc(self.b_desc)
@@ -607,12 +639,12 @@ class GroupedGemmDgluBf16API(APIBase):
         self._expect_shape(c_desc, (tensor_m, two_n, 1), "c_tensor")
         self._expect_shape(d_desc, (tensor_m, two_n, 1), "d_row_tensor")
         self._expect_shape(prob_desc, (tensor_m, 1, 1), "prob_tensor")
-        self._expect_shape(dprob_desc, (tensor_m, 1, 1), "dprob_tensor")
+        self._expect_shape(dprob_desc, (tensor_m, self._dprob_slots, 1), "dprob_tensor")
         self._expect_stride(a_desc, (k, 1, tensor_m * k), "a_tensor")
         self._expect_stride(c_desc, (two_n, 1, tensor_m * two_n), "c_tensor")
         self._expect_stride(d_desc, (two_n, 1, tensor_m * two_n), "d_row_tensor")
         self._expect_stride(prob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "prob_tensor")
-        self._expect_stride(dprob_desc, canonicalize_unit_dim_strides((tensor_m, 1, 1), (1, 1, 1)), "dprob_tensor")
+        self._expect_stride(dprob_desc, self._dprob_stride(tensor_m), "dprob_tensor")
 
         if self._has_dbias:
             if dbias_tensor is None:

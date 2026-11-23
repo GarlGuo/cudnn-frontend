@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unified FE API for grouped GEMM wgrad on SM100+."""
+"""Unified FE API for grouped GEMM wgrad on SM90 (BF16) and SM100+."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
+    default_stream,
     detect_framework,
     framework_dtype,
     get_device,
@@ -30,6 +31,7 @@ from ..backend_utils import (
     backend_cache_key,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
+    wrapper_workspace,
 )
 from ..moe_utils import MoEWeightMode, WGradInputOrder, WgradSfTensormapConstructor
 
@@ -77,6 +79,7 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
+from ..unfused.moe_grouped_gemm_sm90 import schedule_override
 from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
@@ -133,7 +136,7 @@ class GroupedGemmWgradSm100(APIBase):
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -292,6 +295,18 @@ def wgrad_allocate_output(framework, wgrad_shape, wgrad_dtype, accumulate_on_out
     return jax.block_until_ready(allocator(wgrad_shape, dtype=framework_dtype(wgrad_dtype, "jax"), device=a_tensor.device))
 
 
+def _wgrad_execute(op, framework, current_stream, descriptor_workspace, **operands):
+    """Run a cached plan; a BF16 plan with a tile counter gets per-call scratch on the launch stream."""
+    implementation = op._implementation
+    nbytes = getattr(implementation, "_scratch_nbytes", 0) if descriptor_workspace is None else 0
+    if not nbytes:
+        op.execute(current_stream=current_stream, descriptor_workspace=descriptor_workspace, **operands)
+        return
+    launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, nbytes, operands["a_tensor"].device, launch_stream) as workspace:
+        implementation.execute(current_stream=launch_stream, workspace=workspace, **operands)
+
+
 # Operand-metadata key -> (op, framework, output shape, output dtype); see wrapper_operand_meta.
 _wgrad_wrapper_memo: dict = {}
 
@@ -309,7 +324,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
     global_scale_b: Optional[torch.Tensor] = None,
     acc_dtype: Optional[torch.dtype] = None,
     wgrad_dtype: Optional[torch.dtype] = None,
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -340,7 +355,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             offsets_tensor,
             wgrad_dtype=wgrad_dtype if wgrad_dtype is not None else cutlass.BFloat16,
             acc_dtype=acc_dtype if acc_dtype is not None else cutlass.Float32,
-            mma_tiler_mn=mma_tiler_mn,
+            mma_tiler_mn=mma_tiler_mn or (256, 256),
             cluster_shape_mn=cluster_shape_mn,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
@@ -365,20 +380,25 @@ def grouped_gemm_wgrad_wrapper_sm100(
         wrapper_operand_meta(global_scale_b),
         acc_dtype,
         wgrad_dtype,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         sf_vec_size,
         sf_fp8_dtype_override,
         accumulate_on_output,
         input_order,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        schedule_override(),
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
         op, framework, wgrad_shape, memo_wgrad_dtype = memo
         if wgrad_tensor is None and wgrad_ptrs is None:
             wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
-        op.execute(
+        _wgrad_execute(
+            op,
+            framework,
+            current_stream,
+            descriptor_workspace,
             a_tensor=a_tensor,
             b_tensor=b_tensor,
             sfa_tensor=sfa_tensor,
@@ -386,10 +406,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
             offsets_tensor=offsets_tensor,
             wgrad_tensor=wgrad_tensor,
             wgrad_ptrs=wgrad_ptrs,
-            descriptor_workspace=descriptor_workspace,
             global_scale_a=global_scale_a,
             global_scale_b=global_scale_b,
-            current_stream=current_stream,
         )
         return TupleDict(wgrad_tensor=wgrad_tensor)
 
@@ -451,13 +469,15 @@ def grouped_gemm_wgrad_wrapper_sm100(
         _wgrad_tensor_signature(global_scale_b, exact_stride=True),
         acc_dtype,
         wgrad_dtype,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         sf_vec_size,
         sf_fp8_dtype_override,
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
+        # The SM90 schedule is a function of the shapes and tile above plus the forced one.
+        schedule_override(),
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
@@ -505,7 +525,11 @@ def grouped_gemm_wgrad_wrapper_sm100(
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
     _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
-    op.execute(
+    _wgrad_execute(
+        op,
+        framework,
+        current_stream,
+        descriptor_workspace,
         a_tensor=a_tensor,
         b_tensor=b_tensor,
         sfa_tensor=sfa_tensor,
@@ -513,10 +537,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         offsets_tensor=offsets_tensor,
         wgrad_tensor=wgrad_tensor,
         wgrad_ptrs=wgrad_ptrs,
-        descriptor_workspace=descriptor_workspace,
         global_scale_a=global_scale_a,
         global_scale_b=global_scale_b,
-        current_stream=current_stream,
     )
     return TupleDict(wgrad_tensor=wgrad_tensor)
 

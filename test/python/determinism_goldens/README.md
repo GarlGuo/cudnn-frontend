@@ -4,6 +4,60 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### H100 SM90 BF16 grouped GEMM pingpong and epilogue scaling (2026-11-23)
+
+Pingpong runs only a 128x192 tile on a (2, 1) cluster, and a GLU only without C.
+Forced-pingpong cases (test-only schedule hook) in `gemm/cutedsl/test_grouped_gemm_wgrad_sm90_determinism.py`:
+replay, bytes equal to the cooperative 128x192 schedule, claim-order invariance
+down to one persistent cluster, and expert batch invariance. No wgrad golden is
+recorded: the cooperative records below cover the bytes.
+
+Recorded on H100 at 3a99fdb4 (run s9, strict check 8/8 under `CUDNN_DETERMINISM_GOLDENS`):
+new `grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` and `grouped_gemm_glu_sm90_bf16_pingpong_noc`
+(the GLU record replaces a 128x128 record with C, a tile pingpong no longer runs), and
+re-recorded `grouped_gemm_sm90_bf16_{fwd,dgrad}`. Numerical reason for the re-record: the
+epilogue now scales D once per row by `alpha * prob` instead of `(acc * alpha) * prob`; with
+these problems' non-unit alpha (0.5..1.5) the reassociation can move a D element by at most one
+bf16 ulp. C, the GLU, dGLU and wgrad records are unchanged, and unit alpha/prob is bitwise
+unchanged. The re-recorded D still matches the FP32 reference within the suites' tolerance.
+
+### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22)
+
+New SM90 (Hopper) kernels behind `grouped_gemm_wrapper_sm100` (forward, dgrad),
+`grouped_gemm_wgrad_wrapper_sm100`, `grouped_gemm_glu_wrapper_sm100` and
+`grouped_gemm_dglu_wrapper_sm100`. The five goldens are in `d7223a07b419e232/`.
+
+Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch
+2.14.0+cu130, CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0,
+tvm-ffi 0.1.16, compute-sanitizer 2026.1.1.0. Source built from the commit
+under test.
+
+```
+G=gemm/cutedsl
+F="$G/test_grouped_gemm_sm90.py $G/test_grouped_gemm_sm90_determinism.py $G/test_grouped_gemm_wgrad_sm90.py \
+   $G/test_grouped_gemm_wgrad_sm90_determinism.py $G/test_grouped_gemm_glu_sm90.py $G/test_grouped_gemm_glu_sm90_determinism.py"
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=<new directory> pytest -m L0 $F   # sharded over 5 GPUs
+```
+
+- `5f3bbb1e` (forward, dgrad, wgrad): 61 passed, 0 skipped. `b42265a3`: 61
+  passed. `c36a50af` (adds GLU and dGLU): 113 passed, 0 skipped, plus 3
+  wgrad scheduler tests.
+- The forward, dgrad and wgrad records are byte-identical across all three
+  commits; GLU and dGLU are recorded once, at `c36a50af`.
+- Each `test_sm90*_golden` case checks the FP32 reference and replays bitwise
+  before recording. The replay cases run 8 fresh-buffer launches against
+  concurrent second-stream work. Batch invariance covers a segment alone,
+  packed, reordered, duplicated and with changed neighbors.
+- Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000
+  warm and 3000 poisoned launches for forward, dgrad, wgrad, GLU and dGLU;
+  the unsafe control failed 200 of 200.
+- dGLU's `dprob` is an atomic per-row sum across N tiles and is excluded
+  from the byte checks (max replay difference 4.6e-5); its D is checked.
+- compute-sanitizer at `c36a50af`: racecheck and synccheck report 0 errors
+  for all four ops. memcheck reports 0 device errors, but exits 99 on 28
+  host API messages (cuda-python's requested CUDA 13030 exceeds the 13020
+  driver; a `cuMemCreate` refusal).
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
@@ -999,6 +1053,7 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_gate_then_up.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D/RHT payloads and scales, including standard GEMM-blocked column scales | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
+| `gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` | `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel with `deterministic=True` | — | dprob and D_row: replay under concurrent work (both activations, dense/discrete, static/dynamic scheduler, ragged and empty experts), expert reorder, duplicate and neighbor isolation in both GLU orders; launch-stream ordering; D_row equal to the atomic path |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -9241,3 +9296,107 @@ method, and paged QSA capacity helper while retaining the new tests: **10 failed
 10 passed** in 3.52 s. The corrected versions passed the targeted regression run.
 Mocked capability cases cover SM120 and SM121, but no SM12.x GPU or DSL 4.9
 run was available. Those execution scopes remain unverified.
+
+## Grouped BF16 dGLU deterministic dprob — SM100, 2026-11-23 UTC
+
+`grouped_gemm_dglu_wrapper_sm100(..., deterministic=True)` now covers the
+SM100-family BF16 kernel as well as the block-scaled one. Each
+(token, N-tile) dprob partial gets its own FP32 slot, and the slots are
+summed in a fixed order on the launch stream. The new
+`gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` (18 cases: 17 L0,
+plus an L1 case at scale) checks the following:
+
+- Replay: eight runs on fresh outputs with concurrent work on another
+  stream compare dprob and `D_row` as raw bytes. This covers both
+  activations, dense and discrete weights, and the static and dynamic
+  schedulers. The shape is N=1024 (four N-tiles), K=256 and experts of
+  512/0/256/768 tokens plus 256 rows of capacity.
+- Expert reorder, solo, duplicate and changed-neighbor runs: they keep each
+  expert's dprob and `D_row` bytes, with natural-rank tensors in both GLU
+  orders.
+- `D_row` is byte-equal to the atomic path.
+- dprob matches the atomic path within 1e-4 and the independent Torch
+  reference within the BF16 tolerance. Rows past the last offset stay zero.
+- Slot zero-fill and reduction run on the launch stream, both when the
+  current stream is busy and when the launch stream is busy.
+- dbias and JAX inputs are rejected.
+
+The one skip is dGeGLU with `gate_then_up`, which the BF16 kernel does not
+support.
+
+Runtime: NVIDIA GB200 (cc 10.0, 152 SMs, aarch64), driver 595.71.05,
+PyTorch 2.14.1+cu130, CuTe DSL 4.8.0 (CUDA 13.4 compiler), tvm-ffi 0.1.16,
+at `2b98a25d` plus this change. The source tree was imported with a stubbed
+compiled core, so no cuDNN backend was involved.
+
+```
+pytest -m "L0 or L1" gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py  # 17 passed, 1 skipped
+pytest -m L0 <the dGLU suites below>   # new tree: 602 passed, 426 skipped, 2 failed of 1030
+```
+
+The dGLU suites are `test_grouped_gemm_dglu{,_bf16_determinism,_bf16_training,_activation,_gate_then_up,_workspace}.py`,
+`test_grouped_dgeglu_autograd.py`, `test_grouped_gemm_backward_canonical.py`
+and `gemm/jax/test_grouped_gemm_dglu_jax.py`. The two failures,
+`test_dglu_activation_caller_workspace_and_first_capture[False/True]`, fail
+the same way on develop in this environment: the stubbed core's
+`make_operand_buffer` has no `__dlpack__`.
+
+The suite fails against develop: 17 failed, 1 skipped (BF16 rejects the
+flag). It also fails against three mutations:
+
+- All N-tiles write slot 0: replay and batch-invariance cases fail with
+  156-373 differing bytes.
+- Reduction on torch's current stream: the busy-launch-stream case fails.
+- Zero-fill on torch's current stream: the busy-current-stream case fails.
+
+At the suite's shape, the atomic dprob changed in 29 of 29 replays for each
+of the eight activation/weight/scheduler cases, in up to 645 of 1792 rows.
+The deterministic dprob changed in 0 of 29.
+
+At the FC2 shapes, with 20 runs, fixed inputs and EP4/EP8, the atomic dprob
+changed in 19 of 19 replays. That was up to 32152/65536 rows for DeepSeek-V3
+(N=2048) and up to 55320/98304 for Qwen3-2.4T. The deterministic dprob
+changed in 0 of 19, and `D_row` never changed on either path. Non-default
+tiles and clusters ((256, 256)/(2, 2) at N=768, (128, 256)/(1, 1) at N=800
+and (256, 128)/(2, 1) at N=544) replay bitwise and stay within 4e-7 of the
+atomic path.
+
+compute-sanitizer 2026.1.1 reports 0 errors under memcheck and 0 hazards
+under racecheck. Memcheck ran three suite cases, including `gate_then_up`,
+and four direct launches: two at the default tile, one with the (2, 2)
+cluster and one with the (128, 256) tile. Racecheck ran the two default-tile
+launches. SM103 and SM107 were not run, only compiled: ptxas 13.4.92 reports
+0 spills for the deterministic configurations, 26 on sm_100a and 24 on sm_107a.
+
+### Grouped BF16 dGLU deterministic dprob — SM90 kernel, 2026-11-23 UTC
+
+The SM90 (Hopper) BF16 dGLU kernel takes the same `deterministic=True` flag:
+each (token, N-tile) partial goes to its own FP32 slot, with one slot per
+SM90 N tile (128 or 256 columns, rounded up to whole clusters along N). The
+wrapper zero-fills the slots and sums them on the launch stream, as on SM100.
+`gemm/cutedsl/test_grouped_gemm_dglu_bf16_sm90_determinism.py` (18 L0 cases,
+plus an L1 case at the DeepSeek-V3 FC2 dgrad shape) checks replay under
+concurrent work at both tiles and the (1, 2) and (2, 2) clusters. It also
+checks partial N tiles, expert reorder, solo, duplicate and changed-neighbor
+runs, D_row against the atomic path, dprob against the Torch reference,
+empty experts, the launch stream, and dbias and JAX rejections.
+
+H100 run s10 at `37a80724` (NVIDIA H100 80GB HBM3, SM90): the suite passed 19
+of 19 (L0 and L1). The L1 control shows the atomic dprob changed in 19 of 19
+replays, in up to 6444 of 8192 rows, while the deterministic path replayed
+bitwise and D never changed. The full SM90 L0 regression passed 235 of 235, the
+8 SM90 goldens passed a strict check, and compute-sanitizer memcheck (2 cases,
+including N tiles rounded up to whole clusters), racecheck and synccheck found
+nothing. Cost on fc2 dGLU (deterministic / atomic time): EP8 and EP4
+DeepSeek-V3 and qwen38_2p4t measured 1.007 to 1.009 gated and 0.991 to 1.006
+back-to-back.
+
+Before the H100 run, compile checks: with CuTe DSL
+4.8.0 and ptxas 13.2.86 for sm_90a, all nine dGLU configurations report 0
+spills and no warnings, with the flag off and on. setmaxnreg stays at 56/224.
+With the flag off, the SM90 PTX is byte-identical to `1733e54b` in 9 of 9
+configurations, and the SM100 BF16 dGLU PTX is byte-identical in 36 of 36.
+On GB200, the suite runs on the SM100 kernel when its SM90 gate is removed;
+18 of 19 cases pass. The JAX case fails because it targets the SM90-only
+rejection. At the L1 shape, the SM100 atomic dprob changed in 19 of 19
+replays, in up to 4450 of 8192 rows.

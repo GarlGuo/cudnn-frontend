@@ -248,8 +248,10 @@ class MoESchedulerParams:
         cta_tile_shape_mnk: Tuple[int, int, int],  # (tile_m, tile_n, tile_k)
         cluster_shape_mn: Tuple[int, int],  # (cluster_m, cluster_n)
         use_dynamic_sched: bool = False,
+        atomic_counter_claim: bool = False,  # 2Dx2D (SM90, no CLC): claim from the gmem atomic counter on persistent clusters
     ):
         self.scenario = scenario
+        self.atomic_counter_claim = atomic_counter_claim
         e, i, h = expert_shape
         self.expert_cnt = e if isinstance(e, Int32) else Int32(e)
         self.intermediate = i if isinstance(i, Int32) else Int32(i)
@@ -259,6 +261,11 @@ class MoESchedulerParams:
         if scenario == "2Dx2D":
             use_dynamic_sched = True
         self.use_dynamic_sched = use_dynamic_sched
+
+    @property
+    def uses_clc(self) -> bool:
+        """2Dx2D claims with CLC (Blackwell) unless it claims from the atomic counter: a grid of every tile, not persistent clusters."""
+        return self.scenario == "2Dx2D" and not self.atomic_counter_claim
 
     @property
     def cluster_tile_m(self) -> int:
@@ -295,6 +302,7 @@ class MoESchedulerParams:
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
             use_dynamic_sched=self.use_dynamic_sched,
+            atomic_counter_claim=self.atomic_counter_claim,
         )
 
     @staticmethod
@@ -305,10 +313,10 @@ class MoESchedulerParams:
         """
         Compute grid shape for kernel launch.
 
-        2Dx3D uses persistent clusters. 2Dx2D uses a full CTA grid with
-        cluster-level cancellation to rebalance uneven expert K lengths.
+        2Dx3D and 2Dx2D counter claims use persistent clusters. 2Dx2D CLC uses a
+        full CTA grid with cluster-level cancellation to rebalance uneven expert K lengths.
         """
-        if params.scenario == "2Dx2D":
+        if params.uses_clc:
             cm, cn = params.cluster_shape_mn
             tm, tn = params.cta_tile_shape_mnk[0], params.cta_tile_shape_mnk[1]
             grid_m = ((params.hidden + tm * cm - 1) // (tm * cm)) * cm
@@ -456,7 +464,7 @@ class MoEPersistentTileScheduler:
         """
         if const_expr(self.use_dynamic_sched):
             cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
-            if const_expr(self.scenario == "2Dx2D"):
+            if const_expr(self.params.uses_clc):
                 self.cluster_pipeline = pipeline.PipelineClcFetchAsync.create(
                     barrier_storage=self._sched_storage.cluster_mbar.data_ptr(),
                     num_stages=1,
@@ -720,7 +728,7 @@ class MoEPersistentTileScheduler:
         if const_expr(params.use_dynamic_sched):
             current_work_linear_idx = Int32(-1)
             is_leader_cta = (cta_id_in_cluster[0] + cta_id_in_cluster[1] + cta_id_in_cluster[2]) == Int32(0)
-            if const_expr(params.scenario == "2Dx2D"):
+            if const_expr(params.uses_clc):
                 producer_state_type = PipelineUserType.ProducerConsumer
             else:
                 producer_state_type = PipelineUserType.Producer
@@ -759,7 +767,7 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Get the initial work tile info."""
-        if const_expr(self.scenario == "2Dx2D"):
+        if const_expr(self.params.uses_clc):
             return self._initial_work_from_block_idx(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             if const_expr(not hasattr(self, "cluster_pipeline")):
@@ -774,7 +782,7 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def advance_to_next_work(self, *, loc=None, ip=None) -> MoEWorkTileInfo:
         """Advance to the next work tile and return its info."""
-        if const_expr(self.scenario == "2Dx2D"):
+        if const_expr(self.params.uses_clc):
             return self._fetch_next_clc_work(loc=loc, ip=ip)
         if const_expr(self.use_dynamic_sched):
             self._current_work_linear_idx = self._fetch_next_cluster_idx(loc=loc, ip=ip)
@@ -846,49 +854,58 @@ class MoEPersistentTileScheduler:
         """
         assert self.use_dynamic_sched
         ds = self._dynamic_state
-        broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
-        cluster_idx = Int32(0)
+        cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
+        if const_expr(cluster_size == 1):
+            # One CTA needs no DSMEM broadcast (compute-sanitizer rejects shared::cluster ops in a one-CTA cluster).
+            claim = cute.make_rmem_tensor((1,), Int32)
+            claim[0] = Int32(0)
+            with cute.arch.elect_one(loc=loc, ip=ip):
+                claim[0] = atomic_add_i32(ds.counter_ptr.llvm_ptr, Int32(1), loc=loc, ip=ip)
+            # The full-mask shuffle needs a converged warp, so elect.sync picked lane 0.
+            cluster_idx = cute.arch.shuffle_sync(claim[0], offset=0, mask=0xFFFFFFFF, mask_and_clamp=31)
+        else:
+            broadcast_tensor = cute.make_tensor(ds.broadcast_ptr, cute.make_layout((1,)))
+            cluster_idx = Int32(0)
 
-        # --- Producer: leader acquires and broadcasts ---
-        if ds.is_leader_cta:
-            self.cluster_pipeline.producer_acquire(ds.producer_state)
-            full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip)
-            tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
-            lane_idx = tidx % Int32(32)
-            cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
+            # --- Producer: leader acquires and broadcasts ---
+            if ds.is_leader_cta:
+                self.cluster_pipeline.producer_acquire(ds.producer_state)
+                full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(ds.producer_state.index, loc=loc, ip=ip)
+                tidx, _, _ = cute.arch.thread_idx(loc=loc, ip=ip)
+                lane_idx = tidx % Int32(32)
 
-            atomic_idx = Int32(0)
-            if lane_idx == 0:
-                atomic_idx = atomic_add_i32(
-                    ds.counter_ptr.llvm_ptr,
-                    Int32(1),
-                    loc=loc,
-                    ip=ip,
-                )
-            atomic_idx = cute.arch.shuffle_sync(
-                atomic_idx,
-                offset=0,
-                mask=0xFFFFFFFF,
-                mask_and_clamp=31,
-            )
-
-            if lane_idx < Int32(cluster_size):
-                store_i32_to_peer_cluster_smem_async(
-                    ds.broadcast_ptr,
+                atomic_idx = Int32(0)
+                if lane_idx == 0:
+                    atomic_idx = atomic_add_i32(
+                        ds.counter_ptr.llvm_ptr,
+                        Int32(1),
+                        loc=loc,
+                        ip=ip,
+                    )
+                atomic_idx = cute.arch.shuffle_sync(
                     atomic_idx,
-                    full_barrier_ptr,
-                    lane_idx,
-                    loc=loc,
-                    ip=ip,
+                    offset=0,
+                    mask=0xFFFFFFFF,
+                    mask_and_clamp=31,
                 )
 
-            self._cluster_producer_commit(loc=loc, ip=ip)
+                if lane_idx < Int32(cluster_size):
+                    store_i32_to_peer_cluster_smem_async(
+                        ds.broadcast_ptr,
+                        atomic_idx,
+                        full_barrier_ptr,
+                        lane_idx,
+                        loc=loc,
+                        ip=ip,
+                    )
 
-        ds.producer_state.advance()
+                self._cluster_producer_commit(loc=loc, ip=ip)
 
-        # --- Consumer: all CTAs read the broadcast value ---
-        self.cluster_pipeline.consumer_wait(ds.consumer_state)
-        cluster_idx = broadcast_tensor[0]
+            ds.producer_state.advance()
+
+            # --- Consumer: all CTAs read the broadcast value ---
+            self.cluster_pipeline.consumer_wait(ds.consumer_state)
+            cluster_idx = broadcast_tensor[0]
 
         return cluster_idx
 
@@ -896,9 +913,10 @@ class MoEPersistentTileScheduler:
     @cute.jit
     def _release_cluster_idx(self, *, loc=None, ip=None) -> None:
         """Release the cluster broadcast slot after the fetched value has been consumed."""
-        ds = self._dynamic_state
-        self._cluster_consumer_release(loc=loc, ip=ip)
-        ds.consumer_state.advance()
+        if const_expr(self.cluster_shape_mn[0] * self.cluster_shape_mn[1] > 1):
+            ds = self._dynamic_state
+            self._cluster_consumer_release(loc=loc, ip=ip)
+            ds.consumer_state.advance()
 
     @dsl_user_op
     @cute.jit
