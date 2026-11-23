@@ -308,9 +308,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         c_smem_layout_stage_one = sm90_utils.make_smem_layout_epi(c_dtype, c_layout, epi_tile, 1)
         d_smem_layout_stage_one = sm90_utils.make_smem_layout_epi(d_dtype, d_layout, epi_tile, 1)
 
-        ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one) + cute.size_in_bytes(b_dtype, b_smem_layout_stage_one)
-        )
+        ab_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one) + cute.size_in_bytes(b_dtype, b_smem_layout_stage_one)
         mbar_helpers_bytes = 1024
         sinfo_bytes = 4 * 4 * num_tile_stage
         c_stage_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one)
@@ -620,7 +618,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
     def _expert_row_view(ext, tensor, padded_offsets, work_tile_info):
         """A per-row ``tensor`` (prob, dprob) at its expert's first row by a 32-bit offset, fewer registers than the
         64-bit one.  Needs rows x n < 2^31 (check_row_views_fit_32_bits)."""
-        if cutlass.const_expr(hasattr(ext, "token_offset")):     # update_expert_info's, this tile's expert
+        if cutlass.const_expr(hasattr(ext, "token_offset")):  # update_expert_info's, this tile's expert
             token_offset, tokens_i = ext.token_offset, ext.tokens_i
         else:
             token_offset, tokens_i = compute_expert_token_range(padded_offsets, work_tile_info.expert_idx)
@@ -740,12 +738,8 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         b_full_mcast_mask = None
         # Multicast masks must be created together when any mcast is active.
         if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast):
-            a_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
-            )
-            b_full_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
-            )
+            a_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2)
+            b_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1)
 
         # SMEM fragments for WGMMA plus the register accumulator shared by MMA and epilogue.
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -776,9 +770,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         # ---- Scheduler warp (MoE Persistent Tile Scheduler) ----
         if warp_idx == self.sched_warp_id:
             work_tile_info = scheduler.initial_work_tile_info()
-            tile_info_producer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Producer, self.num_tile_stage
-            )
+            tile_info_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_tile_stage)
             while work_tile_info.is_valid_tile:
                 tile_info_pipeline.producer_acquire(tile_info_producer_state)
                 with cute.arch.elect_one():
@@ -808,9 +800,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         if warp_idx == self.c_load_warp_id:
             c_ext = self._make_extension(workspace_ptr)
             c_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_c_stage)
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_stage
-            )
+            tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
@@ -829,9 +819,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                 )
                 c_ext.update_expert_info(padded_offsets, work_tile_info.expert_idx)
                 real_c, _ = c_ext.get_gmem_tensor("c", mC_mnl, padded_offsets, work_tile_info)
-                gC_mnl_loop = cute.local_tile(
-                    real_c, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None)
-                )
+                gC_mnl_loop = cute.local_tile(real_c, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
                 gC_tile = gC_mnl_loop[(None, None, work_tile_info.tile_m_idx, work_tile_info.tile_n_idx, 0)]
                 gC_epi = cute.zipped_divide(gC_tile, epi_tile)
                 bGS_sC, bGS_gC = cpasync.tma_partition(
@@ -867,9 +855,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         if warp_idx == self.tma_warp_id:
             ext = self._make_extension(workspace_ptr)
             ab_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_stage
-            )
+            tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
 
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
@@ -978,16 +964,12 @@ class MoEGroupedGemmDgluBf16KernelSm90:
 
             epi_ext = self._make_extension(workspace_ptr)
             ab_consumer_read_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
-            ab_consumer_release_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_ab_stage
-            )
+            ab_consumer_release_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
             c_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_c_stage)
             d_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_threads)
             d_pipeline = pipeline.PipelineTmaStore.create(num_stages=self.num_d_stage, producer_group=d_producer_group)
 
-            tile_info_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_tile_stage
-            )
+            tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
             tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
             tile_info_pipeline.consumer_wait(tile_info_consumer_state)
             for idx in cutlass.range(4, unroll_full=True):
@@ -1054,9 +1036,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                 real_dprob = self._expert_row_view(epi_ext, dprob, padded_offsets, epi_work_tile_info)
                 m_base = epi_work_tile_info.tile_m_idx * self.cta_tile_shape_mnk[0]
 
-                gD_mnl_loop = cute.local_tile(
-                    real_d, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None)
-                )
+                gD_mnl_loop = cute.local_tile(real_d, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
                 gD_tile = gD_mnl_loop[(None, None, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx, 0)]
                 gD_epi = cute.zipped_divide(gD_tile, epi_tile)
                 bSG_sD, bSG_gD = cpasync.tma_partition(
