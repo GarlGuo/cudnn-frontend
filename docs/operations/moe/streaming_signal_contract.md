@@ -200,6 +200,19 @@ unchanged, and `signal[t]` covers M tile t's scale factors as well as its rows o
 | GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
 | other | Dense weights, `padded_offsets` in global memory, no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA. |
 
+### Input direction with compact SFA (`compact_sfa_sf_warp=True`)
+
+An EP dispatch delivers each token's scales as a compact row, not as SF atoms. With `compact_sfa_sf_warp=True` the GLU
+kernel takes `sfa` as those rows and builds the atoms itself:
+
+| Item | Contract |
+|---|---|
+| SFA | Compact E8M0 rows `[M, K / 32]` (row r = A row r's scales, K order), MXFP8 only, `K % 512 == 0`. |
+| M tile t | A rows and compact SFA rows `[256 t, 256 (t + 1))`: the contiguous bytes `[t * 256 * K / 32, (t + 1) * 256 * K / 32)`. |
+| producer | Writes both, padding rows included, before the release store of `signal[t]`. |
+| GEMM | A dedicated SF warp (the last warp) reads each tile's rows with L2-only loads (`ld.global.cg`, 64-bit row index) after the tile's acquire, and stores each row's 4-scale word into the stage's atom. It does `fence.proxy.async.shared::cta` before and after the stores, then `fence.release.cluster` and an arrive on the MMA leader's full barrier; the MMA warp acquires it at cluster scope. The TMA warp loads no SFA. |
+| other | As stock SFA; cluster (2, 1) with the 2-CTA MMA and the interleaved GLU layout. With every option off the generated code is unchanged. |
+
 ## 5. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |
@@ -267,8 +280,8 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
   exists on the GLU kernel only and requires `streaming_signal_capacity`.
 - Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3), `N_CHUNK` on the block-scaled
-  quant forward kernels with BF16 D, and the input direction on the SM100 block-scaled GLU kernel with stock SFA
-  (section 4). Other recipes are not wired up yet.
+  quant forward kernels with BF16 D, and the input direction on the SM100 block-scaled GLU kernel with stock or compact
+  SFA (section 4). Other recipes are not wired up yet.
 
 ## Acknowledgements
 

@@ -60,7 +60,9 @@ def require_sm10x_cutedsl():
 
 def signal_options(capacity, variant):
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity)
-    if variant == "signal_layout_trigger":
+    if variant.startswith("compact"):
+        options["compact_sfa_sf_warp"] = True
+    if variant.endswith("signal_layout_trigger"):
         options.update(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
     return options
 
@@ -69,7 +71,7 @@ ROUTINGS = {"many_experts_64": MANY_EXPERTS_64, "big_expert": BIG_EXPERT}
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("variant", ["signal", "signal_layout_trigger"])
+@pytest.mark.parametrize("variant", ["signal", "signal_layout_trigger", "compact_signal", "compact_signal_layout_trigger"])
 @pytest.mark.parametrize("routing", sorted(ROUTINGS))
 def test_mxfp8_glu_signal_replays_match_dynamic(variant, routing):
     """Replays on fresh buffers beside concurrent work give the same C and D bytes, which equal the stock scheduler's."""
@@ -83,8 +85,8 @@ def test_mxfp8_glu_signal_replays_match_dynamic(variant, routing):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("late", ["a", "sfa"])
-def test_mxfp8_glu_producer_release_order_invariance(late):
+@pytest.mark.parametrize("late, compact", [("a", False), ("sfa", False), ("sfa", True)], ids=["late_a", "late_sfa", "late_compact_sfa"])
+def test_mxfp8_glu_producer_release_order_invariance(late, compact):
     """The GEMM starts while every M tile reads not-ready and the late operand holds NaN; a producer releases the tiles
     in order, in reverse and in a seeded random order.  Every order gives the stock scheduler's bytes."""
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
@@ -93,7 +95,7 @@ def test_mxfp8_glu_producer_release_order_invariance(late):
     problem = make_problem(tokens, N, HIDDEN, seed=7)
     capacity = problem["rows"] // ROWS_ALIGNMENT
     expected = snapshot(Launcher(make_glu_kernel(len(tokens), use_dynamic_sched=True), problem)(problem)[0])
-    kernel = make_glu_kernel(len(tokens), use_dynamic_sched=True, streaming_signal_capacity=capacity)
+    kernel = make_glu_kernel(len(tokens), use_dynamic_sched=True, streaming_signal_capacity=capacity, compact_sfa_sf_warp=compact)
     launcher = Launcher(kernel, problem, max_active_clusters=4)
     launcher(problem, signal_ready(kernel))
     torch.cuda.synchronize()
@@ -138,23 +140,25 @@ def test_mxfp8_glu_signal_target_expert_batch_invariance(device_layout):
 
 
 @pytest.mark.L0
-def test_mxfp8_glu_signal_slot_release_warm_stress():
-    """The claim slot each cluster broadcasts is released only after every lane read it (python/cudnn/AGENTS.md Rule 11):
-    back-to-back and shared-memory-poisoned launches with many claims per cluster, every byte against stock."""
+@pytest.mark.parametrize("compact", [False, True], ids=["sfa_atoms", "compact_sfa"])
+def test_mxfp8_glu_signal_slot_release_warm_stress(compact):
+    """The claim slot each cluster broadcasts, and with the SF warp its tile_info slot, are released only after every
+    lane read them (python/cudnn/AGENTS.md Rule 11): back-to-back and shared-memory-poisoned launches with many claims
+    per cluster, every byte against stock."""
     from warm_stress import StressCase, assert_warm_stress
 
     clusters = 4
     problem = make_problem(BIG_EXPERT, N, HIDDEN, seed=13)
     assert problem["rows"] == sum(padded(t) for t in BIG_EXPERT), "every C and D row is written, so the sentinel fill is overwritten"
     stock, _ = Launcher(make_glu_kernel(len(BIG_EXPERT), use_dynamic_sched=True), problem)(problem)
-    kernel = make_glu_kernel(len(BIG_EXPERT), use_dynamic_sched=True, streaming_signal_capacity=problem["rows"] // ROWS_ALIGNMENT)
+    kernel = make_glu_kernel(len(BIG_EXPERT), use_dynamic_sched=True, streaming_signal_capacity=problem["rows"] // ROWS_ALIGNMENT, compact_sfa_sf_warp=compact)
     launcher = Launcher(kernel, problem, max_active_clusters=clusters)
     c, d, workspace = launcher.buffers(problem)
     reset = signal_ready(kernel)
     claims = (problem["rows"] // ROWS_ALIGNMENT) * (N // 256)
     assert_warm_stress(
         StressCase(
-            "MXFP8 GLU streaming signal scheduler, big expert, 4 clusters",
+            f"MXFP8 GLU streaming signal scheduler{', compact SFA' if compact else ''}, big expert, 4 clusters",
             launch=lambda: launcher.launch(problem, (c, d, workspace)),
             outputs={"c": c, "d": d},
             thread_blocks=2 * clusters,

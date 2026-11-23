@@ -2633,26 +2633,28 @@ as part of this addition.
 
 ### Block-scaled grouped GEMM streaming input signal (FC1 GLU) — SM100, 2026-11-23
 
-`gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py` adds 9 L0 forward cases for
-`streaming_signal_capacity` on the MXFP8 block-scaled SwiGLU kernel (E4M3 A/B with E8M0 SF atoms quantized once, BF16
+`gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py` adds 14 L0 forward cases for
+`streaming_signal_capacity`, with stock SFA atoms and with `compact_sfa_sf_warp` (compact E8M0 rows, the SF warp builds
+the atoms), on the MXFP8 block-scaled SwiGLU kernel (E4M3 A/B with E8M0 SF atoms quantized once, BF16
 C/D, dense weights, 256 x 256 tile, cluster (2, 1), dynamic scheduler). The signal scheduler reorders tiles and waits
 only, so every case compares raw C and D bytes with the stock dynamic scheduler:
 
-- Replay (4 cases): host layout and `device_layout` with use_pdl and the all-slots-ready trigger, on 64 ragged experts
-  and a 5000-row expert; three launches each on fresh NaN-filled C/D and workspace beside concurrent work.
-- Producer release order (2 cases): A codes or SFA atoms poisoned (NaN) until a producer stream writes each M tile's rows
+- Replay (8 cases): host layout and `device_layout` with use_pdl and the all-slots-ready trigger, stock and compact
+  SFA, on 64 ragged experts and a 5000-row expert; three launches each on fresh NaN-filled C/D and workspace beside concurrent work.
+- Producer release order (3 cases): A codes, SFA atoms or compact SFA rows poisoned (NaN) until a producer stream writes each M tile's rows
   and SFA bytes and releases it, in order, in reverse and in a seeded random order; all orders give identical bytes.
 - Batch invariance (2 cases): the 700-row target expert alone, with neighbors, behind empty experts, among 1/255/257-row
   experts, reordered and duplicated, under host and device layout.
-- Claim-slot warm stress (1 case, Rule 11): 0 wrong of 500 warm and 0 of 500 poisoned launches (8 thread blocks, 25 slot
-  refills per launch, below the control's geometry); the unsafe control failed 200 of 200.
+- Claim-slot warm stress (2 cases, Rule 11; the compact case also covers the SF warp's tile_info release): 0 wrong of
+  500 warm and 0 of 500 poisoned launches each (8 thread blocks, 25 slot refills per launch, below the control's
+  geometry); the unsafe control failed 200 of 200.
 
 `test_grouped_gemm_blockscaled_glu_streaming_signal.py` holds the producer tests with A and SFA poisoned independently
 and together (a scheduler that ignores readiness fails all 20) and a check that the poison reaches D. No golden is
 recorded. The kernels have no backward.
 
 Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0 (CUDA 12.9), one GPU:
-both FC1 files with the two FC2 files at `-m "L0 or L1"`: **95 passed** (40 FC1, 55 FC2), 0 skipped. SM103 is
+both FC1 files with the two FC2 files at `-m "L0 or L1"`: **119 passed** (64 FC1, 55 FC2), 0 skipped. SM103 is
 unverified; SM107 runs the Rubin GLU kernel, which has no input direction yet. From `test/python`:
 
 ```bash
