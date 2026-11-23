@@ -97,6 +97,24 @@ def make_problem(tokens_per_expert, n, k, seed=0):
     return assemble_problem(a, a_exp, b.view(experts, n, k), b_exp, layout, alpha, prob)
 
 
+def dequantize(codes, exponents):
+    k = codes.shape[-1]
+    # A lookup of exact powers of two (E8M0 exponent e is 2^(e - 127)).
+    powers = torch.tensor([2.0**e for e in range(-127, 129)], device="cuda")
+    return codes.float() * powers[exponents[..., : k // SF_VEC_SIZE].long()].repeat_interleave(SF_VEC_SIZE, dim=-1)
+
+
+def reference(problem):
+    """float32 D = alpha[e] * prob * (SFA * A) @ (SFB * B[e])^T over the experts' rows, from the unswizzled codes and scales."""
+    a, n = dequantize(problem["a"], problem["a_exp"]), problem["n"]
+    out, begin = torch.zeros(problem["rows"], n, device="cuda"), 0
+    for expert, end in enumerate(problem["offsets"].tolist()):
+        b = dequantize(problem["b"][expert], problem["b_exp"][expert * n : (expert + 1) * n])
+        out[begin:end] = problem["alpha"][expert] * (a[begin:end] @ b.T)
+        begin = end
+    return out * problem["prob"][:, 0, :]
+
+
 def new_buffers(kernel, problem):
     """A NaN-filled BF16 D and a zeroed workspace."""
     d = torch.full((problem["rows"], problem["n"]), float("nan"), device="cuda", dtype=torch.bfloat16)

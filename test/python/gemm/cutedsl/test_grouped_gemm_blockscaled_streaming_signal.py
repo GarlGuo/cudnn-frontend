@@ -26,6 +26,7 @@ from gemm.cutedsl._streaming_signal_blockscaled import (  # noqa: F401  (require
     make_quant_kernel,
     new_buffers,
     notify_kernel,
+    reference,
     require_sm100,
     require_sm10x,
     valid_rows,
@@ -65,6 +66,17 @@ def test_mxfp8_output_notify_publishes_every_chunk(clusters_beside_consumer, one
     torch.cuda.synchronize()
     assert torch.equal(out["d"].view(torch.int16), stock["d"].view(torch.int16))
     assert chunk_signal(kernel, workspace).tolist() == list(range(len(range(0, n, chunk))))
+
+
+@pytest.mark.L0
+def test_mxfp8_output_notify_matches_float_reference():
+    """An independent check of the bytes compared above: D is within 2e-2 of a float32 reference computed from the
+    dequantized E4M3 codes and E8M0 scales (partial last chunk, an empty expert, a one-row expert)."""
+    n, chunk = 768, 512
+    tokens = ROUTINGS["uneven"]
+    problem = make_problem(tokens, n, HIDDEN, seed=3)
+    out, _ = Launcher(notify_kernel(len(tokens), n, chunk), problem)(problem)
+    torch.testing.assert_close(out["d"].float(), reference(problem)[: valid_rows(problem)], atol=2e-2, rtol=2e-2)
 
 
 # The consumer is the GEMM's PDL dependent on its stream (the contract's topology: a consumer on another stream could take

@@ -2649,13 +2649,13 @@ and (1, 1) with the 128 x 256 1-CTA tile. N_CHUNK reorders tiles only, so every 
 - Claim-slot warm stress (1 case, Rule 11): 0 wrong of 500 warm and 0 of 500 poisoned launches (8 thread blocks, 25
   slot refills per launch, below the control's geometry, so the zero bounds little); the unsafe control reproduced.
 
-`test_grouped_gemm_blockscaled_streaming_signal.py` holds a concurrent consumer that copies each chunk on publication (a
-variant that counts tiles before their D stores fails 9 of its 12 cases, all 3 at L0). No golden is recorded: the claim
-is byte equality with the stock scheduler on the same runtime, whose numerics the existing quant tests cover. The kernel
-has no backward.
+`test_grouped_gemm_blockscaled_streaming_signal.py` holds the independent float reference (D within 2e-2 of float32
+math on the dequantized codes and scales, L0) and a concurrent consumer that copies each chunk on publication (a variant
+that counts tiles before their D stores fails 9 of its 12 cases, all 3 at L0). No golden is recorded: the claim is byte
+equality with the stock scheduler on the same runtime. The kernel has no backward.
 
 Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, CuTe DSL 4.8.0, with this change's `python/` tree, one GPU per
-file: both files at `-m "L0 or L1"` collected 55 cases and **55 passed** (47 + 8), 0 skipped. SM103 is unverified; the
+file: both files at `-m "L0 or L1"` collected 56 cases and **56 passed** (48 + 8), 0 skipped. SM103 is unverified; the
 SM107 (Rubin) quant kernel is not wired. From `test/python`:
 
 ```bash
