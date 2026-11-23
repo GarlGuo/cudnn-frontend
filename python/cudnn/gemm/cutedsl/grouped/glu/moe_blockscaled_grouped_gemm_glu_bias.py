@@ -896,7 +896,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         if cutlass.const_expr(scheduler_counter is not None):
             workspace_ptr = scheduler_counter.iterator
         a = kernel_facing_mx(a)
-        # The SF warp loads 4 K tiles' words per row at once: 16-byte aligned compact rows.
+        # The SF warp loads and releases 4 K tiles' words per row at once: 16-byte aligned compact rows.
         if cutlass.const_expr(self.compact_sfa_sf_warp and cute.is_static(a.shape[1]) and cute.size(a, mode=[1]) % 512 != 0):
             raise ValueError(f"compact_sfa_sf_warp requires K % 512 == 0, got K = {cute.size(a, mode=[1])}")
         c = kernel_facing_mx(c)
@@ -924,6 +924,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
         self._setup_attributes()
+        # The SF warp holds 4 stages between its empty waits and its arrives.
+        if cutlass.const_expr(self.compact_sfa_sf_warp and self.num_ab_stage < self.SF_WARP_K_TILES_PER_LOAD):
+            raise ValueError(f"compact_sfa_sf_warp needs >= {self.SF_WARP_K_TILES_PER_LOAD} A/B stages, got {self.num_ab_stage}")
 
         # ---- B / SFB setup (mode-dependent) ----
         b_from_call_arg = b
@@ -3280,6 +3283,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
     #: K tiles of compact SFA words the SF warp loads at once: one 16-byte L2-only load per row (K % 512 == 0).
     SF_WARP_K_TILES_PER_LOAD = 4
+    #: Stages the SF warp stores between two cluster-scope releases (a release per stage costs more than its MMA).
+    SF_WARP_RELEASE_BATCH = 4
 
     @cute.jit
     def compact_sfa_sf_warp_loop(self, compact_sfa_words, sSFA, mA_mkl, padded_offsets, sInfo, tile_info_pipeline, ab_pipeline, leader_cta, lane_idx, zero):
@@ -3291,7 +3296,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         words = cute.make_tensor(compact_sfa_words, cute.make_layout((rows_total, 4, words_per_row), stride=(words_per_row, 32 * words_per_row, 1)))
         lines = cute.make_tensor(cute.recast_ptr(sSFA.iterator, dtype=cutlass.Int32), cute.make_layout((32, 4, self.num_ab_stage), stride=(4, 1, 128)))
         group = self.SF_WARP_K_TILES_PER_LOAD
-        queue = [cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32) for _ in range(group)]
+        # Two groups of K tiles in flight: a group's loads are issued right after its slots were stored, 2 groups ahead.
+        queue = [cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32) for _ in range(2 * group)]
         sf_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
         tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
         tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
@@ -3303,26 +3309,40 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             # A 64-bit row: row x words per row passes 2^31 at large M.
             row = cutlass.Int64(token_offset) + cutlass.Int64(tile_info[1]) * self.cta_tile_shape_mnk[0] + cutlass.Int64(lane_idx)
             rows = words[(row, None, None)]
-            self._load_compact_sfa_group(queue, rows, 0)
+            self._load_compact_sfa_group(queue[:group], rows, 0)
+            if group < k_tile_cnt:
+                self._load_compact_sfa_group(queue[group:], rows, group)
             sf_producer_state.reset_count()
-            for k_tile_base in cutlass.range(0, k_tile_cnt, group, unroll=1):
-                for j in cutlass.range_constexpr(group):
-                    ab_pipeline.sync_object_empty.wait(sf_producer_state.index, sf_producer_state.phase)
-                    # The MMA's tcgen05.cp read the stage through the async proxy: order that before these generic stores.
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    for row_group in cutlass.range_constexpr(4):
-                        lines[(lane_idx, row_group, sf_producer_state.index)] = queue[j][row_group]
-                    # tcgen05.cp reads the atom through the async proxy; the peer's stores reach the leader's MMA.
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        fence_release_cluster()
-                        cute.arch.mbarrier_arrive(
-                            ab_pipeline.producer_get_barrier(sf_producer_state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER
-                        )
-                    sf_producer_state.advance()
-                if k_tile_base + group < k_tile_cnt:
-                    self._load_compact_sfa_group(queue, rows, k_tile_base + group)
+            # K tiles go out in groups of 4 (k_tile_cnt % 4 == 0): one cluster release per group, not per K tile.
+            for k_tile_base in cutlass.range(0, k_tile_cnt, 2 * group, unroll=1):
+                for half in cutlass.range_constexpr(2):
+                    if k_tile_base + half * group < k_tile_cnt:
+                        for batch_first in cutlass.range_constexpr(0, group, self.SF_WARP_RELEASE_BATCH):
+                            arrive_state = sf_producer_state.clone()
+                            for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
+                                ab_pipeline.sync_object_empty.wait(sf_producer_state.index, sf_producer_state.phase)
+                                sf_producer_state.advance()
+                            # The MMA's tcgen05.cp read these stages through the async proxy: order that before the stores.
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            store_state = arrive_state.clone()
+                            for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
+                                for row_group in cutlass.range_constexpr(4):
+                                    lines[(lane_idx, row_group, store_state.index)] = queue[half * group + batch_first + j][row_group]
+                                store_state.advance()
+                            # tcgen05.cp reads the atoms through the async proxy, the peer's from the leader's MMA.
+                            cute.arch.fence_proxy("async.shared", space="cta")
+                            cute.arch.sync_warp()
+                            with cute.arch.elect_one():
+                                # One release for the batch, then relaxed arrives; the MMA leader acquires at cluster scope.
+                                fence_release_cluster()
+                                for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
+                                    cute.arch.mbarrier_arrive(
+                                        ab_pipeline.producer_get_barrier(arrive_state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER
+                                    )
+                                    arrive_state.advance()
+                        # This group's slots are stored: load the group two ahead into them.
+                        if k_tile_base + half * group + 2 * group < k_tile_cnt:
+                            self._load_compact_sfa_group(queue[half * group : (half + 1) * group], rows, k_tile_base + half * group + 2 * group)
             is_valid_tile = self._sf_warp_next_tile(sInfo, tile_info, tile_info_pipeline, tile_info_consumer_state, zero)
             tile_info_consumer_state.advance()
 
