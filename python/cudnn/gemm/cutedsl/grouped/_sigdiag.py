@@ -19,6 +19,11 @@ signal scheduler's Rubin overhead.  Every knob is read at trace time; unset, not
       not only read).  Which part of the role-3 log removes the Rubin gap.
   SIGDIAG_L2_A / SIGDIAG_L2_B / SIGDIAG_L2_CD = first | last | normal: an L2 eviction-priority cache policy on the
       A + SFA loads / B + SFB loads / C + D + D_col stores (CUTLASS's CacheHintSm90 constants).  Unset: no policy.
+  TIMELINE_ADDR=<device address of int32[1 << 23]>: a passive per-tile timeline, plain stores only (no atomics, no
+      waits): word ((expert * 64 + CTA tile m) * 64 + CTA tile n) * 16 + field = %globaltimer_lo at: 1 scheduler publish,
+      2 TMA tile start, 3 MMA acc-empty wait start, 4 MMA start (acc acquired), 5 MMA all issued (acc commit),
+      6 epilogue acc-full wait start, 7 epilogue start (acc full), 8 epilogue early acc release, 9 epilogue tile end;
+      field 0 = %smid + 1 (epilogue).  MMA fields exist for the MMA leader CTA's tiles only.
   SIGDIAG_NO_FINALIZE=1   a signal-scheduler build without the final cluster barrier (internal_finalize)
   SIGDIAG_STOCK_FINALIZE=1  with SIGDIAG_STOCK_SCHED: add that cluster barrier to the stock scheduler
 """
@@ -118,3 +123,19 @@ def l2_policy(operand: str):
     if not name:
         return None
     return cutlass.Int64(_L2_POLICY[name])
+
+
+def timeline_on() -> bool:
+    return int(os.environ.get("TIMELINE_ADDR", "0")) != 0
+
+
+def tl(field: int, expert, tile_m, tile_n, smid: bool = False):
+    """One thread: the passive timeline's ``field`` of this tile (see the module docstring)."""
+    addr = int(os.environ.get("TIMELINE_ADDR", "0"))
+    if addr == 0:
+        return
+    base = cute.make_ptr(Int32, addr, AddressSpace.gmem, assumed_align=16)
+    rec = cute.make_tensor(base + ((expert * 64 + tile_m) * 64 + tile_n) * 16, cute.make_layout((16,)))
+    rec[field] = cute.arch.globaltimer_lo()
+    if smid:
+        rec[0] = cute.arch.smid() + 1

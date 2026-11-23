@@ -9,6 +9,8 @@ atoms), every M tile ready, dsv3 and qwen35 EP4 per-rank shapes.  From test/pyth
     python -m gemm.cutedsl.perf.rubin_sigsched_bisect tilelog
     # L2 eviction-policy x epilogue-phase sweep (L2CFGS / SLEEPS env lists)
     ncu --metrics gpu__time_duration.sum,dram__bytes_op_read.sum,lts__t_sector_hit_rate.pct -k regex:kernel_kernel --csv python -m gemm.cutedsl.perf.rubin_sigsched_bisect ncu sweep
+    # passive per-tile timeline (TL_VARIANTS env list)
+    python -m gemm.cutedsl.perf.rubin_sigsched_bisect timeline
     # TMA coordinates per tile, stock vs signal / signal_stock_sched / signal_hyb_both (no ncu)
     python -m gemm.cutedsl.perf.rubin_sigsched_bisect coords
 
@@ -72,6 +74,7 @@ KNOBS = (
     "SIGDIAG_L2_A",
     "SIGDIAG_L2_B",
     "SIGDIAG_L2_CD",
+    "TIMELINE_ADDR",
 )
 L2_CONFIGS = {
     "none": {},
@@ -250,6 +253,46 @@ def coords(shapes):
                 print(f"    {k}: stock {ref.get(k)} vs {m.get(k)}")
 
 
+def timeline(shapes):
+    """Passive per-tile timeline (plain stores only) for TL_VARIANTS (default stock_dynamic,signal,signal_epi_sleep1000,
+    stock_epi_sleep3000): per-tile phase durations and the MMA leader's accumulator handoff between consecutive tiles."""
+    names = os.environ.get("TL_VARIANTS", "stock_dynamic,signal,signal_epi_sleep1000,stock_epi_sleep3000").split(",")
+    every = dict(VARIANTS)
+    every.update(sweep_variants())
+    buf = torch.zeros(1 << 23, dtype=torch.int32, device="cuda")
+    q = lambda x: f"{np.median(x) / 1e3:6.2f}/{np.percentile(x, 90) / 1e3:6.2f}" if len(x) else "   -  /   -  "
+    for shape in shapes:
+        experts, rows, hidden, inter = SHAPES[shape]
+        problem = bs.make_problem([rows] * experts, 2 * inter, hidden, seed=0)
+        print(f"== {shape}  (us median/p90)")
+        for name in names:
+            VARIANTS[name] = every[name]
+            run = build(shape, name, problem, {"TIMELINE_ADDR": str(buf.data_ptr())}, tag="timeline")
+            for _ in range(3):
+                buf.zero_()
+                launch(problem, run)
+            t = buf.cpu().numpy().reshape(-1, 16).astype(np.int64)
+            t = t[t[:, 9] != 0]
+            for f in range(1, 10):
+                t[:, f] = np.where(t[:, f] != 0, t[:, f] & 0xFFFFFFFF, 0)
+            t0 = t[:, 1:10][t[:, 1:10] > 0].min()
+            t[:, 1:10] = np.where(t[:, 1:10] > 0, t[:, 1:10] - t0, -1)
+            lead = t[t[:, 4] >= 0]
+            span = t[:, 9].max()
+            # Consecutive tiles of one MMA leader (same SM): next MMA start minus this tile's early release / tile end.
+            handoff, overlap = [], []
+            for sm in np.unique(lead[:, 0]):
+                c = lead[lead[:, 0] == sm]
+                c = c[np.argsort(c[:, 4])]
+                handoff += list(c[1:, 4] - c[:-1, 8])
+                overlap += list(c[1:, 4] < c[:-1, 9])
+            print(
+                f"  {name:26} tiles {len(t)} span {span / 1e3:7.1f} | MMA: acc-empty wait {q(lead[:, 4] - lead[:, 3])}, issue {q(lead[:, 5] - lead[:, 4])} | "
+                f"epi: acc-full wait {q(t[:, 7] - t[:, 6])}, start->early release {q(t[:, 8] - t[:, 7])}, release->end {q(t[:, 9] - t[:, 8])} | "
+                f"next MMA start - early release {q(handoff)}, next MMA starts before epilogue end {np.mean(overlap):.2f}"
+            )
+
+
 if __name__ == "__main__":
     shapes = os.environ.get("DIAG_SHAPES", ",".join(SHAPES)).split(",")
     if "sweep" in sys.argv[1:]:
@@ -257,6 +300,8 @@ if __name__ == "__main__":
         bisect(shapes)
     elif "tilelog" in sys.argv[1:]:
         tilelog(shapes)
+    elif "timeline" in sys.argv[1:]:
+        timeline(shapes)
     elif "coords" in sys.argv[1:]:
         coords(shapes)
     else:

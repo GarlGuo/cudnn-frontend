@@ -1990,6 +1990,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 if cutlass.const_expr(_sigdiag.tilelog_on(0)):
                     with cute.arch.elect_one():
                         _sigdiag.tilelog(0, (work_tile_info.expert_idx, work_tile_info.tile_m_idx, work_tile_info.tile_n_idx))
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    with cute.arch.elect_one():
+                        _sigdiag.tl(1, work_tile_info.expert_idx, work_tile_info.tile_m_idx, work_tile_info.tile_n_idx)
 
                 self.sched_sync_barrier.arrive_and_wait()
                 tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -2154,6 +2157,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 if cutlass.const_expr(self.use_streaming_signal_sched):
                     cute.arch.fence_proxy("async.global")
 
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    with cute.arch.elect_one():
+                        _sigdiag.tl(2, work_tile_info.expert_idx, work_tile_info.tile_m_idx, work_tile_info.tile_n_idx)
                 if cutlass.const_expr(_sigdiag.tilelog_on(1)):
                     with cute.arch.elect_one():
                         _sigdiag.tilelog(
@@ -2376,8 +2382,16 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 #
                 # Wait for accumulator buffer empty
                 #
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    if is_leader_cta:
+                        with cute.arch.elect_one():
+                            _sigdiag.tl(3, tile_info[0], tile_info[1], tile_info[2])
                 if is_leader_cta:
                     acc_pipeline.producer_acquire(acc_producer_state, peek_acc_empty_status)
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    if is_leader_cta:
+                        with cute.arch.elect_one():
+                            _sigdiag.tl(4, tile_info[0], tile_info[1], tile_info[2])
                 #
                 # Mma mainloop
                 #
@@ -2468,6 +2482,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 #
                 if is_leader_cta:
                     acc_pipeline.producer_commit(acc_producer_state)
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    if is_leader_cta:
+                        with cute.arch.elect_one():
+                            _sigdiag.tl(5, tile_info[0], tile_info[1], tile_info[2])
 
                 # Peek (try_wait) Acc buffer empty for k_tile = k_tile + 1
                 acc_producer_state.advance()
@@ -2867,7 +2885,15 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 #
                 # Wait for accumulator buffer full
                 #
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    if warp_idx == self.epilog_warp_id[0]:
+                        with cute.arch.elect_one():
+                            _sigdiag.tl(6, epi_work_tile_info.expert_idx, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx)
                 acc_pipeline.consumer_wait(acc_consumer_state)
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    if warp_idx == self.epilog_warp_id[0]:
+                        with cute.arch.elect_one():
+                            _sigdiag.tl(7, epi_work_tile_info.expert_idx, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx)
 
                 # For breuse: process bkeep (m_half=0) then breuse (m_half=1) M-halves.
                 # For non-breuse: one pass (m_half=0).
@@ -2925,6 +2951,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                                 with cute.arch.elect_one():
                                     acc_pipeline.consumer_release(acc_consumer_state)
                                 acc_consumer_state.advance()
+                                if cutlass.const_expr(_sigdiag.timeline_on()):
+                                    if warp_idx == self.epilog_warp_id[0]:
+                                        with cute.arch.elect_one():
+                                            _sigdiag.tl(8, epi_work_tile_info.expert_idx, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx)
 
                         #
                         # Apply alpha (+ bias if enabled)
@@ -3154,6 +3184,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
+                if cutlass.const_expr(_sigdiag.timeline_on()):
+                    if warp_idx == self.epilog_warp_id[0]:
+                        with cute.arch.elect_one():
+                            _sigdiag.tl(9, epi_work_tile_info.expert_idx, epi_work_tile_info.tile_m_idx, epi_work_tile_info.tile_n_idx, smid=True)
                 if cutlass.const_expr(_sigdiag.tilelog_on(3)):
                     if warp_idx == self.epilog_warp_id[0]:
                         with cute.arch.elect_one():
