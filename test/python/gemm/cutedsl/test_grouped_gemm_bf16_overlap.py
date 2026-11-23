@@ -17,6 +17,7 @@ import cudnn
 from cudnn.tensor_adapter import has_wgmma
 from determinism_utils import assert_bitwise, snapshot
 from gemm.cutedsl import test_grouped_gemm_sm90 as gemm
+from gemm.cutedsl.test_grouped_gemm_wgrad_bf16_utils import make_grouped_gemm_wgrad_bf16_problem
 
 pytestmark = pytest.mark.L0
 
@@ -30,6 +31,11 @@ def _capability():
 
 
 def _make(op, seed, discrete=False):
+    if op == "wgrad":
+        # M = N, N = K over 32 experts of 512 tokens; a per-seed scale keeps the two problems' bytes apart.
+        problem = make_grouped_gemm_wgrad_bf16_problem(group_k_list=COUNTS, m=N, n=K, a_major="m", b_major="n", discrete=discrete)
+        problem["a"].mul_(0.5 * seed)
+        return problem
     problem = gemm.make_problem(COUNTS, n=N, k=K, direction=op, seed=seed)
     if discrete:
         problem["b_ptrs"] = torch.tensor([expert.data_ptr() for expert in problem["weights"]], dtype=torch.int64, device="cuda")
@@ -60,6 +66,23 @@ def _launch(op, problem, sched, schedule=None):
     if op in ("fwd", "dgrad"):
         result = gemm.run(problem, schedule=schedule, **kwargs)
         return {"c": result["c_tensor"], "d": result["d_tensor"]}
+    output = torch.empty_like(problem["output"])
+    discrete = problem["discrete"]
+    ptrs = torch.tensor([expert.data_ptr() for expert in output], dtype=torch.int64, device="cuda") if discrete else None
+    with gemm.override_schedule(schedule):
+        cudnn.grouped_gemm_wgrad_wrapper_sm100(
+            a_tensor=problem["a"],
+            b_tensor=problem["b"],
+            sfa_tensor=None,
+            sfb_tensor=None,
+            offsets_tensor=problem["offsets"],
+            output_mode="discrete" if discrete else "dense",
+            wgrad_tensor=output,
+            wgrad_ptrs=ptrs,
+            acc_dtype=torch.float32,
+            wgrad_dtype=problem["output_dtype"],
+        )
+    return {"wgrad": output}
 
 
 def _assert_overlap_matches_serial(op, sched, discrete=False, schedule=None):
@@ -80,7 +103,9 @@ def _assert_overlap_matches_serial(op, sched, discrete=False, schedule=None):
 
 SM100_CASES = [
     *[(op, sched) for op in ("fwd", "dgrad") for sched in ("static", "dynamic")],
+    ("wgrad", None),
     *[(op, sched) for op in ("fwd-discrete",) for sched in ("static", "dynamic")],
+    ("wgrad-discrete", None),
 ]
 
 
@@ -91,13 +116,13 @@ def test_sm100_bf16_overlapping_streams(op, sched):
     _assert_overlap_matches_serial(op.split("-")[0], sched, discrete=op.endswith("discrete"))
 
 
-# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad.
-SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad") for schedule in (None, "cooperative", "pingpong")]
+# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad, cooperative for wgrad (N=1024).
+SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad", "wgrad") for schedule in (None, "cooperative", "pingpong")]
 
 
 @pytest.mark.parametrize("op,schedule", SM90_CASES, ids=[f"{op}-{schedule or 'heuristic'}" for op, schedule in SM90_CASES])
 def test_sm90_bf16_overlapping_streams(op, schedule):
-    # SM90 runs the dynamic (atomic-counter) scheduler by default.
+    # SM90 runs the dynamic (atomic-counter) scheduler by default (and dense wgrad only).
     if not has_wgmma(_capability()[0]):
         pytest.skip("SM90 is required")
     _assert_overlap_matches_serial(op, None, schedule=schedule)
