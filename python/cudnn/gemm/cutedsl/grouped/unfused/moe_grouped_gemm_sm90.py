@@ -177,6 +177,7 @@ class MoEGroupedGemmBf16KernelSm90:
             and cd_major == "n"
             and is_valid_tensor_alignment(m, n, k, l, ab_dtype, d_dtype, a_major, b_major, cd_major)
             and n % 32 == 0
+            and k > 0
             and m % 256 == 0
         )
 
@@ -406,7 +407,8 @@ class MoEGroupedGemmBf16KernelSm90:
         ab_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one) + cute.size_in_bytes(b_dtype, b_smem_layout_stage_one)
         mbar_helpers_bytes = 1024
         sinfo_bytes = 4 * 4 * num_tile_stage
-        c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one) * num_epi_groups
+        # Without C no sC is allocated, so its bytes go to A/B and D stages.
+        c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one) * num_epi_groups if generate_c else 0
         d_bytes = cute.size_in_bytes(d_dtype, d_smem_layout_stage_one) * num_epi_groups
 
         free_bytes = num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + d_bytes + sinfo_bytes)
@@ -572,14 +574,16 @@ class MoEGroupedGemmBf16KernelSm90:
         SchedulerStorage = MoEPersistentTileScheduler.make_storage_struct(self.num_tile_stage, True)
 
         # ---- Shared storage ----
+        sC_cosize = cute.cosize(self.c_smem_layout_staged.outer)
+        sC_field = cute.struct.Align[cute.struct.MemRange[self.c_dtype, sC_cosize], self.buffer_align_bytes]
+        if cutlass.const_expr(not self.generate_c):
+            sC_field = cute.struct.MemRange[self.c_dtype, 0]
+
         @cute.struct
         class SharedStorage:
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             scheduler: SchedulerStorage
-            sC: cute.struct.Align[
-                cute.struct.MemRange[self.c_dtype, cute.cosize(self.c_smem_layout_staged.outer)],
-                self.buffer_align_bytes,
-            ]
+            sC: sC_field
             sD: cute.struct.Align[
                 cute.struct.MemRange[self.d_dtype, cute.cosize(self.d_smem_layout_staged.outer)],
                 self.buffer_align_bytes,
@@ -764,7 +768,7 @@ class MoEGroupedGemmBf16KernelSm90:
         if cute.size(self.cluster_shape_mn) > 1:
             cute.arch.cluster_arrive_relaxed()
 
-        sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner)
+        sC = storage.sC.get_tensor(c_smem_layout_staged.outer, swizzle=c_smem_layout_staged.inner) if cutlass.const_expr(self.generate_c) else None
         sD = storage.sD.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
@@ -1012,13 +1016,10 @@ class MoEGroupedGemmBf16KernelSm90:
                 # ---- mainloop: one accumulator init and one wgmma fence per output tile ----
                 ab_consumer_read_state.reset_count()
                 ab_consumer_release_state.reset_count()
+                # The first k-block zero-inits (K >= 1, so every tile has one): no register fill to sink past the WGMMA.
+                tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                 if cutlass.const_expr(self.pingpong):
-                    # The first k-block zero-inits: a register fill of the second m64 atom can sink past the first WGMMA.
-                    tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
                     mma_turn.arrive_and_wait()
-                else:
-                    accumulators.fill(0.0)
-                    tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                 warpgroup.fence()
 
                 prologue_mma_cnt = cutlass.min(k_pipe_mmas, k_tile_cnt)
@@ -1027,8 +1028,7 @@ class MoEGroupedGemmBf16KernelSm90:
                     for kblock_idx in cutlass.range_constexpr(num_k_blocks):
                         kblock_coord = (None, None, kblock_idx, ab_consumer_read_state.index)
                         cute.gemm(tiled_mma, accumulators, tCrA[kblock_coord], tCrB[kblock_coord], accumulators)
-                        if cutlass.const_expr(self.pingpong):
-                            tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                        tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                     warpgroup.commit_group()
                     ab_consumer_read_state.advance()
 
@@ -1050,9 +1050,6 @@ class MoEGroupedGemmBf16KernelSm90:
                 for k_tile in cutlass.range(0, prologue_mma_cnt, 1, unroll=1):
                     ab_pipeline.consumer_release(ab_consumer_release_state)
                     ab_consumer_release_state.advance()
-                if cutlass.const_expr(self.pingpong):
-                    if k_tile_cnt == 0:
-                        accumulators.fill(0.0)
 
                 # ---- epilogue ----
                 real_d, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
@@ -1120,12 +1117,12 @@ class MoEGroupedGemmBf16KernelSm90:
                         acc_base = subtile_idx * size_tRS_rD
                         for i in cutlass.range_constexpr(size_tRS_rD):
                             acc_coord = tRS_cAcc[acc_base + i]
-                            # prob depends on the row only: load it at the first N subtile of each M subtile.
+                            # The row scale alpha * prob, set at the first N subtile of each M subtile: D takes one multiply.
                             if cutlass.const_expr(subtile_idx % subtile_shape[1] == 0):
-                                tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0]
-                            c_value = tRS_rAcc[acc_base + i] * alpha_val
-                            tRS_rC[i] = c_value
-                            tRS_rD[i] = c_value * tRS_rProb[i]
+                                tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0] * alpha_val
+                            if cutlass.const_expr(self.generate_c):
+                                tRS_rC[i] = tRS_rAcc[acc_base + i] * alpha_val
+                            tRS_rD[i] = tRS_rAcc[acc_base + i] * tRS_rProb[i]
 
                     if cutlass.const_expr(self.generate_c and self.fused_glu):
                         # C keeps the pre-activation gate and up blocks; two C stores per D subtile, own buffers.
