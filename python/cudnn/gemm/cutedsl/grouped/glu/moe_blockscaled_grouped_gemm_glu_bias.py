@@ -347,6 +347,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         compact_sfa_sf_warp: bool = False,
         compact_sfa_cta_release: bool = False,
         generate_sfd_col: bool = True,
+        tight_sf_tmem_cols: bool = False,
+        sfd_col_lane_scales: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -474,6 +476,11 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         self.generate_sfd = generate_sfd
         # __call__ narrows it to generate_sfd (an SFD is written at all) and this request.
         self.generate_sfd_col = generate_sfd_col
+        # tight_sf_tmem_cols: SF TMEM columns = the SF TMEM layouts' footprints (16 for MXFP8 at 256 x 256, not 48).
+        self.tight_sf_tmem_cols = tight_sf_tmem_cols
+        # sfd_col_lane_scales: column SFD maxima by one warp redux per column, lane l computes column l's scale only,
+        # shared through a per-warp smem scratch (64 FP32 per epilogue warp).
+        self.sfd_col_lane_scales = sfd_col_lane_scales
         self.discrete_col_sfd = discrete_col_sfd
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
@@ -639,7 +646,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
             self.d_layout,
             self.sf_dtype,
             self.sf_vec_size,
-            self.num_smem_capacity - (256 if self.use_sfb_reorder_warp else 0),
+            self.num_smem_capacity - (256 if self.use_sfb_reorder_warp else 0) - (4 * 64 * self.num_epilog_warps if self.sfd_col_lane_scales else 0),
             self.occupancy,
             self.generate_sfd,
             bias_dtype=self.bias_dtype if self.enable_bias else None,
@@ -706,7 +713,19 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            )
+            sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+            )
+            self.num_sfa_tmem_cols = utils.compute_tmem_cols_from_layout(sfa_tmem_layout, self.sf_dtype)
+            self.num_sfb_tmem_cols = utils.compute_tmem_cols_from_layout(sfb_tmem_layout, self.sf_dtype)
+            assert self.num_sfa_tmem_cols % 4 == 0, f"SFA's {self.num_sfa_tmem_cols} TMEM columns misalign SFB's tcgen05.cp"
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            self.num_sf_tmem_cols = -(-self.num_sf_tmem_cols // 16) * 16
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         )
@@ -1239,6 +1258,11 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                 cute.struct.MemRange[self.sf_dtype, cute.cosize(self.sfb_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
+            # sfd_col_lane_scales: per epilogue warp, 32 column maxima then 32 column scales
+            sColScratch: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 64 * self.num_epilog_warps if self.sfd_col_lane_scales else 0],
+                16,
+            ]
             # Amax reduction shared memory (one FP32 per epilogue warp)
             sAmax: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Float32, self.num_epilog_warps],
@@ -1558,6 +1582,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         rcp_limit,
         tRSrD,
         tile_info,
+        scratch=None,
     ) -> None:
         # Get absolute max across a vector and Compute SFD
         tTR_rAcc_frg = cute.logical_divide(src, cute.make_layout(self.sf_vec_size))
@@ -1566,7 +1591,36 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         acc_frg = type(acc_frg)(abs_acc_frg_ir, acc_frg.shape, acc_frg.dtype)
 
         tmp_f32 = cutlass.Float32(0.0)
-        for vi in cutlass.range_constexpr(acc_frg.shape[0]):
+        if cutlass.const_expr(self.sfd_col_lane_scales):
+            # The loop below's values, computed once per column: a warp redux per column (NaN-propagating max), then
+            # lane l's column scale only, shared through the warp's scratch.
+            lane = cute.arch.lane_idx()
+            col_max = cute.make_rmem_tensor(cute.make_layout(acc_frg.shape[0]), cutlass.Float32)
+            for vi in cutlass.range_constexpr(acc_frg.shape[0]):
+                col_max[vi] = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+            scratch_max = cute.make_tensor(scratch.iterator, cute.make_layout(32))
+            scratch_scale = cute.make_tensor(scratch.iterator + 32, cute.make_layout(32))
+            cute.arch.sync_warp()
+            cute.autovec_copy(col_max, scratch_max)
+            cute.arch.sync_warp()
+            max_value_original = scratch_max[lane] * rcp_limit * norm_const
+            max_value_vec = cute.full(4, max_value_original, dtype=cutlass.Float32)
+            max_value_vec_f8 = max_value_vec.to(cutlass.Float8E8M0FNU)
+            max_value_vec_f32_chunked = max_value_vec_f8.to(cutlass.Float32)
+            tmp_f32 = max_value_vec_f32_chunked[0]
+            acc_scale_col = cutlass.Float32(0.0)
+            if max_value_vec_f32_chunked[0] == 0.000000:
+                acc_scale_col = cutlass.Float32(0.0)
+            else:
+                acc_scale_col = norm_const * cute.arch.rcp_approx(max_value_vec_f32_chunked[0])
+            acc_scale_col = fmin(acc_scale_col, cutlass.Float32(3.40282346638528859812e38))
+            scratch_scale[lane] = acc_scale_col
+            cute.arch.sync_warp()
+            col_scale = cute.make_rmem_tensor(cute.make_layout(acc_frg.shape[0]), cutlass.Float32)
+            cute.autovec_copy(scratch_scale, col_scale)
+            for vi in cutlass.range_constexpr(acc_frg.shape[0]):
+                tTR_rAcc_frg[vi] = tTR_rAcc_frg[vi] * col_scale[vi]
+        for vi in cutlass.range_constexpr(0 if self.sfd_col_lane_scales else acc_frg.shape[0]):
             max_value_original = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0])) * rcp_limit * norm_const
             max_value_vec = cute.full(4, max_value_original, dtype=cutlass.Float32)
             max_value_vec_f8 = max_value_vec.to(cutlass.Float8E8M0FNU)
@@ -2839,6 +2893,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                 tCrSFDCol = cute.make_rmem_tensor(tCgSFDRow_mnl[(None, None, None, 0, 0, 0)].shape, self.sf_dtype)
                 tCrSFDCol_pvscale = cute.make_rmem_tensor_like(tCrSFDRow, cutlass.Float32)
                 tCrSFDCol_qpvscale_up_fp32 = cute.make_rmem_tensor_like(tCrSFDRow, cutlass.Float32)
+            column_scratch = None
+            if cutlass.const_expr(self.generate_sfd_col and self.sfd_col_lane_scales):
+                sColScratch = storage.sColScratch.get_tensor(cute.make_layout((64, self.num_epilog_warps), stride=(1, 64)))
+                column_scratch = sColScratch[(None, warp_idx % self.num_epilog_warps)]
 
             acc_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_acc_stage)
 
@@ -3166,6 +3224,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                                 d_rcp_limits,
                                 tRS_rD_col,
                                 tile_info,
+                                column_scratch,
                             )
 
                         # Assume subtile partitioned always happens on n dimension
