@@ -1003,6 +1003,7 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` | `MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel` with `streaming_signal_capacity` (host / device layout, PDL) or `streaming_output_notify=N_CHUNK` | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
 | `gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py` | `BlockScaledMoEGroupedGemmGluBiasKernel` (SM100), MXFP8 SwiGLU, with `streaming_signal_capacity` (host / device layout, PDL trigger; stock or compact SFA) | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
 | `gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` | `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel with `deterministic=True` | — | dprob and D_row: replay under concurrent work (both activations, dense/discrete, static/dynamic scheduler, ragged and empty experts), expert reorder, duplicate and neighbor isolation in both GLU orders; launch-stream ordering; D_row equal to the atomic path |
+| `gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal_determinism.py` | `MoEGroupedGemmDgluDbiasBf16Kernel`, `BlockScaledMoEGroupedGemmDgluDbiasKernel` (SM100, `deterministic=True`) with `streaming_signal_capacity` (PDL entry trigger; stock or compact SFA) | — | BF16 D and the FP32 dprob slots over the experts' rows: replay, producer release order, claim-slot warm stress |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -2658,6 +2659,33 @@ Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, 
 ```bash
 python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py -m L0 -q -rs
 python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal.py -m "L0 or L1" -q -rs
+```
+
+### dGLU streaming input signal (BF16 and MXFP8) — SM100, 2026-11-23
+
+`gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal_determinism.py` adds 13 L0 backward cases for
+`streaming_signal_capacity` on the dSwiGLU kernels `MoEGroupedGemmDgluDbiasBf16Kernel` (BF16 dY/W2/C/D) and
+`BlockScaledMoEGroupedGemmDgluDbiasKernel` (MXFP8 dY/W2 with E8M0 SF atoms or compact scale rows, BF16 C/D), both with
+`deterministic=True` (one FP32 dprob slot per 256-wide N tile), 256 x 256 tile, cluster (2, 1), dense weights, 64 ragged
+experts or a 5000-row expert. Every case compares raw D and dprob-slot bytes with the stock dynamic scheduler:
+
+- Replay (5 cases): with and without `use_pdl` and the entry trigger, BF16 and MXFP8, stock and compact SFA; three
+  launches each on fresh buffers beside concurrent work.
+- Producer release order (5 cases): dY codes, SFA atoms or compact rows poisoned (NaN) until a producer stream writes
+  each M tile and releases it, in order, in reverse and in a seeded random order; all orders give the same bytes.
+- Claim-slot warm stress (3 cases, Rule 11; the compact case also covers the SF warp's tile_info release): 0 wrong of
+  500 warm and 0 of 500 poisoned launches each.
+
+`test_grouped_gemm_dglu_streaming_signal.py` holds the functional cases (bytes equal to stock for the signal,
+entry-trigger and compact variants over three routings; producer tests with dY and its scales poisoned; poison
+detectors; rejected options). No golden is recorded.
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0, one GPU: both files at
+`-m "L0 or L1"`: **46 passed**. SM103 is unverified. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal_determinism.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal.py -m "L0 or L1" -q -rs
 ```
 
 ### Grouped GEMM streaming signal options — SM100, 2026-11-20

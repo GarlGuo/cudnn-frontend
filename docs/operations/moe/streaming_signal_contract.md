@@ -11,7 +11,8 @@ memory: the readiness signals.
 | GEMM → consumer | `streaming_output_notify=StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, ...)` | producer | one N chunk of D columns | `MoEStreamingOutputChunkSignalTileScheduler` |
 
 Kernels: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`,
-input direction only), BF16 on SM100-class GPUs; the input direction also on the block-scaled GLU kernel (section 4a).
+input direction only), BF16 on SM100-class GPUs; the input direction also on the block-scaled GLU kernel and the BF16
+and MXFP8 dGLU kernels (section 4a).
 Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is
 the same as without this feature.
 
@@ -212,12 +213,27 @@ release fence still emits a hardware async-proxy fence, the handoff takes hundre
 stale copy to read, so the PTX proxy rule it enforces is guarded by review, not by tests (racecheck does not model it
 either). Moving the arrive before the stores is caught (the producer and release-order tests fail).
 
+### Backward dGLU
+
+The dGLU kernels `MoEGroupedGemmDgluDbiasBf16Kernel` (BF16) and `BlockScaledMoEGroupedGemmDgluDbiasKernel` (MXFP8), both
+in `dglu/` on SM100, compute FC1's backward activation: dY x W2 with the dGLU epilogue over the saved pre-activation C.
+They read the dispatched output gradient dY as A, so the backward dispatch is the producer and `signal[t]` covers dY's
+rows of M tile t (and, for MXFP8, their scales) exactly as A's for the forward GLU. C, prob, alpha, beta and B are
+ordinary inputs that must be complete before the GEMM starts.
+
+| Item | Contract |
+|---|---|
+| options | `streaming_signal_capacity`, `use_pdl` and `launch_pdl_dependents_at_entry`; MXFP8 also `compact_sfa_sf_warp` (as above). No `device_layout` and no all-slots-ready trigger: the expert layout is known before the backward dispatch. |
+| M tile t | dY rows `[256 t, 256 (t + 1))`; MXFP8: their SF atoms or compact scale rows, as for the GLU. |
+| outputs | D, the row and column SFD and dprob are written per tile as without a producer. With `deterministic=True` dprob has one slot per N tile, so it is bitwise independent of the release order. |
+| other | Dense weights, `padded_offsets` in global memory, cluster (2, 1) with the 2-CTA MMA. |
+
 ## 4. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |
 |---|---|---|
 | `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). | The GEMM runs beside its producer on one stream. |
-| `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
+| `launch_pdl_dependents_at_entry=True` (plain and dGLU kernels) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
 | `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernels, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
 
 ## 5. Sketches
@@ -279,7 +295,7 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
   exists on the GLU kernels only and requires `streaming_signal_capacity`.
 - Covered today: the BF16 plain and GLU grouped GEMM forward kernels, and the input direction on the block-scaled GLU
-  forward kernel (section 4a). Other recipes are not wired up yet.
+  forward kernel and the BF16 and MXFP8 dGLU kernels (section 4a). Other recipes are not wired up yet.
 
 ## Acknowledgements
 
