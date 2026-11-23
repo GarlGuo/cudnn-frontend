@@ -1,4 +1,4 @@
-# Grouped GEMM + GLU (SM100)
+# Grouped GEMM + GLU (SM100 and SM90 BF16)
 
 **This is an experimental API and subject to change.**
 
@@ -109,6 +109,30 @@ The wrapper return order is exactly `c_tensor`, `d_tensor`, `d_col_tensor`,
 `amax_tensor`, `sfd_row_tensor`, `sfd_col_tensor`. On BF16,
 `d_col_tensor`, `amax_tensor`, `sfd_row_tensor`, and `sfd_col_tensor` are
 always `None`; `c_tensor` is `None` unless `generate_c=True`.
+
+## SM90 (Hopper)
+
+On an SM90 device, `GroupedGemmGluSm100` and `grouped_gemm_glu_wrapper_sm100`
+run a Hopper kernel for the BF16 contract (WGMMA and TMA, accumulator in
+registers). The `_sm100` suffix is historical; no new names are added. Limits:
+
+- `act_func` is `"swiglu"` or `"geglu"` with `glu_layout="interleaved_32"`;
+  `gate_then_up` raises `NotImplementedError`.
+- Dense K-major `B` only; discrete `b_ptrs` and `bias` raise `NotImplementedError`.
+- `C` and `D` are BF16 or FP16; FP32 raises `NotImplementedError`.
+- Torch tensors only (no JAX entry); block-scaled inputs are SM100 only.
+- SM90 uses the dynamic scheduler (atomic counter) by default; the static
+  scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
+- The SM90 kernel picks its warp-group schedule from the problem shape, and
+  `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
+  or `(128, 192)` for short K (`K <= 3072`, pre-activation `N >= 2048`), with
+  or without `generate_c`. SM100 uses `(256, 256)`. The short-K schedule runs
+  only on a `(128, 192)` tile with a `(2, 1)` cluster (given or defaulted); any
+  other tile or cluster runs the default schedule.
+  An explicit SM90 tile has M in `{64, 128}` and N a multiple of 64 up to 256.
+  `cluster_shape_mn=None` selects `(2, 1)`; an
+  explicit cluster has power-of-two sides, at most 8 CTAs, and a cluster M tile
+  (`tile_m * cluster_m`) that divides 256.
 
 ## Block-scaled contract
 

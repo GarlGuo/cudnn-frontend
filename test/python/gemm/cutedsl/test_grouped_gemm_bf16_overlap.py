@@ -16,6 +16,7 @@ import torch
 import cudnn
 from cudnn.tensor_adapter import has_wgmma
 from determinism_utils import assert_bitwise, snapshot
+from gemm.cutedsl import test_grouped_gemm_glu_sm90 as glu
 from gemm.cutedsl import test_grouped_gemm_sm90 as gemm
 
 pytestmark = pytest.mark.L0
@@ -30,7 +31,7 @@ def _capability():
 
 
 def _make(op, seed, discrete=False):
-    problem = gemm.make_problem(COUNTS, n=N, k=K, direction=op, seed=seed)
+    problem = gemm.make_problem(COUNTS, n=N, k=K, direction=op, seed=seed) if op in ("fwd", "dgrad") else glu.make_problem(COUNTS, n=N, k=K, seed=seed)
     if discrete:
         problem["b_ptrs"] = torch.tensor([expert.data_ptr() for expert in problem["weights"]], dtype=torch.int64, device="cuda")
     return problem
@@ -48,7 +49,10 @@ def _launch_discrete(op, problem, kwargs):
         generate_c=True,
         **kwargs,
     )
-    result = cudnn.grouped_gemm_wrapper_sm100(**common)
+    if op == "fwd":
+        result = cudnn.grouped_gemm_wrapper_sm100(**common)
+    else:
+        result = cudnn.grouped_gemm_glu_wrapper_sm100(sfa_tensor=None, **common)
     return {"c": result["c_tensor"], "d": result["d_tensor"]}
 
 
@@ -60,6 +64,15 @@ def _launch(op, problem, sched, schedule=None):
     if op in ("fwd", "dgrad"):
         result = gemm.run(problem, schedule=schedule, **kwargs)
         return {"c": result["c_tensor"], "d": result["d_tensor"]}
+    if op == "glu" and schedule == "pingpong":
+        # The forced pingpong case runs a GLU without the saved C; the heuristic case covers pingpong with C.
+        return {"d": glu.run_glu(problem, schedule=schedule, generate_c=False, **kwargs)["d_tensor"]}
+    if op == "glu":
+        result = glu.run_glu(problem, schedule=schedule, **kwargs)
+        return {"c": result["c_tensor"], "d": result["d_tensor"]}
+    if op == "dglu":
+        # dprob is an atomic sum across N tiles, so only D is compared bitwise.
+        return {"d": glu.run_dglu(problem, **kwargs)["d_row_tensor"]}
 
 
 def _assert_overlap_matches_serial(op, sched, discrete=False, schedule=None):
@@ -79,8 +92,8 @@ def _assert_overlap_matches_serial(op, sched, discrete=False, schedule=None):
 
 
 SM100_CASES = [
-    *[(op, sched) for op in ("fwd", "dgrad") for sched in ("static", "dynamic")],
-    *[(op, sched) for op in ("fwd-discrete",) for sched in ("static", "dynamic")],
+    *[(op, sched) for op in ("fwd", "dgrad", "glu", "dglu") for sched in ("static", "dynamic")],
+    *[(op, sched) for op in ("fwd-discrete", "glu-discrete") for sched in ("static", "dynamic")],
 ]
 
 
@@ -91,8 +104,8 @@ def test_sm100_bf16_overlapping_streams(op, sched):
     _assert_overlap_matches_serial(op.split("-")[0], sched, discrete=op.endswith("discrete"))
 
 
-# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad.
-SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad") for schedule in (None, "cooperative", "pingpong")]
+# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad / GLU with C; dGLU has one schedule.
+SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad", "glu") for schedule in (None, "cooperative", "pingpong")] + [("dglu", None)]
 
 
 @pytest.mark.parametrize("op,schedule", SM90_CASES, ids=[f"{op}-{schedule or 'heuristic'}" for op, schedule in SM90_CASES])
