@@ -87,7 +87,13 @@ def assert_outputs_match(kernel, got, want, label=""):
     for name in exact_outputs(kernel, want):
         assert torch.equal(got[name].view(torch.int16), want[name].view(torch.int16)), f"{label}: {name} differs from the stock scheduler"
     if not dprob_is_bitwise(kernel):
-        torch.testing.assert_close(got["dprob"], want["dprob"], rtol=1e-5, atol=1e-5, msg=lambda m: f"{label}: dprob: {m}")
+        # Atomic dprob differs from want only by fp32 reassociation of its partials.  The rounding is relative to the
+        # partials, not to the sum: a token whose large partials cancel can differ by a few ulp of the largest
+        # partial (Rubin: 0.016-0.047 at |dprob| up to 2.7e5, relative 2.7e-3 on such small sums).  So the absolute
+        # tolerance scales with the output (8 fp32 eps of max |want|), plus a small relative one.  The existing
+        # dprob comparisons use fixed rtol / atol 1e-4 at unit-scale data, which this reduces to there.
+        atol = 8 * torch.finfo(torch.float32).eps * max(want["dprob"].abs().max().item(), 1.0)
+        torch.testing.assert_close(got["dprob"], want["dprob"], rtol=1e-5, atol=atol, msg=lambda m: f"{label}: dprob: {m}")
 
 
 def make_problem(recipe, tokens_per_expert, seed=0, rows=None):
