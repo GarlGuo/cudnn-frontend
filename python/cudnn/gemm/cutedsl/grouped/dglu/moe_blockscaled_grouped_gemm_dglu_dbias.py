@@ -70,7 +70,8 @@ from ..moe_kernel_helpers import (
     is_valid_tensor_alignment,
     check_dynamic_sched_cluster_shape,
     compute_grid,
-    mbarrier_try_wait_parity_acquire_cluster,
+    mbarrier_try_wait_parity_relaxed_cluster,
+    fence_acquire_sync_restrict_shared_cluster_cluster,
 )
 from ..moe_streaming_input_block_tile_scheduler import (
     MoEInputBlockSignalSchedulerParams,
@@ -458,7 +459,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         # column l's scale (one E8M0 round trip and reciprocal, not 32), and the scales come back through the scratch.
         self.sfd_col_lane_scales = sfd_col_lane_scales
         self.stage_sfd_smem_requested = stage_sfd_smem
-        # K tiles the SF warp stores per arrive round: one CTA-scope arrive each, or one cluster release per batch.
+        # K tiles the SF warp stores per arrive round (SF_WARP_RELEASE_BATCH: 1, a restricted cluster release is cheap).
         self.sf_warp_release_batch = 1 if compact_sfa_cta_release else self.SF_WARP_RELEASE_BATCH
         self.device_layout = device_layout
         self.use_pdl = use_pdl
@@ -3031,12 +3032,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                     for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
                         # Conditionally wait for AB buffer full
                         ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
-                        # compact_sfa_sf_warp: the peer SF warp's sSFA stores arrive with .release.cluster; acquire them.
+                        # compact_sfa_sf_warp: the SF warps' sSFA stores arrive with a shared::cta-restricted cluster release: a relaxed
+                        # cluster-scope wait on the arrive, then the shared::cluster-restricted acquire (no L1 invalidate per K tile).
                         if cutlass.const_expr(self.compact_sfa_sf_warp and not self.compact_sfa_cta_release):
                             full_barrier = ab_pipeline.sync_object_full.get_barrier(ab_consumer_state.index)
                             sf_acquired = cutlass.Boolean(False)
                             while not sf_acquired:
-                                sf_acquired = mbarrier_try_wait_parity_acquire_cluster(full_barrier, ab_consumer_state.phase)
+                                sf_acquired = mbarrier_try_wait_parity_relaxed_cluster(full_barrier, ab_consumer_state.phase)
+                            fence_acquire_sync_restrict_shared_cluster_cluster()
                         ab_consumer_state_next = ab_consumer_state.clone()
                         ab_consumer_state_next.advance()
                         if k_tile < k_tile_cnt - 1:

@@ -64,7 +64,8 @@ from ..moe_kernel_helpers import (
     warp_amax_with_nan,
     epilog_gmem_copy_and_partition,
     check_dynamic_sched_cluster_shape,
-    mbarrier_try_wait_parity_acquire_cluster,
+    mbarrier_try_wait_parity_relaxed_cluster,
+    fence_acquire_sync_restrict_shared_cluster_cluster,
 )
 from ..moe_streaming_input_block_tile_scheduler import (
     MoEInputBlockSignalSchedulerParams,
@@ -273,7 +274,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         a dedicated SF warp writes each tile's atoms to shared memory and the TMA warp loads no SFA. MXFP8 only,
         ``K % 512 == 0``, cluster (2, 1) with the 2-CTA MMA.
     :param compact_sfa_cta_release: With ``compact_sfa_sf_warp``: the SF warp arrives on the MMA leader's full barrier once
-        per K tile with a CTA-scope release instead of one cluster-scope release per 4 K tiles, and the MMA warp does no
+        per K tile with a CTA-scope release instead of the default shared::cta-restricted cluster release, and the MMA warp does no
         cluster-scope acquire. Faster, but formally outside the PTX memory model: it relies on each SF warp storing only
         into its own CTA's shared memory (the leader's MMA reads the peer's atoms there through tcgen05.cp).
     :param generate_sfd_col: With ``sfd_row`` and ``norm_const``: also write the column-quantized ``d_col`` and its
@@ -503,7 +504,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         if compact_sfa_cta_release and not compact_sfa_sf_warp:
             raise ValueError("compact_sfa_cta_release requires compact_sfa_sf_warp")
         self.compact_sfa_cta_release = compact_sfa_cta_release
-        # K tiles the SF warp stores per arrive round: one CTA-scope arrive each, or one cluster release per batch.
+        # K tiles the SF warp stores per arrive round (SF_WARP_RELEASE_BATCH: 1, a restricted cluster release is cheap).
         self.sf_warp_release_batch = 1 if compact_sfa_cta_release else self.SF_WARP_RELEASE_BATCH
         self.device_layout = device_layout
         self.use_pdl = use_pdl
@@ -2580,12 +2581,14 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                             _wait_sfb_cluster(sfb_pair_barrier_base + ab_consumer_state.index, ab_consumer_state.phase)
                         else:
                             ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
-                        # compact_sfa_sf_warp: the peer SF warp's sSFA stores arrive with .release.cluster; acquire them.
+                        # compact_sfa_sf_warp: the SF warps' sSFA stores arrive with a shared::cta-restricted cluster release: a relaxed
+                        # cluster-scope wait on the arrive, then the shared::cluster-restricted acquire (no L1 invalidate per K tile).
                         if cutlass.const_expr(self.compact_sfa_sf_warp and not self.compact_sfa_cta_release):
                             full_barrier = ab_pipeline.sync_object_full.get_barrier(ab_consumer_state.index)
                             sf_acquired = cutlass.Boolean(False)
                             while not sf_acquired:
-                                sf_acquired = mbarrier_try_wait_parity_acquire_cluster(full_barrier, ab_consumer_state.phase)
+                                sf_acquired = mbarrier_try_wait_parity_relaxed_cluster(full_barrier, ab_consumer_state.phase)
+                            fence_acquire_sync_restrict_shared_cluster_cluster()
                         if cutlass.const_expr(self.glu_layout == "gate_then_up" and not self.use_2cta_instrs):
                             self.interleave_sfb_in_place(sSFB, ab_consumer_state.index, lane_idx)
 

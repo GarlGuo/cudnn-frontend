@@ -1429,6 +1429,22 @@ def fence_acquire_gpu(*, loc=None, ip=None) -> None:
     llvm.fence(llvm.AtomicOrdering.acquire, syncscope="device", loc=loc, ip=ip)
 
 
+@dsl_user_op
+def fence_release_sync_restrict_shared_cta_cluster(*, loc=None, ip=None) -> None:
+    """``fence.release.sync_restrict::shared::cta.cluster``: a cluster-scope release of this thread's (and, through a
+    barrier, its warp's) earlier operations on ``.shared::cta`` objects only, for a relaxed ``.cluster`` mbarrier arrive
+    after it.  ``MEMBAR.ALL.CTA`` on SM100 / SM107, not the ``MEMBAR.ALL.GPU`` of ``fence.release.cluster``."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.RELEASE, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_acquire_sync_restrict_shared_cluster_cluster(*, loc=None, ip=None) -> None:
+    """``fence.acquire.sync_restrict::shared::cluster.cluster``: after a relaxed ``.cluster`` mbarrier wait, a cluster-scope
+    acquire that orders this thread's later operations on ``.shared::cluster`` objects only.  No SASS on SM100 / SM107
+    (no ``CCTL.IVALL``: shared memory is not cached in L1)."""
+    nvvm.fence_sync_restrict(nvvm.MemOrderKind.ACQUIRE, loc=loc, ip=ip)
+
+
 # ---- The signal workspace byte map: the producer's and this consumer's contract ----
 
 

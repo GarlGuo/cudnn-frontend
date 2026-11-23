@@ -16,7 +16,7 @@ from cutlass._mlir.dialects import nvvm, vector
 
 from cudnn.frost.tile_dsl.consume import consume_then_arrive
 
-from .moe_kernel_helpers import fence_release_cluster
+from .moe_kernel_helpers import fence_release_sync_restrict_shared_cta_cluster
 from .moe_utils import compute_expert_token_range
 
 
@@ -32,12 +32,24 @@ def check_compact_sfa_options(compact_sfa_sf_warp, compact_sfa_cta_release, sf_v
 class CompactSfaSfWarpMixin:
     """The SF warp's loop. The kernel sets ``compact_sfa_cta_release``, ``sf_warp_release_batch``, ``sf_vec_size``,
     ``num_ab_stage`` and ``cta_tile_shape_mnk``; its ab_pipeline counts 2 more producer arrivals per stage (each CTA's
-    SF warp), and its MMA warp acquires them at cluster scope unless ``compact_sfa_cta_release``."""
+    SF warp), and its MMA warp acquires them at cluster scope unless ``compact_sfa_cta_release``.
+
+    The cluster-scope handoff (default) is the PTX ``sync_restrict`` mbarrier pattern for shared memory:
+      SF warp, each lane: st.shared::cta (its CTA's SF atoms); fence.proxy.async.shared::cta (tcgen05.cp reads them
+        through the async proxy); bar.warp.sync; elected lane: fence.release.sync_restrict::shared::cta.cluster;
+        mbarrier.arrive.relaxed.cluster on the MMA leader's full barrier.
+      MMA leader: mbarrier.try_wait.relaxed.cluster on that barrier; fence.acquire.sync_restrict::shared::cluster.cluster;
+        tcgen05.cp of both CTAs' atoms (.shared::cluster objects).
+    The restricted release covers exactly the .shared::cta stores (every lane's, through bar.warp.sync), the restricted
+    acquire exactly the .shared::cluster reads that follow, and the writer-side proxy fences give the async proxy
+    the generic stores (as for any smem a thread writes and a TMA store or tcgen05 op reads).  Lowered: MEMBAR.ALL.CTA +
+    FENCE.VIEW.ASYNC.S per arrive, nothing on the acquire side (a gpu/cluster acquire would be a CCTL.IVALL per K tile).
+    """
 
     #: K tiles of compact SFA words the SF warp loads at once: one 16-byte L2-only load per row (K % 512 == 0).
     SF_WARP_K_TILES_PER_LOAD = 4
-    #: Stages the SF warp stores between two cluster-scope releases (a release per stage costs more than its MMA).
-    SF_WARP_RELEASE_BATCH = 4
+    #: Stages the SF warp stores between two arrive rounds (the restricted release is cheap: one per stage).
+    SF_WARP_RELEASE_BATCH = 1
 
     @cute.jit
     def compact_sfa_sf_warp_loop(self, compact_sfa_words, sSFA, mA_mkl, padded_offsets, sInfo, tile_info_pipeline, ab_pipeline, leader_cta, lane_idx, zero):
@@ -90,9 +102,10 @@ class CompactSfaSfWarpMixin:
                                     # compact_sfa_cta_release: a CTA-scope release arrive (the stores stay in this CTA's smem).
                                     cute.arch.mbarrier_arrive(ab_pipeline.producer_get_barrier(arrive_state), leader_cta)
                                 else:
-                                    # One release for the batch, then relaxed arrives; the MMA leader acquires at cluster scope.
-                                    fence_release_cluster()
-                                    for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
+                                    # A shared::cta-restricted cluster release, then relaxed cluster arrives; the MMA leader
+                                    # acquires with the shared::cluster-restricted fence (see the class docstring).
+                                    fence_release_sync_restrict_shared_cta_cluster()
+                                    for j in cutlass.range_constexpr(self.sf_warp_release_batch):
                                         cute.arch.mbarrier_arrive(
                                             ab_pipeline.producer_get_barrier(arrive_state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER
                                         )
