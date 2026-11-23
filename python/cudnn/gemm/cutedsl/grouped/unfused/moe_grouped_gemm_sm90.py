@@ -59,10 +59,8 @@ PINGPONG_TILE = (128, 192)
 PINGPONG_CLUSTER = (2, 1)
 
 
-def pingpong_config_error(mma_tiler_mn, cluster_shape_mn, glu_generate_c: bool = False) -> Optional[str]:
+def pingpong_config_error(mma_tiler_mn, cluster_shape_mn) -> Optional[str]:
     """Why a pingpong configuration is unsupported, or None (None tile or cluster: the pingpong default)."""
-    if glu_generate_c:
-        return "a GLU with generate_c has no pingpong schedule (its 128x192 epilogue spills)"
     tile = PINGPONG_TILE if mma_tiler_mn is None else tuple(mma_tiler_mn)
     cluster = PINGPONG_CLUSTER if cluster_shape_mn is None else tuple(cluster_shape_mn)
     if (tile, cluster) != (PINGPONG_TILE, PINGPONG_CLUSTER):
@@ -102,14 +100,14 @@ def apply_schedule_override(rule_picks_pingpong: bool) -> bool:
 
 def use_pingpong(n: int, k: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]], generate_c: bool = False) -> bool:
     """fwd / dgrad / GLU (n: the accumulator N, a GLU's 2I): the override, else pingpong for K <= 2048 and N >= 2048
-    (s6 H100 sweep) on the 128x192 / (2, 1) configuration only; generate_c is a GLU's."""
-    rule = k <= 2048 and n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn, generate_c) is None
+    (s6 H100 sweep) on the 128x192 / (2, 1) configuration only; generate_c is a GLU's (forced pingpong only, unmeasured)."""
+    rule = k <= 2048 and n >= 2048 and not generate_c and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None
     return apply_schedule_override(rule)
 
 
-def check_pingpong_tile(pingpong: bool, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Tuple[int, int], glu_generate_c: bool = False) -> None:
+def check_pingpong_tile(pingpong: bool, mma_tiler_mn: Tuple[int, int], cluster_shape_mn: Tuple[int, int]) -> None:
     """A forced pingpong schedule with a configuration it cannot run raises; the heuristic never picks one."""
-    error = pingpong_config_error(mma_tiler_mn, cluster_shape_mn, glu_generate_c) if pingpong else None
+    error = pingpong_config_error(mma_tiler_mn, cluster_shape_mn) if pingpong else None
     if error is not None:
         raise ValueError(f"SM90: {error}")
 
@@ -131,7 +129,7 @@ class MoEGroupedGemmBf16KernelSm90:
     :param weight_mode: Must be ``MoEWeightMode.DENSE``.
     :param use_dynamic_sched: Must be True.
     :param pingpong: Each MMA warp group owns whole tiles (alternate tiles of the scheduler's sequence) and
-        the two overlap one's epilogue with the other's mainloop; a 128x192 tile, a (2, 1) cluster, no GLU with C.
+        the two overlap one's epilogue with the other's mainloop; a 128x192 tile and a (2, 1) cluster.
     """
 
     FIX_PAD_SIZE = 256
@@ -218,7 +216,7 @@ class MoEGroupedGemmBf16KernelSm90:
             raise ValueError(f"SM90 CTA tile M must be 64 or 128, got {mma_tile_m}.")
         if mma_tiler_mn[1] not in range(32, 257, 32):
             raise ValueError(f"SM90 CTA tile N must be a multiple of 32 in [32, 256], got {mma_tiler_mn[1]}.")
-        pingpong_error = pingpong_config_error(mma_tiler_mn, cluster_shape_mn, act_func is not None and generate_c) if pingpong else None
+        pingpong_error = pingpong_config_error(mma_tiler_mn, cluster_shape_mn) if pingpong else None
         if pingpong_error is not None:
             raise ValueError(f"SM90: {pingpong_error}.")
 
@@ -1092,18 +1090,40 @@ class MoEGroupedGemmBf16KernelSm90:
                     if cutlass.const_expr(self.fused_glu):
                         # A load past the previous subtile's barriers keeps ptxas from hoisting this subtile's
                         # activation above the C stores (spills at SM90's flat 168 registers).
-                        if cutlass.const_expr(subtile_idx > 0 and self.generate_c):
+                        if cutlass.const_expr(subtile_idx > 0 and self.generate_c and not self.pingpong):
                             alpha_val = cutlass.Float32(alpha[expert_idx])
                         # D subtile s reads accumulator subtiles 2s (gate) and 2s+1 (up): same rows, 32 columns apart.
                         acc_gate = 2 * subtile_idx * size_tRS_rD
                         acc_up = acc_gate + size_tRS_rD
+                        if cutlass.const_expr(self.generate_c and self.pingpong):
+                            # Pingpong's 192-register accumulator: C (gate, then up) is stored first, straight from it, and the
+                            # alpha reload past those stores' barriers keeps the activation below them (0 spills).
+                            for half in cutlass.range_constexpr(2):
+                                for i in cutlass.range_constexpr(size_tRS_rD):
+                                    tRS_rC[i] = tRS_rAcc[acc_gate + half * size_tRS_rD + i] * alpha_val
+                                self.store_c(
+                                    tiled_copy_r2s_c,
+                                    tma_atom_c,
+                                    warp_idx,
+                                    tRS_rC,
+                                    tRS_rC_out,
+                                    tRS_sC,
+                                    bSG_gC,
+                                    bSG_sC,
+                                    c_pipeline,
+                                    self._epi_buffer(2 * num_prev_subtiles + half, self.num_c_stage, c_buffer_base),
+                                    c_subtile_layout.get_hier_coord(2 * subtile_idx + half),
+                                    epilog_barrier,
+                                    epi_store_warp,
+                                )
+                            alpha_val = cutlass.Float32(alpha[expert_idx])
                         for i in cutlass.range_constexpr(size_tRS_rD):
                             acc_coord = tRS_cAcc[acc_gate + i]
                             if cutlass.const_expr(subtile_idx % subtile_shape[1] == 0):
                                 tRS_rProb[i] = real_prob[m_base + acc_coord[0], 0, 0]
                             gate_value = tRS_rAcc[acc_gate + i] * alpha_val
                             up_value = tRS_rAcc[acc_up + i] * alpha_val
-                            if cutlass.const_expr(self.generate_c):
+                            if cutlass.const_expr(self.generate_c and not self.pingpong):
                                 tRS_rC[i] = gate_value
                                 tRS_rC_up[i] = up_value
                             if cutlass.const_expr(self.act_func == "geglu"):
@@ -1124,7 +1144,7 @@ class MoEGroupedGemmBf16KernelSm90:
                                 tRS_rC[i] = tRS_rAcc[acc_base + i] * alpha_val
                             tRS_rD[i] = tRS_rAcc[acc_base + i] * tRS_rProb[i]
 
-                    if cutlass.const_expr(self.generate_c and self.fused_glu):
+                    if cutlass.const_expr(self.generate_c and self.fused_glu and not self.pingpong):
                         # C keeps the pre-activation gate and up blocks; two C stores per D subtile, own buffers.
                         self.store_c(
                             tiled_copy_r2s_c,
@@ -1156,7 +1176,7 @@ class MoEGroupedGemmBf16KernelSm90:
                             epilog_barrier,
                             epi_store_warp,
                         )
-                    elif cutlass.const_expr(self.generate_c):
+                    elif cutlass.const_expr(self.generate_c and not self.fused_glu):
                         self.store_c(
                             tiled_copy_r2s_c,
                             tma_atom_c,
