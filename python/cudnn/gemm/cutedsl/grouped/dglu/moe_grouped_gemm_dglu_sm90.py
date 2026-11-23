@@ -35,7 +35,7 @@ from ..moe_persistent_scheduler import (
 from ..moe_utils import MoEWeightMode, compute_expert_token_range, rewrite_tensor_shape
 from ..moe_sched_extension import ContiguousGroupedGemmSchedExtension
 from ..moe_kernel_helpers import atomic_add_float32, compute_grid, fmax, fmin, sigmoid_f32
-from ..unfused.moe_grouped_gemm_sm90 import _widen_for_cluster
+from ..unfused.moe_grouped_gemm_sm90 import _widen_for_cluster, check_register_split
 
 
 class MoEGroupedGemmDgluBf16KernelSm90:
@@ -164,8 +164,10 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         self.num_mma_threads = self.num_mma_warp_groups * self.num_threads_per_warp_group
         self.threads_per_cta = (self.num_mma_warp_groups + 1) * self.num_threads_per_warp_group
         self.threads_wo_sched = self.num_mma_threads + self.threads_per_warp * 2
-        self.load_register_requirement = 40
-        self.mma_register_requirement = 232
+        # The split must fit the 3 x 168 launch registers (48 + 2 x 232 hung); the producer warps spill at 40.
+        self.load_register_requirement = 56
+        self.mma_register_requirement = 224
+        check_register_split(self.load_register_requirement, self.mma_register_requirement, self.num_mma_warp_groups)
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
@@ -763,11 +765,9 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         if total_token <= 0:
             cute.arch.nvvm.exit()
 
-        is_dma_warp_group = warp_idx >= self.tma_warp_id
-        if is_dma_warp_group:
+        # The increase opens the MMA branch: ptxas ignores a decrease whose region reaches the MMA code (C7507).
+        if warp_idx >= self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.load_register_requirement)
-        else:
-            cute.arch.setmaxregister_increase(self.mma_register_requirement)
 
         # ---- Scheduler warp (MoE Persistent Tile Scheduler) ----
         if warp_idx == self.sched_warp_id:
@@ -945,6 +945,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         # ---- MMA + epilogue warp group(s) ----
         # WGMMA accumulates in these threads' registers: mainloop and epilogue share them.
         if warp_idx < self.tma_warp_id and total_token > 0:
+            cute.arch.setmaxregister_increase(self.mma_register_requirement)
             epi_tidx = tidx
             num_k_blocks = cute.size(tCrA, mode=[2])
             k_pipe_mmas = 1

@@ -56,6 +56,13 @@ def _widen_for_cluster(tma_tensor, mode, tile, cluster_count):
 KERNEL_SCHEDULES = ("cooperative", "pingpong")
 
 
+def check_register_split(load_regs: int, mma_regs: int, num_mma_warp_groups: int) -> None:
+    """setmaxnreg.inc waits for registers the decreases free: the split must fit the launch allocation or the MMA warps hang."""
+    launch_regs = min(65536 // ((num_mma_warp_groups + 1) * 128) // 8 * 8, 256)
+    if load_regs + num_mma_warp_groups * mma_regs > (num_mma_warp_groups + 1) * launch_regs:
+        raise ValueError(f"setmaxnreg split {load_regs} + {num_mma_warp_groups} x {mma_regs} exceeds {num_mma_warp_groups + 1} x {launch_regs} registers")
+
+
 def sm90_default_mma_tiler(pingpong: bool, glu_generate_c: bool = False) -> Tuple[int, int]:
     """The SM90 CTA tile when the caller gives none: (128, 256) cooperative; pingpong (128, 192), (128, 128) for a GLU with C."""
     if not pingpong:
@@ -227,6 +234,7 @@ class MoEGroupedGemmBf16KernelSm90:
         self.threads_wo_sched = self.num_mma_threads + self.threads_per_warp
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
+        check_register_split(self.load_register_requirement, self.mma_register_requirement, self.num_mma_warp_groups)
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1,
@@ -321,6 +329,7 @@ class MoEGroupedGemmBf16KernelSm90:
             self.occupancy,
             self.generate_c,
             self.num_epi_groups,
+            self.fused_glu,
         )
 
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
@@ -368,6 +377,7 @@ class MoEGroupedGemmBf16KernelSm90:
         occupancy,
         generate_c,
         num_epi_groups=1,
+        fused_glu=False,
     ):
         """A/B, C, D and tile-info stage counts; C/D stages are per epilogue group (each has its own buffers)."""
         num_tile_stage = 2
@@ -385,10 +395,17 @@ class MoEGroupedGemmBf16KernelSm90:
 
         free_bytes = num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + d_bytes + sinfo_bytes)
         num_ab_stage = free_bytes // ab_bytes_per_stage
-        # Bytes the A/B stages leave buy a second D, then C, store stage (no subtile waits for its own TMA store).
+        # The bytes the A/B stages leave become D and C store stages in turn (up to one per subtile), so subtiles rarely wait on TMA stores.
         spare_bytes = free_bytes % ab_bytes_per_stage
-        num_d_stage = 2 if spare_bytes >= d_bytes else 1
-        num_c_stage = 2 if generate_c and spare_bytes >= c_bytes + d_bytes else 1
+        num_c_subtiles = -(-mma_tiler_mnk[0] // epi_tile[0]) * -(-mma_tiler_mnk[1] // epi_tile[1])
+        num_d_subtiles = num_c_subtiles // 2 if fused_glu else num_c_subtiles
+        num_c_stage, num_d_stage, grew = 1, 1, True
+        while grew:
+            grew = False
+            if num_d_stage < num_d_subtiles and spare_bytes >= d_bytes:
+                num_d_stage, spare_bytes, grew = num_d_stage + 1, spare_bytes - d_bytes, True
+            if generate_c and num_c_stage < num_c_subtiles and spare_bytes >= c_bytes:
+                num_c_stage, spare_bytes, grew = num_c_stage + 1, spare_bytes - c_bytes, True
         return num_ab_stage, num_c_stage, num_d_stage, num_tile_stage
 
     # ------------------------------------------------------------------
@@ -766,15 +783,9 @@ class MoEGroupedGemmBf16KernelSm90:
         if total_token <= 0:
             cute.arch.nvvm.exit()
 
-        if cutlass.const_expr(self.pingpong):
-            # The increase sits in the MMA branch: ptxas keeps setmaxnreg only if no MMA code is reachable after the decrease.
-            if warp_idx >= self.tma_warp_id:
-                cute.arch.setmaxregister_decrease(self.load_register_requirement)
-        else:
-            if warp_idx >= self.tma_warp_id:
-                cute.arch.setmaxregister_decrease(self.load_register_requirement)
-            else:
-                cute.arch.setmaxregister_increase(self.mma_register_requirement)
+        # The increase opens the MMA branch: ptxas ignores a decrease whose region reaches the MMA code (C7507).
+        if warp_idx >= self.tma_warp_id:
+            cute.arch.setmaxregister_decrease(self.load_register_requirement)
 
         # ==== Scheduler warp (MoE Persistent Tile Scheduler) ====
         if warp_idx == self.sched_warp_id:
@@ -886,8 +897,7 @@ class MoEGroupedGemmBf16KernelSm90:
         # ==== MMA + epilogue warp group(s) ====
         # WGMMA accumulates in these threads' registers, so the mainloop and the epilogue live in the same warps.
         if warp_idx < self.tma_warp_id and total_token > 0:
-            if cutlass.const_expr(self.pingpong):
-                cute.arch.setmaxregister_increase(self.mma_register_requirement)
+            cute.arch.setmaxregister_increase(self.mma_register_requirement)
             epi_tidx = tidx
             epilog_barrier = self.epilog_sync_barrier
             epi_store_warp = self.epi_store_warp_id
