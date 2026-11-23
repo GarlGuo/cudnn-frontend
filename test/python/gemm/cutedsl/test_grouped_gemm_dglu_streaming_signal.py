@@ -65,7 +65,7 @@ SIGNAL_VARIANTS = {
 
 
 def skip_unsupported(recipe, options):
-    if options.get("compact_sfa_sf_warp") and (recipe != "mxfp8" or is_rubin()):
+    if options.get("compact_sfa_sf_warp") and recipe != "mxfp8":
         pytest.skip("compact_sfa_sf_warp: the SM100 MXFP8 kernel only")
 
 
@@ -118,8 +118,6 @@ def test_dglu_poison_reaches_d(recipe, late):
 @pytest.mark.L0
 def test_dglu_compact_sfa_poison_reaches_d():
     """The detector works for the compact form: with the compact rows poisoned, D holds NaN."""
-    if is_rubin():
-        pytest.skip("compact_sfa_sf_warp: the SM100 MXFP8 kernel only")
     tokens = ROUTINGS["uneven"]
     problem = make_problem("mxfp8", tokens, seed=1)
     poison_inputs(problem, "sfa")
@@ -206,8 +204,6 @@ def test_dglu_signal_rejects_invalid(recipe):
 
 @pytest.mark.L0
 def test_dglu_compact_sfa_rejects_invalid():
-    if is_rubin():
-        pytest.skip("compact_sfa_sf_warp: the SM100 MXFP8 kernel only")
     with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
         make_dglu_kernel("mxfp8", 4, use_dynamic_sched=True, compact_sfa_sf_warp=True, use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1))
     with pytest.raises(ValueError, match="compact_sfa_cta_release requires compact_sfa_sf_warp"):

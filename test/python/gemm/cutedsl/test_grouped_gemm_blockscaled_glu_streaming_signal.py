@@ -218,7 +218,7 @@ COMPACT_L0 = {
 
 
 @pytest.mark.parametrize("variant, routing", levels(COMPACT_CASES, COMPACT_L0, lambda variant, routing: f"{variant}-{routing}"))
-def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing, sm100_kernel_only):
+def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing):
     """The SF warp's atoms from the compact rows give the bytes of the stock kernel's TMA'd atoms."""
     tokens = ROUTINGS[routing]
     problem = make_problem(tokens, N, HIDDEN, seed=len(routing) + 1)
@@ -238,7 +238,7 @@ def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing, sm100_kernel_only
 
 
 @pytest.mark.L0
-def test_mxfp8_glu_compact_sfa_poison_reaches_d(sm100_kernel_only):
+def test_mxfp8_glu_compact_sfa_poison_reaches_d():
     """The detector works for the compact form: with the compact rows poisoned, D holds NaN."""
     tokens = ROUTINGS["uneven"]
     problem = make_problem(tokens, N, HIDDEN, seed=1)
@@ -257,7 +257,7 @@ def compact_producer_id(late, order, release):
 
 
 @pytest.mark.parametrize("late, order, release", levels(COMPACT_PRODUCER_CASES, COMPACT_PRODUCER_L0, compact_producer_id))
-def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order, release, sm100_kernel_only):
+def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order, release):
     """The producer writes each M tile's compact SFA rows (and A) before releasing it; the SF warp must not load a row
     early (it reads through L2 only, after the tile's acquire)."""
     tokens = ROUTINGS["many_experts_64"]
@@ -269,7 +269,7 @@ def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order, release, sm100_ke
 
 
 @pytest.mark.L0
-def test_mxfp8_glu_compact_sfa_device_layout_waits_for_producer(sm100_kernel_only):
+def test_mxfp8_glu_compact_sfa_device_layout_waits_for_producer():
     tokens = ROUTINGS["many_experts_64"]
     problem = make_problem(tokens, N, HIDDEN, seed=11)
     expected, _ = Launcher(stock(tokens), problem)(problem)

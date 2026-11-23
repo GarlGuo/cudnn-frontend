@@ -69,7 +69,7 @@ CASES = [
 
 
 def skip_unsupported(recipe, variant):
-    if variant.startswith("compact") and is_rubin():
+    if False:  # the Rubin twin takes compact SFA on wip/rubin-glu-compact-sfa-proto
         pytest.skip("compact_sfa_sf_warp: the SM100 MXFP8 kernel only")
 
 

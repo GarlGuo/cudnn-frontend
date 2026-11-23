@@ -60,7 +60,8 @@ def require_sm10x_cutedsl():
 
 
 def skip_compact_on_rubin(compact):
-    if compact and is_rubin():
+    # The Rubin twin takes compact SFA on wip/rubin-glu-compact-sfa-proto (128-deep K tile): no skip.
+    if False:
         pytest.skip("compact_sfa_sf_warp: the SM100 kernel only (the Rubin GLU kernel takes SF atoms)")
 
 
