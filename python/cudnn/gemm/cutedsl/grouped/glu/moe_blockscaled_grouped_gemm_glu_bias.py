@@ -65,6 +65,7 @@ from ..moe_kernel_helpers import (
     epilog_gmem_copy_and_partition,
 )
 from ..moe_streaming_input_block_tile_scheduler import MoEInputBlockSignalSchedulerParams, StreamingInputSignalMixin
+from ..compact_sfa_sf_warp import CompactSfaSfWarpMixin, check_compact_sfa_options
 from cudnn.frost.tile_dsl.consume import release_zero
 
 """
@@ -203,7 +204,7 @@ def _wait_sfb_cluster(ptr, phase, *, loc=None, ip=None):
     )
 
 
-class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
+class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactSfaSfWarpMixin):
     """Block-scaled grouped GEMM kernel with MoE tile scheduling and GLU fusion.
 
     Supports both dense and discrete weight layouts, static and dynamic
@@ -254,6 +255,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
 
     :param streaming_signal_capacity, device_layout, use_pdl, launch_pdl_dependents_at_all_streaming_signal_slots_ready:
         a streaming input producer of A and SFA; see docs/operations/moe/streaming_signal_contract.md (section 4a).
+    :param compact_sfa_sf_warp: ``sfa`` is compact E8M0 rows ``[M, K / 32]`` (as an EP dispatch delivers them), not SF
+        atoms; a dedicated SF warp builds the atoms (MXFP8, ``K % 512 == 0``, cluster (2, 1); contract section 4a).
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -320,6 +323,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
         device_layout: bool = False,
         use_pdl: bool = False,
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
+        compact_sfa_sf_warp: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -378,6 +382,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
             use_pdl=use_pdl,
             launch_pdl_dependents_at_all_streaming_signal_slots_ready=launch_pdl_dependents_at_all_streaming_signal_slots_ready,
         )
+        check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
+        self.compact_sfa_sf_warp = compact_sfa_sf_warp
 
         self.glu_layout = validate_glu_layout(glu_layout)
         self.sf_vec_size = sf_vec_size
@@ -421,6 +427,13 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
             all_warps.append(self.sfb_reorder_warp_id)
             warps_wo_sched.append(self.sfb_reorder_warp_id)
         all_warps += self.streaming_input_trigger_warps(len(all_warps))
+        # compact_sfa_sf_warp: the SF warp goes last; it consumes tile_info like the TMA warp.
+        self.sf_warp_id = len(all_warps) if compact_sfa_sf_warp else None
+        if compact_sfa_sf_warp:
+            if self.use_sfb_reorder_warp:
+                raise ValueError("compact_sfa_sf_warp requires the interleaved GLU layout")
+            all_warps.append(self.sf_warp_id)
+            warps_wo_sched.append(self.sf_warp_id)
         self.threads_per_cta = self.threads_per_warp * len(all_warps)
         self.threads_wo_sched = self.threads_per_warp * len(warps_wo_sched)
 
@@ -881,6 +894,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
 
         self._setup_attributes()
+        self.check_compact_sfa_attributes(a)
 
         # ---- B / SFB setup (mode-dependent) ----
         b_from_call_arg = b
@@ -1032,7 +1046,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
+        # compact_sfa_sf_warp: the SF warp, not the TMA, fills sSFA (it arrives on the full barrier itself).
+        sfa_copy_size = 0 if cutlass.const_expr(self.compact_sfa_sf_warp) else cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
         self.num_sfb_load_bytes = sfb_copy_size
@@ -1219,7 +1234,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
             glu_clamp_min,
             situ_beta1,
             situ_beta2,
-            Int32(0) if self.use_streaming_signal_sched else None,
+            Int32(0) if self.use_streaming_signal_sched or self.compact_sfa_sf_warp else None,
+            cute.recast_ptr(sfa.iterator, dtype=cutlass.Int32) if cutlass.const_expr(self.compact_sfa_sf_warp) else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1782,12 +1798,14 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
         situ_beta1: cutlass.Float32 = 4.0,
         situ_beta2: cutlass.Float32 = 25.0,
         release_zero_arg: Optional[Int32] = None,
+        compact_sfa_words: Optional[cute.Pointer] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
 
-        ``release_zero_arg``: with the signal scheduler, the release-zero (python/cudnn/AGENTS.md Rule 11): the host passes
-        the literal 0 and its only use is ``release_zero()``; None otherwise.
+        ``release_zero_arg``: with the signal scheduler or the SF warp, the release-zero (python/cudnn/AGENTS.md Rule 11): the
+        host passes the literal 0 and its only use is ``release_zero()``; None otherwise.
+        ``compact_sfa_words``: with ``compact_sfa_sf_warp``, the compact SFA rows as int32 words (4 scales each).
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1848,7 +1866,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
             cute.arch.mbarrier_init_fence()
 
         # Initialize mainloop ab_pipeline (barrier) and states
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        # compact_sfa_sf_warp: each CTA's SF warp also arrives once per stage on the leader's full barrier.
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1 + (2 if self.compact_sfa_sf_warp else 0))
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_producer)
         ab_pipeline = pipeline.PipelineTmaUmma.create(
@@ -2230,14 +2249,15 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
                         mcast_mask=b_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_b,
                     )
-                    # TMA load SFA (contiguous, global desc via domain_offset)
-                    cute.copy(
-                        tma_atom_sfa,
-                        tAgSFA_k,
-                        tAsSFA_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfa_full_mcast_mask,
-                    )
+                    # TMA load SFA (contiguous, global desc via domain_offset); the SF warp's when compact
+                    if cutlass.const_expr(not self.compact_sfa_sf_warp):
+                        cute.copy(
+                            tma_atom_sfa,
+                            tAgSFA_k,
+                            tAsSFA_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfa_full_mcast_mask,
+                        )
                     # Each CTA receives two distinct half-tile multicasts. Their
                     # combined bytes fill one local SFB stage; cta_group::1 gives
                     # each CTA a local completion signal without a peer notify.
@@ -2273,6 +2293,24 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
+
+        #
+        # SF warp (compact_sfa_sf_warp): this CTA's 128 compact SFA rows into the stage's SF atom, per K tile
+        #
+        if cutlass.const_expr(self.compact_sfa_sf_warp):
+            if warp_idx == self.sf_warp_id:
+                self.compact_sfa_sf_warp_loop(
+                    compact_sfa_words,
+                    sSFA,
+                    mA_mkl,
+                    padded_offsets,
+                    sInfo,
+                    tile_info_pipeline,
+                    ab_pipeline,
+                    cta_rank_in_cluster - mma_tile_coord_v,
+                    lane_idx,
+                    zero,
+                )
 
         #
         # Scale reorder warp: observe each CTA's local SFB multicast completion.
@@ -2457,6 +2495,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin):
                             _wait_sfb_cluster(sfb_pair_barrier_base + ab_consumer_state.index, ab_consumer_state.phase)
                         else:
                             ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        self.compact_sfa_acquire(ab_pipeline, ab_consumer_state)
                         if cutlass.const_expr(self.glu_layout == "gate_then_up" and not self.use_2cta_instrs):
                             self.interleave_sfb_in_place(sSFB, ab_consumer_state.index, lane_idx)
 
