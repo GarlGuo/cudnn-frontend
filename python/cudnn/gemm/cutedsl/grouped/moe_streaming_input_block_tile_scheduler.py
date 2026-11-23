@@ -68,7 +68,9 @@ from .moe_kernel_helpers import (
     streaming_signal_ptr,
     mbarrier_arrive_expect_tx_on_peer_relaxed_cluster,
     fence_release_cluster,
-    mbarrier_try_wait_parity_acquire_cluster,
+    fence_acquire_cluster,
+    fence_acquire_gpu,
+    mbarrier_try_wait_parity_relaxed_cluster,
 )
 from .moe_utils import ceil_div
 from cudnn.frost.tile_dsl.consume import ReleaseZero, consume_then_arrive_on_peer
@@ -120,10 +122,14 @@ def streaming_signal_workspace_bytes_after_counter(streaming_signal_capacity: in
 @cute.jit
 def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     """Block, without bound, until ``*ptr >= floor`` and return it, acquiring the writer's earlier stores.
+    Relaxed polls, then one ``fence.acquire.gpu`` (with the last poll, an acquire pattern): an acquire is a
+    ``CCTL.IVALL`` that drops the SM's whole L1 (every warp's lines, the epilogue's too), so it must not run per poll.
+    A fence, not a final acquire load: a load whose value is unused is dropped, its acquire with it.
     One load point in the loop: a load ahead of it would make the compiler duplicate the loop."""
     value = Int32(floor - 1)
     while value < floor:
-        value = cute.arch.load(ptr.llvm_ptr, Int32, sem="acquire", scope="gpu")
+        value = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+    fence_acquire_gpu()
     return value
 
 
@@ -505,6 +511,10 @@ class MoEStreamingInputBlockSignalTileScheduler:
             if lane_expert == expert:
                 ready_m_tile_count_candidate = lane_ready_m_tile_count
             m_tile_count = cute.arch.warp_redux_sync(ready_m_tile_count_candidate, "max")
+        # Makes this lane's relaxed flag reads above acquire patterns: each ready flag's producer release now
+        # happens before the release of ``assigned_claim_count`` below (after bar.warp.sync), so a claimer's one
+        # acquire of ``assigned_claim_count`` also acquires every M tile of the batches published here.
+        fence_acquire_gpu()
 
         # One opening publishes several batches: the chosen expert's first, then, in lane order, every other lane's
         # best expert whose ready run is complete (ends the expert or fills the cap).  Batch openings are serialized
@@ -552,9 +562,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             # Published LAST, and that order is load-bearing: the release is what hands the
             # records to the claimers and ``expert_assigned_m_tiles[]`` to the next opener.
             cute.arch.store(assigned_claim_count_ptr.llvm_ptr, claim_idx + total_m_tiles * n_tiles_per_m_tile, sem="release", scope="gpu")
-        # ``assigned_claim_count`` is past ``claim_idx`` now, so this returns at once.  It is
-        # here for its acquire: one lane wrote the records, and every lane is about to read them.
-        _spin_until_at_least(assigned_claim_count_ptr, claim_idx + 1)
+        # No acquire back: each lane wrote its records before the bar.warp.sync above, which orders memory among the
+        # warp's lanes, and every lane reads its claim's record after it.  (An acquire is a whole-L1 invalidate.)
 
     @cute.jit
     def _claim_linear_tile_idx(self, n_tiles_per_m_tile: Int32, lane_idx: Int32) -> Int32:
@@ -580,9 +589,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
             claim_idx_in_batch = claim_idx - first_claim_idx
             n_tile = claim_idx_in_batch // m_tile_count
             m_tile = first_m_tile + claim_idx_in_batch % m_tile_count
-            # A batch holds only ready M-tiles, so this returns at once.  It is here for its
-            # acquire, which pairs the producer's release and makes the M-tile's rows visible.
-            _spin_until_at_least(streaming_signal_ptr(dynamic_state.counter_ptr) + m_tile, 0)
+            # No acquire of ``signal[m_tile]`` here: the opener read it ready and acquired it (``fence_acquire_gpu``)
+            # before its release of ``assigned_claim_count``, which the spin above acquired, so the producer's
+            # release of the M tile's rows happens before this claim (causality order is transitive).
             linear_tile_idx = m_tile * n_tiles_per_m_tile + n_tile
         return linear_tile_idx
 
@@ -610,8 +619,20 @@ class MoEStreamingInputBlockSignalTileScheduler:
         dynamic_state.producer_state.advance()
         consumer_full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(dynamic_state.consumer_state.index)
         broadcast_arrived = Boolean(False)
-        while not broadcast_arrived:
-            broadcast_arrived = mbarrier_try_wait_parity_acquire_cluster(consumer_full_barrier_ptr, dynamic_state.consumer_state.phase)
+        if dynamic_state.is_leader_cta:
+            # This very warp acquired the claim above and made the arrive: the default ``.acquire.cta`` try_wait
+            # covers the ``st.async`` word, and the claim's acquire is already in program order.
+            while not broadcast_arrived:
+                broadcast_arrived = cute.arch.mbarrier_try_wait(consumer_full_barrier_ptr, dynamic_state.consumer_state.phase)
+        else:
+            # A peer: relaxed cluster-scope polls (no L1 invalidation per poll), then ONE cluster acquire.  The
+            # relaxed read of the leader's arrive (after its ``fence.release.cluster``) and this fence form an acquire
+            # pattern, so the leader's claim acquire (and through it the producer's release of the rows) happens
+            # before this CTA's tile info and its TMA warp's A loads.  The phase cannot move on before this CTA
+            # releases the slot, so the fence acquires this phase's arrive.
+            while not broadcast_arrived:
+                broadcast_arrived = mbarrier_try_wait_parity_relaxed_cluster(consumer_full_barrier_ptr, dynamic_state.consumer_state.phase)
+            fence_acquire_cluster()
         return broadcast_tensor[0]
 
     @cute.jit

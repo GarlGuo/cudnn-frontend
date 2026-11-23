@@ -1399,6 +1399,36 @@ def mbarrier_try_wait_parity_acquire_cluster(mbar_ptr, phase: Int32, *, loc=None
     )
 
 
+@dsl_user_op
+def mbarrier_try_wait_parity_relaxed_cluster(mbar_ptr, phase: Int32, *, loc=None, ip=None) -> Boolean:
+    """``mbarrier.try_wait.parity.relaxed.cluster``: a strong read of a peer's arrive with no acquire, so no L1
+    invalidation per poll.  Follow the successful poll with ``fence_acquire_cluster`` (an acquire pattern)."""
+    return Boolean(
+        nvvm.mbarrier_wait_parity(
+            mbar_ptr.to_llvm_ptr(loc=loc, ip=ip),
+            Int32(phase).ir_value(loc=loc, ip=ip),
+            nvvm.MBarrierWaitKind.TRY,
+            scope=nvvm.MemScopeKind.CLUSTER,
+            order=nvvm.MemOrderKind.RELAXED,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def fence_acquire_cluster(*, loc=None, ip=None) -> None:
+    """``fence.acquire.cluster``: with the strong reads before it, an acquire pattern.  On SM100 and SM107 it is one
+    ``CCTL.IVALL`` (the SM's whole L1 dropped, every warp's lines), so take it once after a relaxed poll, not per poll."""
+    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="cluster", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_acquire_gpu(*, loc=None, ip=None) -> None:
+    """``fence.acquire.gpu``: as ``fence_acquire_cluster`` at gpu scope (also one ``CCTL.IVALL``)."""
+    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="device", loc=loc, ip=ip)
+
+
 # ---- The signal workspace byte map: the producer's and this consumer's contract ----
 
 
