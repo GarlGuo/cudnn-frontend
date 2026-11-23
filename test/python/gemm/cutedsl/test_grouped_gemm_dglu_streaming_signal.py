@@ -6,7 +6,8 @@ MXFP8 Rubin twin.
 
 The producer (an EP dispatch of the output gradient) writes dY's rows, and for MXFP8 their scales (SF atoms, or compact
 rows with ``compact_sfa_sf_warp``), then releases ``signal[t] = t`` for the 256-row M tile t.  The signal scheduler only
-reorders tiles and waits, so D and the deterministic dprob must be raw-byte equal to the stock dynamic scheduler's.  dY
+reorders tiles and waits, so D and the deterministic dprob (SM100) must be raw-byte equal to the stock dynamic scheduler's;
+the Rubin kernel's dprob is an fp32 atomic sum in arrival order, compared with a tolerance.  dY
 and its scales are poisoned (NaN) until their tile is released: a tile loaded before its signal carries NaN into D.
 
 L0 keeps one case per behaviour; the remaining routings and release orders are L1.
@@ -21,6 +22,7 @@ from gemm.cutedsl._streaming_signal_dglu import (
     Launcher,
     is_rubin,
     make_dglu_kernel,
+    assert_outputs_match,
     make_problem,
     poison_inputs,
     run_with_producer,
@@ -71,9 +73,8 @@ def stock(recipe, tokens):
     return make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True)
 
 
-def assert_same_bytes(got, want, label=""):
-    for name in want:
-        assert torch.equal(got[name].view(torch.int16), want[name].view(torch.int16)), f"{label}: {name} differs from the stock scheduler"
+def assert_same_bytes(kernel, got, want, label=""):
+    assert_outputs_match(kernel, got, want, label)
 
 
 MATCH_CASES = [(recipe, variant, routing) for recipe in ("bf16", "mxfp8") for variant in SIGNAL_VARIANTS for routing in sorted(ROUTINGS)]
@@ -98,7 +99,7 @@ def test_dglu_signal_matches_dynamic(recipe, variant, routing):
     kernel = make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True, streaming_signal_capacity=problem["rows"] // ROWS_ALIGNMENT, **options)
     got, _ = Launcher(kernel, problem)(problem, signal_ready(kernel))
     torch.cuda.synchronize()
-    assert_same_bytes(got, expected, f"{recipe} {variant}")
+    assert_same_bytes(kernel, got, expected, f"{recipe} {variant}")
     assert not torch.isnan(got["d"].float()).any()
 
 
@@ -156,7 +157,7 @@ def test_dglu_signal_waits_for_producer(recipe, variant, late):
     kernel = make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True, streaming_signal_capacity=problem["rows"] // ROWS_ALIGNMENT, **options)
     results = run_with_producer(kernel, problem, late, ["in_order", "reverse", "random"])
     for order, got in results.items():
-        assert_same_bytes(got, expected, f"{recipe} {variant}, {late} late, {order} release")
+        assert_same_bytes(kernel, got, expected, f"{recipe} {variant}, {late} late, {order} release")
 
 
 @pytest.mark.L0
@@ -169,7 +170,7 @@ def test_dglu_signal_device_layout_waits_for_producer(recipe):
     options = dict(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
     kernel = make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True, streaming_signal_capacity=problem["rows"] // ROWS_ALIGNMENT, **options)
     results = run_with_producer(kernel, problem, "a", ["random"], device_layout=True)
-    assert_same_bytes(results["random"], expected, f"{recipe} device layout")
+    assert_same_bytes(kernel, results["random"], expected, f"{recipe} device layout")
 
 
 @pytest.mark.L0
@@ -182,7 +183,7 @@ def test_dglu_launch_pdl_dependents_at_entry_matches_dynamic(recipe):
     kernel = make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True, use_pdl=True, launch_pdl_dependents_at_entry=True)
     got, _ = Launcher(kernel, problem)(problem)
     torch.cuda.synchronize()
-    assert_same_bytes(got, expected, f"{recipe} entry trigger")
+    assert_same_bytes(kernel, got, expected, f"{recipe} entry trigger")
 
 
 @pytest.mark.L0

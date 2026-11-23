@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Bitwise determinism of the streaming input signal on the dSwiGLU kernels: BF16 and MXFP8 on SM100 with
-``deterministic=True`` (one dprob slot per N tile), and the MXFP8 Rubin twin on SM107 (two N tiles per token, so its
-atomic dprob adds two partials, the same sum in either order).
+``deterministic=True`` (one dprob slot per N tile), and the MXFP8 Rubin twin on SM107.  The Rubin kernel adds its fp32
+dprob partials with atomics in tile arrival order, so its dprob is not deterministic, not even across replays of the stock
+scheduler: there D is compared bit for bit and dprob within fp32 reassociation (not deterministic on the Rubin MXFP8 dGLU).
 
 ``streaming_signal_capacity`` (with or without ``device_layout``) changes which cluster runs a tile and when, never the
 tile math, so D and dprob must be raw-byte equal across replays, producer release orders and the stock dynamic
@@ -18,7 +19,16 @@ import torch
 from determinism_utils import assert_bitwise, assert_replays, snapshot
 from gemm.cutedsl._streaming_signal import BIG_EXPERT, MANY_EXPERTS_64, ROWS_ALIGNMENT, padded
 from gemm.cutedsl._streaming_signal_blockscaled import signal_ready
-from gemm.cutedsl._streaming_signal_dglu import INTERMEDIATE, Launcher, is_rubin, make_dglu_kernel, make_problem, run_with_producer
+from gemm.cutedsl._streaming_signal_dglu import (
+    INTERMEDIATE,
+    Launcher,
+    assert_outputs_match,
+    exact_outputs,
+    is_rubin,
+    make_dglu_kernel,
+    make_problem,
+    run_with_producer,
+)
 
 REPLAYS = 3
 
@@ -78,8 +88,10 @@ def test_dglu_signal_replays_match_dynamic(recipe, variant):
     expected = snapshot(Launcher(make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True), problem)(problem)[0])
     kernel = signal_kernel(recipe, problem, len(tokens), variant)
     launcher = Launcher(kernel, problem)
-    replayed = assert_replays(lambda: launcher(problem, signal_ready(kernel))[0], repeats=REPLAYS)
-    assert_bitwise(replayed, expected, f"{recipe} {variant} vs stock")
+    # Rubin: exact_outputs drops the atomic dprob, checked against stock within tolerance below.
+    replayed = assert_replays(lambda: exact_outputs(kernel, launcher(problem, signal_ready(kernel))[0]), repeats=REPLAYS)
+    assert_bitwise(replayed, exact_outputs(kernel, expected), f"{recipe} {variant} vs stock")
+    assert_outputs_match(kernel, launcher(problem, signal_ready(kernel))[0], expected, f"{recipe} {variant} vs stock")
 
 
 RELEASE_CASES = [
@@ -100,11 +112,14 @@ def test_dglu_producer_release_order_invariance(recipe, variant, late):
     tokens = MANY_EXPERTS_64
     problem = make_problem(recipe, tokens, seed=7)
     expected = snapshot(Launcher(make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True), problem)(problem)[0])
-    results = run_with_producer(signal_kernel(recipe, problem, len(tokens), variant), problem, late, ["in_order", "reverse", "random"])
+    kernel = signal_kernel(recipe, problem, len(tokens), variant)
+    results = run_with_producer(kernel, problem, late, ["in_order", "reverse", "random"])
     for order, got in results.items():
-        assert_bitwise(snapshot(got), expected, f"{recipe} {variant}, {late} late, {order} release vs stock")
-    assert_bitwise(snapshot(results["reverse"]), snapshot(results["in_order"]), "reverse vs in-order release")
-    assert_bitwise(snapshot(results["random"]), snapshot(results["in_order"]), "random vs in-order release")
+        assert_bitwise(snapshot(exact_outputs(kernel, got)), exact_outputs(kernel, expected), f"{recipe} {variant}, {late} late, {order} release vs stock")
+        assert_outputs_match(kernel, got, expected, f"{recipe} {variant}, {late} late, {order} release vs stock")
+    for order in ("reverse", "random"):
+        exact = snapshot(exact_outputs(kernel, results[order]))
+        assert_bitwise(exact, snapshot(exact_outputs(kernel, results["in_order"])), f"{order} vs in-order release")
 
 
 WARM_CASES = [("bf16", "signal"), ("mxfp8", "signal"), ("mxfp8", "compact_signal")]
@@ -134,14 +149,15 @@ def test_dglu_signal_slot_release_warm_stress(recipe, variant):
         launcher.launch(problem, (d, dprob, workspace))
 
     claims = (problem["rows"] // ROWS_ALIGNMENT) * (INTERMEDIATE // 256)
+    # Rubin: the atomic dprob is left out of the bitwise comparison (exact_outputs); D still covers every tile.
     assert_warm_stress(
         StressCase(
             f"{recipe} dGLU streaming signal scheduler{', compact SFA' if variant.startswith('compact') else ''}, big expert, 4 clusters",
             launch=launch,
-            outputs={"d": d, "dprob": dprob},
+            outputs=exact_outputs(kernel, {"d": d, "dprob": dprob}),
             thread_blocks=2 * clusters,
             refills_per_launch=claims // clusters,
-            reference={"d": stock["d"], "dprob": stock["dprob"]},
+            reference=exact_outputs(kernel, {"d": stock["d"], "dprob": stock["dprob"]}),
             reset=lambda: reset(workspace),
         ),
         warm=500,
