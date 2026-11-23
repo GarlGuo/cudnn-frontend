@@ -321,6 +321,9 @@ def test_sm90_pingpong_rejects(kwargs, match):
         (2048, 1024, None, None, False, (True, (128, 192))),
         (2048, 1024, (128, 192), (2, 1), False, (True, (128, 192))),
         (2048, 2048, None, None, True, (True, (128, 192))),
+        (2048, 3072, None, None, False, (True, (128, 192))),
+        (2048, 3072, None, None, True, (True, (128, 192))),
+        (2048, 3136, None, None, False, (False, (128, 256))),
         (2048, 4096, None, None, True, (False, (128, 256))),
         (1024, 1024, None, None, True, (False, (128, 256))),
         (2048, 1024, (128, 256), None, True, (False, (128, 256))),
@@ -335,6 +338,9 @@ def test_sm90_pingpong_rejects(kwargs, match):
         "N2048-K1024",
         "explicit-128x192-c21",
         "glu-c-N2048-K2048",
+        "N2048-K3072",
+        "glu-c-N2048-K3072",
+        "N2048-K3136",
         "glu-c-N2048-K4096",
         "glu-c-N1024-K1024",
         "glu-c-explicit-128x256",
@@ -347,7 +353,7 @@ def test_sm90_pingpong_rejects(kwargs, match):
     ],
 )
 def test_sm90_schedule_heuristic(n, k, tile, cluster, glu_c, expected):
-    # Pingpong for K <= 2048 and N >= 2048 (a GLU's N is 2I, with or without C) on 128x192 tiles and (2, 1) clusters.
+    # Pingpong for K <= 3072 and N >= 2048 (a GLU's N is 2I, with or without C) on 128x192 tiles and (2, 1) clusters.
     from cudnn.gemm.cutedsl.grouped.glu._bf16_api import GroupedGemmGluBf16API
     from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import GroupedGemmBf16API
     from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad_sm90 import use_pingpong_wgrad

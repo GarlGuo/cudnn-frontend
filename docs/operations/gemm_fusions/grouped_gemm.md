@@ -177,7 +177,7 @@ weights (`b_major="n"`), with these limits:
   scheduler is not available, so `use_dynamic_sched=False` is accepted and ignored.
 - The SM90 kernel picks its warp-group schedule from the problem shape, and
   `mma_tiler_mn=None` (the default) takes that schedule's tile: `(128, 256)`,
-  or `(128, 192)` for short K (`K <= 2048`, `N >= 2048`). SM100 uses
+  or `(128, 192)` for short K (`K <= 3072`, `N >= 2048`). SM100 uses
   `(256, 256)`. The short-K schedule runs only on a `(128, 192)` tile with a
   `(2, 1)` cluster (given or defaulted); any other tile or cluster runs the
   default schedule.

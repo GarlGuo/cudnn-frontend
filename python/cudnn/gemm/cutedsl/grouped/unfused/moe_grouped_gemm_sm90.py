@@ -99,9 +99,9 @@ def apply_schedule_override(rule_picks_pingpong: bool) -> bool:
 
 
 def use_pingpong(n: int, k: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
-    """fwd / dgrad / GLU with or without C (n: the accumulator N, a GLU's 2I): the override, else pingpong for K <= 2048
-    and N >= 2048 (s6 H100 sweep; an H100 A/B for GLU with C) on the 128x192 / (2, 1) configuration only."""
-    rule = k <= 2048 and n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None
+    """fwd / dgrad / GLU with or without C (n: the accumulator N, a GLU's 2I): the override, else pingpong for K <= 3072
+    and N >= 2048 (s6 H100 sweep; the K bound from the s13 H100 K x N sweep) on the 128x192 / (2, 1) configuration only."""
+    rule = k <= 3072 and n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None
     return apply_schedule_override(rule)
 
 
