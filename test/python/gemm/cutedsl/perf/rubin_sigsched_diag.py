@@ -30,8 +30,13 @@ VARIANTS = {
     "signal_no_proxy_fence": (True, {"SIGDIAG_NO_PROXY_FENCE": "1"}),
     "signal_tile_stages4": (True, {"SIGDIAG_TILE_STAGES": "4"}),
     "signal_all_three": (True, {"SIGDIAG_NO_CLAIM_SPIN": "1", "SIGDIAG_NO_PROXY_FENCE": "1", "SIGDIAG_TILE_STAGES": "4"}),
+    "signal_relaxed_spin": (True, {"SIGDIAG_RELAXED_SPIN": "1"}),
+    "signal_relaxed_no_claim_spin": (True, {"SIGDIAG_RELAXED_SPIN": "1", "SIGDIAG_NO_CLAIM_SPIN": "1"}),
 }
-KNOBS = ("SIGDIAG_NO_CLAIM_SPIN", "SIGDIAG_NO_PROXY_FENCE", "SIGDIAG_TILE_STAGES")
+# DIAG_ONLY=<variant,...> / DIAG_KINDS=<glu,dglu> / DIAG_SHAPES=<shape,...> in the environment restrict the run.
+if os.environ.get("DIAG_ONLY"):
+    VARIANTS = {name: VARIANTS[name] for name in os.environ["DIAG_ONLY"].split(",")}
+KNOBS = ("SIGDIAG_NO_CLAIM_SPIN", "SIGDIAG_NO_PROXY_FENCE", "SIGDIAG_TILE_STAGES", "SIGDIAG_RELAXED_SPIN")
 
 
 def build(kind, shape, name, problem):
@@ -54,8 +59,11 @@ def build(kind, shape, name, problem):
 def main():
     ncu = "ncu" in sys.argv[1:]
     rounds = int(os.environ.get("ROUNDS", "8"))
-    for kind in ("glu", "dglu"):
-        for shape, (experts, rows, hidden, inter) in SHAPES.items():
+    kinds = os.environ.get("DIAG_KINDS", "glu,dglu").split(",")
+    shapes = os.environ.get("DIAG_SHAPES", ",".join(SHAPES)).split(",")
+    for kind in kinds:
+        for shape in shapes:
+            experts, rows, hidden, inter = SHAPES[shape]
             if kind == "glu":
                 problem = bs.make_problem([rows] * experts, 2 * inter, hidden, seed=0)
             else:
@@ -86,7 +94,7 @@ def main():
                         torch.cuda.synchronize()
                         if rep >= 2:
                             times[name].append(start.elapsed_time(end))
-            base = statistics.median(times["stock_dynamic"])
+            base = statistics.median(times["stock_dynamic"]) if "stock_dynamic" in times else statistics.median(next(iter(times.values())))
             for name in VARIANTS:
                 med = statistics.median(times[name])
                 print(f"{kind:4} {shape:12} {name:24} median {med * 1000:8.1f} us  vs stock {med / base - 1:+6.1%}", flush=True)

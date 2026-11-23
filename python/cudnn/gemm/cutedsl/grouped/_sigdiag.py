@@ -7,6 +7,7 @@ kernel is built (host Python), so each knob setting is a separate compile.  Unsa
   SIGDIAG_NO_CLAIM_SPIN=1     skip the per-claim acquire of signal[m_tile] (every tile is ready anyway)
   SIGDIAG_NO_PROXY_FENCE=1    skip the TMA warp's per-tile fence.proxy.async.global
   SIGDIAG_TILE_STAGES=<n>     tile_info pipeline depth (the scheduler warp's run-ahead), default 2
+  SIGDIAG_RELAXED_SPIN=1      the scheduler's spins load relaxed, not acquire (unsafe; tests whether acquires cost L1)
   SIGDIAG_BATCH_CAP=<n>       EXPERT_BATCH_MAX_M_TILES (default 16), read at import: one value per process
 """
 

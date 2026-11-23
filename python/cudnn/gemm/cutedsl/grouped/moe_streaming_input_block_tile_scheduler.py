@@ -122,8 +122,10 @@ def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     """Block, without bound, until ``*ptr >= floor`` and return it, acquiring the writer's earlier stores.
     One load point in the loop: a load ahead of it would make the compiler duplicate the loop."""
     value = Int32(floor - 1)
+    # DIAGNOSTIC (_sigdiag RELAXED_SPIN=1): relaxed loads, no acquire (an acquire may invalidate the SM's L1).
+    sem = "relaxed" if __import__("cudnn.gemm.cutedsl.grouped._sigdiag", fromlist=["diag"]).diag("RELAXED_SPIN") == "1" else "acquire"
     while value < floor:
-        value = cute.arch.load(ptr.llvm_ptr, Int32, sem="acquire", scope="gpu")
+        value = cute.arch.load(ptr.llvm_ptr, Int32, sem=sem, scope="gpu")
     return value
 
 
