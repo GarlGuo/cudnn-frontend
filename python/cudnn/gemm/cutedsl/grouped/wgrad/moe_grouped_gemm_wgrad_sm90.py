@@ -44,6 +44,12 @@ from ..moe_persistent_scheduler import (
 )
 from ..moe_utils import MoEWeightMode, TensormapWorkspace, WGradInputOrder
 from ..moe_sched_extension import WgradGemmSchedExtension
+from ..unfused.moe_grouped_gemm_sm90 import sm90_pick_pingpong, sm90_pingpong_config_error
+
+
+def sm90_wgrad_schedule_is_pingpong(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]] = None) -> bool:
+    """The wgrad schedule: pingpong for output N >= 2048 (s6 H100 sweep) where tile and cluster allow it, or the forced one."""
+    return sm90_pick_pingpong(n >= 2048, sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
 
 
 class MoEGroupedGemmWgradBF16KernelSm90:
@@ -63,11 +69,10 @@ class MoEGroupedGemmWgradBF16KernelSm90:
     :param weight_mode: ``MoEWeightMode.DENSE``.
     :param input_order: ``WGradInputOrder.Tensor2D``.
     :param pingpong: Two MMA warp groups own alternate tiles, so one's epilogue overlaps the other's mainloop.
-        Tile M must be 128 and tile N one of ``PINGPONG_TILE_N``.
+        The tile must be 128x192 and the cluster (2, 1).
     """
 
     FIX_PAD_SIZE = 256
-    PINGPONG_TILE_N = (128, 160, 192)
 
     @staticmethod
     def can_implement(
@@ -116,7 +121,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
             and all(k >= 0 and k % MoEGroupedGemmWgradBF16KernelSm90.FIX_PAD_SIZE == 0 for k in group_k_list)
             and tile_m in (64, 128)
             and tile_n in range(32, 257, 32)
-            and (not pingpong or (tile_m == 128 and tile_n in MoEGroupedGemmWgradBF16KernelSm90.PINGPONG_TILE_N))
+            and (not pingpong or sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
             and is_power_of_2(cluster_m)
             and is_power_of_2(cluster_n)
             and cluster_m * cluster_n <= 8
@@ -148,8 +153,9 @@ class MoEGroupedGemmWgradBF16KernelSm90:
         self.weight_mode = weight_mode
         self.input_order = input_order
 
-        if pingpong and (mma_tiler_mn[0] != 128 or mma_tiler_mn[1] not in self.PINGPONG_TILE_N):
-            raise ValueError(f"SM90 wgrad pingpong supports 128 x {self.PINGPONG_TILE_N} tiles, got {mma_tiler_mn}")
+        pingpong_error = sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn) if pingpong else None
+        if pingpong_error is not None:
+            raise ValueError(f"SM90 wgrad: {pingpong_error}")
         self.pingpong = pingpong
         if pingpong:
             # Two MMA warp groups, each with the whole 128-row tile (two WGMMA M blocks) and its own epilogue.
@@ -168,8 +174,8 @@ class MoEGroupedGemmWgradBF16KernelSm90:
         self.tma_warp_id = self.num_mma_warp_groups * 4
         self.sched_warp_id = self.tma_warp_id + 1
         self.threads_per_cta = self.num_mma_threads + self.num_threads_per_warp_group
-        # Every MMA warp and the TMA warp read each tile_info entry; one elected lane per warp releases it.
-        self.sched_consumer_warps = self.num_mma_threads // 32 + 1
+        # Every MMA and TMA-warp thread releases each tile_info entry it read (racecheck flags an elected-lane release).
+        self.sched_consumer_threads = self.num_mma_threads + 32
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
 
@@ -413,7 +419,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
             barrier_storage=sched_storage.tile_info_mbar.data_ptr(),
             num_stages=self.num_tile_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 32),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.sched_consumer_warps),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.sched_consumer_threads),
         )
 
         scheduler = MoEPersistentTileScheduler.create(
@@ -504,9 +510,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                 tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
             work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
             cute.arch.fence_proxy("async.shared", space="cta")
-            cute.arch.sync_warp()
-            with cute.arch.elect_one():
-                sched_pipeline.consumer_release(sched_consumer_state)
+            sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
             while work_tile_info.is_valid_tile:
                 k_tile_cnt = work_tile_info.k_tile_cnt
@@ -563,9 +567,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                     tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                 work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                cute.arch.sync_warp()
-                with cute.arch.elect_one():
-                    sched_pipeline.consumer_release(sched_consumer_state)
+                sched_pipeline.consumer_release(sched_consumer_state)
                 sched_consumer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
 
@@ -602,9 +604,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                 tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
             work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
             cute.arch.fence_proxy("async.shared", space="cta")
-            cute.arch.sync_warp()
-            with cute.arch.elect_one():
-                sched_pipeline.consumer_release(sched_consumer_state)
+            sched_pipeline.consumer_release(sched_consumer_state)
             sched_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             if cutlass.const_expr(not self.pingpong):
@@ -643,9 +643,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                         tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                     work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        sched_pipeline.consumer_release(sched_consumer_state)
+                    sched_pipeline.consumer_release(sched_consumer_state)
                     sched_consumer_state.advance()
             else:
                 # Pingpong: group w owns tiles w, w + 2, ... of the sequence; both read (and release) every entry.
@@ -684,9 +682,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                         tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                     work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    cute.arch.sync_warp()
-                    with cute.arch.elect_one():
-                        sched_pipeline.consumer_release(sched_consumer_state)
+                    sched_pipeline.consumer_release(sched_consumer_state)
                     sched_consumer_state.advance()
                 # The group the sentinel's turn falls to takes the peer's last arrive on both order barriers.
                 if tile_parity == group:

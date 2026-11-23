@@ -77,6 +77,7 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
+from ..unfused.moe_grouped_gemm_sm90 import sm90_forced_schedule
 from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
@@ -139,7 +140,6 @@ class GroupedGemmWgradSm100(APIBase):
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         accumulate_on_output: bool = False,
         input_order: WGradInputOrder | str = WGradInputOrder.Tensor2D,
-        kernel_schedule: Optional[Literal["cooperative", "pingpong"]] = None,
     ) -> None:
         super().__init__()
         self._pending_init_kwargs = dict(locals())
@@ -172,8 +172,6 @@ class GroupedGemmWgradSm100(APIBase):
             else:
                 if detect_framework(kwargs["sample_a"]) == "jax":
                     raise ValueError(_BLOCK_SCALED_JAX_ERROR)
-                if kwargs.pop("kernel_schedule") is not None:
-                    raise ValueError("kernel_schedule applies to the BF16 SM90 wgrad kernel only")
                 self._implementation = GroupedGemmWgradBlockScaledAPI(**kwargs)
             self._kernel = self._implementation._kernel
             self.weight_mode = self._implementation.weight_mode
@@ -321,13 +319,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
     current_stream: Optional[cuda.CUstream] = None,
     *,
     descriptor_workspace: Optional[torch.Tensor] = None,
-    kernel_schedule: Optional[Literal["cooperative", "pingpong"]] = None,
 ) -> TupleDict:
-    """Compile and execute grouped GEMM wgrad through the selected backend API.
-
-    ``kernel_schedule`` (SM90 BF16 only) picks the warp-group schedule: None for the default,
-    ``"cooperative"`` or ``"pingpong"``; it changes performance, not results.
-    """
+    """Compile and execute grouped GEMM wgrad through the selected backend API."""
     if sfa_tensor is not None and detect_framework(a_tensor) == "jax":
         from .jax_api import grouped_gemm_wgrad_jax_sm100
 
@@ -339,7 +332,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
             ("sf_fp8_dtype_override", sf_fp8_dtype_override is not None),
             ("current_stream", current_stream is not None),
             ("descriptor_workspace", descriptor_workspace is not None),
-            ("kernel_schedule", kernel_schedule is not None),
         ):
             if rejected:
                 raise ValueError(f"{name} is unsupported for the JAX MXFP8 path")
@@ -381,7 +373,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
-        kernel_schedule,
+        sm90_forced_schedule(),
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
@@ -468,7 +460,8 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
-        kernel_schedule,
+        # The SM90 schedule is a function of the shapes and tile above plus the forced one.
+        sm90_forced_schedule(),
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
@@ -500,7 +493,6 @@ def grouped_gemm_wgrad_wrapper_sm100(
             sf_fp8_dtype_override=sf_fp8_dtype_override,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
-            kernel_schedule=kernel_schedule,
         )
         if output_mode == "dense":
             common["sample_wgrad"] = wgrad_tensor
