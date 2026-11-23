@@ -191,6 +191,38 @@ M tile t's scale factors:
 | GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
 | other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA. |
 
+#### Compact SFA (`compact_sfa_sf_warp=True`)
+
+An EP dispatch delivers each token's scales as a compact row, not as SF atoms. With `compact_sfa_sf_warp=True` the SM100
+GLU kernel takes `sfa` as those rows and builds the atoms itself:
+
+| Item | Contract |
+|---|---|
+| SFA | Compact E8M0 rows `[M, K / 32]` (row r = A row r's scales, K order); MXFP8 only, `K % 512 == 0`, at least 4 A/B stages, the interleaved GLU layout. |
+| M tile t | A rows and compact SFA rows `[256 t, 256 (t + 1))`: the contiguous bytes `[t * 256 * K / 32, (t + 1) * 256 * K / 32)`. |
+| producer | Writes both, padding rows included, before the release store of `signal[t]`. |
+| GEMM | A dedicated SF warp (the last warp of each CTA) reads the tile's rows with L2-only loads (`ld.global.cg`) after the tile's acquire, and stores each row's 4-scale word of a K tile into the stage's SF atom. The TMA warp loads no SFA. |
+
+The SF warp hands each stage's atoms to the leader CTA's MMA, whose `tcgen05.cp` reads both CTAs' atoms through the async
+proxy, with the PTX `sync_restrict` mbarrier pattern for shared memory, once per K tile:
+
+- SF warp: every lane stores its rows (`st.shared::cta`), then `fence.proxy.async.shared::cta`; `bar.warp.sync`; the
+  elected lane issues `fence.release.sync_restrict::shared::cta.cluster` and `mbarrier.arrive.relaxed.cluster` on the
+  leader's full barrier.
+- MMA leader: after the stage's full wait, `mbarrier.try_wait.relaxed.cluster` on the same barrier, then
+  `fence.acquire.sync_restrict::shared::cluster.cluster`, then `tcgen05.cp`.
+
+Both strong operations are `.cluster`, so the release and acquire patterns synchronize across the two CTAs. The release
+orders the writer's operations on `.shared::cta` objects (the other lanes' stores through `bar.warp.sync`), the acquire
+the leader's later operations on `.shared::cluster` objects (the peer's atoms and its own). Each lane's proxy fence
+orders its generic stores before the async-proxy reads that are causally after the release. On SM100 the release lowers
+to `MEMBAR.ALL.CTA; FENCE.VIEW.ASYNC.S` and the acquire to nothing, so there is no L1 invalidation per K tile.
+
+Known gap: removing the writer lanes' `fence.proxy.async.shared::cta` is not caught by any test. The elected lane's
+release fence still emits a hardware async-proxy fence, the handoff takes hundreds of cycles, and shared memory has no
+stale copy to read, so the PTX proxy rule it enforces is guarded by review, not by tests (racecheck does not model it
+either). Moving the arrive before the stores is caught (the producer and release-order tests fail).
+
 ### 4b. Output direction: quant kernel (FC2 forward)
 
 The SM100 block-scaled quant kernel `BlockScaledMoEGroupedGemmQuantKernel` takes the output direction with the same

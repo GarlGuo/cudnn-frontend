@@ -196,3 +196,82 @@ def test_mxfp8_glu_signal_rejects_invalid():
         make_glu_kernel(4, use_dynamic_sched=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
     with pytest.raises(ValueError, match="cluster"):
         make_glu_kernel(4, use_dynamic_sched=True, streaming_signal_capacity=4, cluster_shape_mn=(4, 1))
+
+
+# ---- compact_sfa_sf_warp: SFA is the compact E8M0 rows [rows, K / 32]; the SF warp writes the SF atoms ----
+
+COMPACT_VARIANTS = ("dynamic", "signal", "signal_layout_trigger")
+COMPACT_CASES = [(variant, routing) for variant in COMPACT_VARIANTS for routing in sorted(ROUTINGS)]
+COMPACT_L0 = {("dynamic", "big_expert"), ("signal", "many_experts_64"), ("signal_layout_trigger", "uneven")}
+
+
+@pytest.mark.parametrize("variant, routing", levels(COMPACT_CASES, COMPACT_L0, lambda variant, routing: f"{variant}-{routing}"))
+def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing):
+    """The SF warp's atoms from the compact rows give the bytes of the stock kernel's TMA'd atoms."""
+    tokens = ROUTINGS[routing]
+    problem = make_problem(tokens, N, HIDDEN, seed=len(routing) + 1)
+    expected, _ = Launcher(stock(tokens), problem)(problem)
+    options = dict(use_dynamic_sched=True, compact_sfa_sf_warp=True)
+    if variant != "dynamic":
+        options["streaming_signal_capacity"] = problem["rows"] // ROWS_ALIGNMENT
+    if variant == "signal_layout_trigger":
+        options.update(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+    kernel = make_glu_kernel(len(tokens), **options)
+    got, _ = Launcher(kernel, problem)(problem, signal_ready(kernel) if variant != "dynamic" else None)
+    torch.cuda.synchronize()
+    assert_same_bytes(got, expected, variant)
+
+
+@pytest.mark.L0
+def test_mxfp8_glu_compact_sfa_poison_reaches_d():
+    """The detector works for the compact form: with the compact rows poisoned, D holds NaN."""
+    tokens = ROUTINGS["uneven"]
+    problem = make_problem(tokens, N, HIDDEN, seed=1)
+    poison_inputs(problem, "sfa")
+    out, _ = Launcher(make_glu_kernel(len(tokens), use_dynamic_sched=True, compact_sfa_sf_warp=True), problem)(problem)
+    torch.cuda.synchronize()
+    assert torch.isnan(out["d"].float()).any()
+
+
+COMPACT_PRODUCER_CASES = [(late, order) for late in ("sfa", "both") for order in ("in_order", "reverse", "random")]
+COMPACT_PRODUCER_L0 = {("sfa", "reverse"), ("both", "random")}
+
+
+@pytest.mark.parametrize("late, order", levels(COMPACT_PRODUCER_CASES, COMPACT_PRODUCER_L0, lambda late, order: f"late_{late}-{order}"))
+def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order):
+    """The producer writes each M tile's compact SFA rows (and A) before releasing it; the SF warp must not load a row
+    early (it reads through L2 only, after the tile's acquire)."""
+    tokens = ROUTINGS["many_experts_64"]
+    problem = make_problem(tokens, N, HIDDEN, seed=7)
+    expected, _ = Launcher(stock(tokens), problem)(problem)
+    results = run_with_producer(tokens, problem, late, [order], kernel_options=dict(compact_sfa_sf_warp=True))
+    assert_same_bytes(results[order], expected, f"compact, {late} late, {order} release")
+
+
+@pytest.mark.L0
+def test_mxfp8_glu_compact_sfa_device_layout_waits_for_producer():
+    tokens = ROUTINGS["many_experts_64"]
+    problem = make_problem(tokens, N, HIDDEN, seed=11)
+    expected, _ = Launcher(stock(tokens), problem)(problem)
+    options = dict(compact_sfa_sf_warp=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+    results = run_with_producer(tokens, problem, "both", ["random"], kernel_options=options, device_layout=True)
+    assert_same_bytes(results["random"], expected, "compact, device layout")
+
+
+@pytest.mark.L0
+def test_mxfp8_glu_compact_sfa_rejects_invalid():
+    with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
+        make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, sf_vec_size=16)
+    with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
+        make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1))
+    with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
+        make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, glu_layout="gate_then_up")
+    # K = 384 is a whole number of SF atoms but not of the SF warp's 4-K-tile loads.
+    import cuda.bindings.driver as cuda
+    import cutlass.cute as cute
+    from gemm.cutedsl._streaming_signal_input import kernel_args, new_buffers
+
+    problem = make_problem([256, 0, 0, 0], N, 384)
+    kernel = make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True)
+    with pytest.raises(Exception, match="K % 512"):
+        cute.compile(kernel, *kernel_args(kernel, problem, *new_buffers(kernel, problem)), 4, cuda.CUstream(torch.cuda.current_stream().cuda_stream))

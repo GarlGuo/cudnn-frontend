@@ -40,6 +40,8 @@ def make_glu_kernel(experts, **options):
     # An option naming a construction argument overrides it (the rejection tests).
     common.update({name: options.pop(name) for name in list(options) if name in common})
     kernel = BlockScaledMoEGroupedGemmGluBiasKernel(**common, **options)
+    # compact_sfa_sf_warp: SFA is the compact E8M0 rows [rows, K / 32] (problem["a_exp"]), not the SF atoms.
+    kernel.test_compact = bool(options.get("compact_sfa_sf_warp"))
     kernel.test_compile_key = (type(kernel).__module__, frozen({**common, **options}))
     return kernel
 
@@ -133,7 +135,7 @@ def kernel_args(kernel, problem, c, d, workspace):
         OperandMajorMode.K,
         from_dlpack(workspace, assumed_align=128).iterator,
     ]
-    sfa = tensor(problem["sfa"].view(torch.float8_e8m0fnu))
+    sfa = tensor((problem["a_exp"] if kernel.test_compact else problem["sfa"]).view(torch.float8_e8m0fnu))
     offsets = from_dlpack(problem["offsets"], assumed_align=4)
     c_cute, d_cute = tensor(c), tensor(d)
     # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias)
