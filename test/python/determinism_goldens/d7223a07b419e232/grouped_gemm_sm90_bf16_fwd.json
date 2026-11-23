@@ -50,7 +50,7 @@
     },
     "d": {
       "dtype": "torch.bfloat16",
-      "sha256": "08cc26bee42a58746dee631ffc7636ac69cae644af547b5b5df21d2ca05762fd",
+      "sha256": "3c082ea3f8728ede2cc390641ee5e17d28ca7922a048538cee3b158cacf3848f",
       "shape": [
         768,
         384
