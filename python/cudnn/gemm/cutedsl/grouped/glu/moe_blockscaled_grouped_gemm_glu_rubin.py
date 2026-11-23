@@ -69,6 +69,7 @@ from ..moe_streaming_input_block_tile_scheduler import (
 )
 from cudnn.frost.tile_dsl.consume import release_zero
 from .._sigdiag import diag as _diag
+from ..moe_persistent_scheduler import atomic_add_i32 as _diag_atomic_add
 from ..compact_sfa_sf_warp import CompactSfaSfWarpMixin
 from ..moe_kernel_helpers import mbarrier_try_wait_parity_acquire_cluster
 
@@ -687,7 +688,8 @@ class BlockScaledMoEGroupedGemmGluKernel(CompactSfaSfWarpMixin):
         signal_workspace_bytes = (
             streaming_signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
         )
-        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes
+        # DIAGNOSTIC (_sigdiag COUNTERS): 64 bytes of counters at the end.
+        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes + (64 if _diag("COUNTERS") == "1" else 0)
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -2060,6 +2062,7 @@ class BlockScaledMoEGroupedGemmGluKernel(CompactSfaSfWarpMixin):
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            diag_wait_cycles = cutlass.Int64(0)
             while is_valid_tile:
                 work_tile_info = MoEWorkTileInfo(
                     expert_idx=tile_info[0],
@@ -2255,13 +2258,24 @@ class BlockScaledMoEGroupedGemmGluKernel(CompactSfaSfWarpMixin):
                 #
                 # Advance to next tile
                 #
-                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                if cutlass.const_expr(_diag("COUNTERS") == "1"):
+                    diag_t0 = cute.arch.clock64()
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    diag_wait_cycles = diag_wait_cycles + (cute.arch.clock64() - diag_t0)
+                else:
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+            if cutlass.const_expr(_diag("COUNTERS") == "1"):
+                # DIAGNOSTIC: the TMA warp's cycles waiting for tile_info (scheduler starvation), / 256, summed over CTAs.
+                with cute.arch.elect_one():
+                    diag_words = cute.make_ptr(cutlass.Int32, workspace_ptr.toint() + self.get_workspace_bytes() - 64, AddressSpace.gmem, assumed_align=4)
+                    _diag_atomic_add((diag_words + 3).llvm_ptr, cutlass.Int32(diag_wait_cycles >> 8))
+                    _diag_atomic_add((diag_words + 4).llvm_ptr, cutlass.Int32(1))
             #
             # Wait A/B buffer empty
             #

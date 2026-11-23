@@ -72,6 +72,7 @@ from ..moe_streaming_input_block_tile_scheduler import (
     streaming_signal_workspace_bytes_after_counter,
 )
 from cudnn.frost.tile_dsl.consume import release_zero
+from .._sigdiag import diag as _diag
 from ..compact_sfa_sf_warp import CompactSfaSfWarpMixin
 
 """
@@ -739,7 +740,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         signal_workspace_bytes = (
             streaming_signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
         )
-        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes
+        # DIAGNOSTIC (_sigdiag COUNTERS): 64 bytes of counters at the end (scheduler counters only on SM100).
+        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes + (64 if _diag("COUNTERS") == "1" else 0)
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):

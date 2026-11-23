@@ -546,6 +546,12 @@ class MoEStreamingInputBlockSignalTileScheduler:
             for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
                 if m_tile_offset < lane_m_tiles:
                     self._set_expert_consecutive_m_batch_record(first_m_tile_order + m_tile_offset, (batch_claim_idx, first_m_tile, lane_m_tiles))
+        if const_expr(__import__("cudnn.gemm.cutedsl.grouped._sigdiag", fromlist=["diag"]).diag("COUNTERS") == "1"):
+            # DIAGNOSTIC: openings, and batches opened.
+            if lane_idx == 0:
+                atomic_add_i32((self._state_region_ptr("total") + 0).llvm_ptr, Int32(1))
+            if lane_m_tiles > 0:
+                atomic_add_i32((self._state_region_ptr("total") + 5).llvm_ptr, Int32(1))
         # bar.warp.sync orders every lane's stores above before the elected lane's release below.
         cute.arch.sync_warp()
         with cute.arch.elect_one():
@@ -561,6 +567,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
         """Claim a number (one atomic add), wait for every earlier one to have a batch, open one if it has none, and
         return its linear tile index, END past the last."""
         dynamic_state = self._dynamic_state
+        diag_t0 = cutlass.Int64(0)
+        if const_expr(__import__("cudnn.gemm.cutedsl.grouped._sigdiag", fromlist=["diag"]).diag("COUNTERS") == "1"):
+            diag_t0 = cute.arch.clock64()
         claim_idx = 0
         if lane_idx == 0:
             claim_idx = atomic_add_i32(dynamic_state.counter_ptr.llvm_ptr, Int32(1))
@@ -585,6 +594,12 @@ class MoEStreamingInputBlockSignalTileScheduler:
             if const_expr(__import__("cudnn.gemm.cutedsl.grouped._sigdiag", fromlist=["diag"]).diag("NO_CLAIM_SPIN") != "1"):
                 _spin_until_at_least(streaming_signal_ptr(dynamic_state.counter_ptr) + m_tile, 0)
             linear_tile_idx = m_tile * n_tiles_per_m_tile + n_tile
+        if const_expr(__import__("cudnn.gemm.cutedsl.grouped._sigdiag", fromlist=["diag"]).diag("COUNTERS") == "1"):
+            # DIAGNOSTIC: claim count and the leader's cycles per claim (/ 256), past the scheduler state.
+            if lane_idx == 0:
+                diag_words = self._state_region_ptr("total")
+                atomic_add_i32((diag_words + 1).llvm_ptr, Int32((cute.arch.clock64() - diag_t0) >> 8))
+                atomic_add_i32((diag_words + 2).llvm_ptr, Int32(1))
         return linear_tile_idx
 
     @cute.jit
