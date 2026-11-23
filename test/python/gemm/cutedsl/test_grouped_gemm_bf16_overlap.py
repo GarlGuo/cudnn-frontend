@@ -1,0 +1,103 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileContributor: Wentao Guo, Phuong Nguyen
+
+"""Two same-signature BF16 grouped GEMM wrapper calls overlapping on two streams match their serial results bitwise.
+
+A cached plan's workspace holds the dynamic scheduler's tile counter and the discrete-mode TMA descriptors; overlapping
+calls that shared it stole each other's tiles or descriptors. 32 experts x 512 rows at N=4096, K=1024 overlapped on GB200 every run.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+import cudnn
+from cudnn.tensor_adapter import has_wgmma
+from determinism_utils import assert_bitwise, snapshot
+from gemm.cutedsl import test_grouped_gemm_sm90 as gemm
+
+pytestmark = pytest.mark.L0
+
+COUNTS = (512,) * 32
+N, K = 4096, 1024
+ITERATIONS = 40
+
+
+def _capability():
+    return torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+
+
+def _make(op, seed, discrete=False):
+    problem = gemm.make_problem(COUNTS, n=N, k=K, direction=op, seed=seed)
+    if discrete:
+        problem["b_ptrs"] = torch.tensor([expert.data_ptr() for expert in problem["weights"]], dtype=torch.int64, device="cuda")
+    return problem
+
+
+def _launch_discrete(op, problem, kwargs):
+    common = dict(
+        a_tensor=problem["a"],
+        padded_offsets=problem["offsets"],
+        alpha_tensor=problem["alpha"],
+        b_ptrs=problem["b_ptrs"],
+        n=N,
+        b_dtype=torch.bfloat16,
+        prob_tensor=problem["prob"],
+        generate_c=True,
+        **kwargs,
+    )
+    result = cudnn.grouped_gemm_wrapper_sm100(**common)
+    return {"c": result["c_tensor"], "d": result["d_tensor"]}
+
+
+def _launch(op, problem, sched, schedule=None):
+    """One wrapper call on the current stream; returns its outputs (fresh buffers). ``schedule`` overrides SM90's."""
+    kwargs = {} if sched is None else {"use_dynamic_sched": sched == "dynamic"}
+    if "b_ptrs" in problem:
+        return _launch_discrete(op, problem, kwargs)
+    if op in ("fwd", "dgrad"):
+        result = gemm.run(problem, schedule=schedule, **kwargs)
+        return {"c": result["c_tensor"], "d": result["d_tensor"]}
+
+
+def _assert_overlap_matches_serial(op, sched, discrete=False, schedule=None):
+    problems = [_make(op, seed, discrete) for seed in (1, 2)]
+    expected = [snapshot(_launch(op, problem, sched, schedule)) for problem in problems]
+    torch.cuda.synchronize()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for iteration in range(ITERATIONS):
+        torch.cuda.synchronize()
+        results = []
+        for stream, problem in zip(streams, problems):
+            with torch.cuda.stream(stream):
+                results.append(_launch(op, problem, sched, schedule))
+        torch.cuda.synchronize()
+        for index, (result, reference) in enumerate(zip(results, expected)):
+            assert_bitwise(snapshot(result), reference, f"{op} {sched} iteration {iteration} call {index}")
+
+
+SM100_CASES = [
+    *[(op, sched) for op in ("fwd", "dgrad") for sched in ("static", "dynamic")],
+    *[(op, sched) for op in ("fwd-discrete",) for sched in ("static", "dynamic")],
+]
+
+
+@pytest.mark.parametrize("op,sched", SM100_CASES, ids=[f"{op}-{sched or 'default'}" for op, sched in SM100_CASES])
+def test_sm100_bf16_overlapping_streams(op, sched):
+    if _capability()[0] != 10:
+        pytest.skip("SM100/103 is required")
+    _assert_overlap_matches_serial(op.split("-")[0], sched, discrete=op.endswith("discrete"))
+
+
+# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad.
+SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad") for schedule in (None, "cooperative", "pingpong")]
+
+
+@pytest.mark.parametrize("op,schedule", SM90_CASES, ids=[f"{op}-{schedule or 'heuristic'}" for op, schedule in SM90_CASES])
+def test_sm90_bf16_overlapping_streams(op, schedule):
+    # SM90 runs the dynamic (atomic-counter) scheduler by default.
+    if not has_wgmma(_capability()[0]):
+        pytest.skip("SM90 is required")
+    _assert_overlap_matches_serial(op, None, schedule=schedule)

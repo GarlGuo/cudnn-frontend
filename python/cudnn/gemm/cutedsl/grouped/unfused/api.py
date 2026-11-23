@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Neutral public API for SM100 unfused BF16 grouped GEMM."""
+"""Neutral public API for the SM100 (and SM90) unfused BF16 grouped GEMM."""
 
 from __future__ import annotations
 
@@ -17,9 +17,11 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
     cuda_is_available,
+    default_stream,
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -27,7 +29,8 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from ..backend_utils import row_major_layout
+from .moe_grouped_gemm_sm90 import schedule_override
+from ..backend_utils import row_major_layout, wrapper_workspace
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
 
@@ -51,7 +54,7 @@ class GroupedGemmSm100(APIBase):
         b_shape: Optional[Tuple[int, ...]] = None,
         b_dtype: Optional[torch.dtype] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         vector_f32: bool = False,
         m_aligned: int = 256,
@@ -134,6 +137,14 @@ def _stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
             key=lambda item: (item[1], shape[item[0]]),
         )
     )
+
+
+def _execute_with_scratch(op, framework, current_stream, **operands):
+    """Run a cached plan with its per-call scratch, allocated on the launch stream."""
+    implementation = op._implementation
+    launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, implementation._scratch_nbytes, operands["a_tensor"].device, launch_stream) as workspace:
+        implementation.execute(current_stream=launch_stream, workspace=workspace, **operands)
 
 
 def _operand_meta(tensor: Optional[torch.Tensor]) -> Optional[tuple]:
@@ -246,8 +257,8 @@ def _normalize_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if not has_tcgen05(major):
-        raise RuntimeError(f"GroupedGemmSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
+    if not (has_tcgen05(major) or has_wgmma(major)):
+        raise RuntimeError(f"GroupedGemmSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
     tensor_m, k = a_shape[:2]
     if tensor_m % 256 != 0:
@@ -308,7 +319,7 @@ def grouped_gemm_wrapper_sm100(
     c_tensor: Optional[torch.Tensor] = None,
     d_tensor: Optional[torch.Tensor] = None,
     cd_major: str = "n",
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     vector_f32: bool = False,
     m_aligned: int = 256,
@@ -341,20 +352,24 @@ def grouped_gemm_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         vector_f32,
         m_aligned,
         generate_c,
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
+        schedule_override(),
     )
     memo = _wrapper_memo.get(_memo_key)
     if memo is not None:
         op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
         internal_c = c_tensor if c_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
         d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
-        op.execute(
+        _execute_with_scratch(
+            op,
+            framework,
+            current_stream,
             a_tensor=a_tensor,
             c_tensor=internal_c,
             d_tensor=d_out,
@@ -364,7 +379,6 @@ def grouped_gemm_wrapper_sm100(
             b_ptrs=None if is_dense else b_ptrs,
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
-            current_stream=current_stream,
         )
         return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
 
@@ -450,7 +464,7 @@ def grouped_gemm_wrapper_sm100(
         c_dtype,
         d_dtype,
         cd_major,
-        tuple(mma_tiler_mn),
+        tuple(mma_tiler_mn) if mma_tiler_mn is not None else None,
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         vector_f32,
         m_aligned,
@@ -458,6 +472,8 @@ def grouped_gemm_wrapper_sm100(
         use_dynamic_sched,
         overlap_margin,
         workspace_signature,
+        # The SM90 schedule is a function of the shapes and tile above plus the forced one.
+        schedule_override(),
     )
 
     op = _cache_of_GroupedGemmSm100Objects.get(cache_key)
@@ -489,7 +505,10 @@ def grouped_gemm_wrapper_sm100(
 
     _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
 
-    op.execute(
+    _execute_with_scratch(
+        op,
+        framework,
+        current_stream,
         a_tensor=a_tensor,
         c_tensor=internal_c,
         d_tensor=d_tensor,
@@ -499,7 +518,6 @@ def grouped_gemm_wrapper_sm100(
         b_ptrs=None if is_dense else b_ptrs,
         bias_tensor=bias_tensor,
         prob_tensor=prob_tensor,
-        current_stream=current_stream,
     )
     return TupleDict(
         d_tensor=d_tensor,

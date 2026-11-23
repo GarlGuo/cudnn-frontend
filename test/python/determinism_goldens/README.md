@@ -4,6 +4,60 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### H100 SM90 BF16 grouped GEMM pingpong and epilogue scaling (2026-11-23)
+
+Pingpong runs only a 128x192 tile on a (2, 1) cluster, and a GLU only without C.
+Forced-pingpong cases (test-only schedule hook) in `gemm/cutedsl/test_grouped_gemm_wgrad_sm90_determinism.py`:
+replay, bytes equal to the cooperative 128x192 schedule, claim-order invariance
+down to one persistent cluster, and expert batch invariance. No wgrad golden is
+recorded: the cooperative records below cover the bytes.
+
+Recorded on H100 at 3a99fdb4 (run s9, strict check 8/8 under `CUDNN_DETERMINISM_GOLDENS`):
+new `grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` and `grouped_gemm_glu_sm90_bf16_pingpong_noc`
+(the GLU record replaces a 128x128 record with C, a tile pingpong no longer runs), and
+re-recorded `grouped_gemm_sm90_bf16_{fwd,dgrad}`. Numerical reason for the re-record: the
+epilogue now scales D once per row by `alpha * prob` instead of `(acc * alpha) * prob`; with
+these problems' non-unit alpha (0.5..1.5) the reassociation can move a D element by at most one
+bf16 ulp. C, the GLU, dGLU and wgrad records are unchanged, and unit alpha/prob is bitwise
+unchanged. The re-recorded D still matches the FP32 reference within the suites' tolerance.
+
+### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22)
+
+New SM90 (Hopper) kernels behind `grouped_gemm_wrapper_sm100` (forward, dgrad),
+`grouped_gemm_wgrad_wrapper_sm100`, `grouped_gemm_glu_wrapper_sm100` and
+`grouped_gemm_dglu_wrapper_sm100`. The five goldens are in `d7223a07b419e232/`.
+
+Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch
+2.14.0+cu130, CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0,
+tvm-ffi 0.1.16, compute-sanitizer 2026.1.1.0. Source built from the commit
+under test.
+
+```
+G=gemm/cutedsl
+F="$G/test_grouped_gemm_sm90.py $G/test_grouped_gemm_sm90_determinism.py $G/test_grouped_gemm_wgrad_sm90.py \
+   $G/test_grouped_gemm_wgrad_sm90_determinism.py $G/test_grouped_gemm_glu_sm90.py $G/test_grouped_gemm_glu_sm90_determinism.py"
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=<new directory> pytest -m L0 $F   # sharded over 5 GPUs
+```
+
+- `5f3bbb1e` (forward, dgrad, wgrad): 61 passed, 0 skipped. `b42265a3`: 61
+  passed. `c36a50af` (adds GLU and dGLU): 113 passed, 0 skipped, plus 3
+  wgrad scheduler tests.
+- The forward, dgrad and wgrad records are byte-identical across all three
+  commits; GLU and dGLU are recorded once, at `c36a50af`.
+- Each `test_sm90*_golden` case checks the FP32 reference and replays bitwise
+  before recording. The replay cases run 8 fresh-buffer launches against
+  concurrent second-stream work. Batch invariance covers a segment alone,
+  packed, reordered, duplicated and with changed neighbors.
+- Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000
+  warm and 3000 poisoned launches for forward, dgrad, wgrad, GLU and dGLU;
+  the unsafe control failed 200 of 200.
+- dGLU's `dprob` is an atomic per-row sum across N tiles and is excluded
+  from the byte checks (max replay difference 4.6e-5); its D is checked.
+- compute-sanitizer at `c36a50af`: racecheck and synccheck report 0 errors
+  for all four ops. memcheck reports 0 device errors, but exits 99 on 28
+  host API messages (cuda-python's requested CUDA 13030 exceeds the 13020
+  driver; a `cuMemCreate` refusal).
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
