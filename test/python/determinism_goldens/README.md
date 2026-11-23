@@ -2657,7 +2657,7 @@ recorded. The kernels have no backward.
 
 Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0 (CUDA 12.9), one GPU:
 both FC1 files with the two FC2 files at `-m "L0 or L1"`: **119 passed** (64 FC1, 55 FC2), 0 skipped. SM103 is
-unverified; SM107 runs the Rubin GLU kernel, which has no input direction yet. From `test/python`:
+unverified; SM107 (the Rubin twin, stock SFA; the compact cases skip there) needs a Rubin run. From `test/python`:
 
 ```bash
 python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py -m L0 -q -rs
