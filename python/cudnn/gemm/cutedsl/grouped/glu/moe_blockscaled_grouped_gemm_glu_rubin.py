@@ -360,6 +360,8 @@ class BlockScaledMoEGroupedGemmGluKernel(CompactSfaSfWarpMixin):
             all_warps.append(self.trigger_warp_id)
         if compact_sfa_sf_warp and (sf_vec_size != 32 or not use_2cta_instrs or tuple(cluster_shape_mn) != (2, 1)):
             raise ValueError("compact_sfa_sf_warp requires MXFP8 (sf_vec_size 32), cluster (2, 1) with the 2-CTA MMA")
+        if compact_sfa_cta_release and not compact_sfa_sf_warp:
+            raise ValueError("compact_sfa_cta_release requires compact_sfa_sf_warp")
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
         self.compact_sfa_cta_release = compact_sfa_cta_release
         self.sf_warp_release_batch = 1 if compact_sfa_cta_release else self.SF_WARP_RELEASE_BATCH
@@ -581,7 +583,9 @@ class BlockScaledMoEGroupedGemmGluKernel(CompactSfaSfWarpMixin):
             self.d_layout,
             self.sf_dtype,
             self.sf_vec_size,
-            self.num_smem_capacity,
+            # compact_sfa_sf_warp's 128-deep K tile doubles the stage count; the 1 KB barrier estimate then misses the
+            # extra barriers and the per-buffer 1 KB alignment padding (the sm_107a cap is exceeded by 1 KB at 9 stages).
+            self.num_smem_capacity - (2048 if self.compact_sfa_sf_warp else 0),
             self.occupancy,
             self.generate_sfd,
             bias_dtype=self.bias_dtype if self.enable_bias else None,
@@ -839,6 +843,9 @@ class BlockScaledMoEGroupedGemmGluKernel(CompactSfaSfWarpMixin):
         if cutlass.const_expr(scheduler_counter is not None):
             workspace_ptr = scheduler_counter.iterator
         a = kernel_facing_mx(a)
+        # The SF warp loads and releases 4 K tiles' words per row at once: 16-byte aligned compact rows.
+        if cutlass.const_expr(self.compact_sfa_sf_warp and cute.is_static(a.shape[1]) and cute.size(a, mode=[1]) % 512 != 0):
+            raise ValueError(f"compact_sfa_sf_warp requires K % 512 == 0, got K = {cute.size(a, mode=[1])}")
         c = kernel_facing_mx(c)
         d = kernel_facing_mx(d)
         d_col = kernel_facing_mx(d_col)
@@ -1188,6 +1195,11 @@ class BlockScaledMoEGroupedGemmGluKernel(CompactSfaSfWarpMixin):
                 ]
 
         self.shared_storage = SharedStorage
+        if cutlass.const_expr(self.compact_sfa_sf_warp and self.shared_storage.size_in_bytes() > self.num_smem_capacity):
+            raise ValueError(
+                f"compact_sfa_sf_warp: {self.shared_storage.size_in_bytes()} bytes of shared memory with {self.num_ab_stage} A/B stages "
+                f"exceed the {self.num_smem_capacity}-byte sm_107a cap"
+            )
 
         # Launch the kernel synchronously
         self.kernel(

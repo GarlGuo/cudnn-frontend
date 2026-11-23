@@ -202,7 +202,7 @@ def test_mxfp8_glu_signal_rejects_invalid():
 @pytest.fixture
 def sm100_kernel_only():
     if is_rubin():
-        pytest.skip("compact_sfa_sf_warp: the SM100 kernel only (the Rubin GLU kernel takes SF atoms)")
+        pytest.skip("generate_sfd_col is an option of the SM100 GLU kernel only")
 
 
 # *_cta: compact_sfa_cta_release, the SF warp's per-K-tile CTA-scope arrive.
@@ -279,13 +279,14 @@ def test_mxfp8_glu_compact_sfa_device_layout_waits_for_producer():
 
 
 @pytest.mark.L0
-def test_mxfp8_glu_compact_sfa_rejects_invalid(sm100_kernel_only):
+def test_mxfp8_glu_compact_sfa_rejects_invalid():
     with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
         make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, sf_vec_size=16)
     with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
         make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1))
-    with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
-        make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, glu_layout="gate_then_up")
+    if not is_rubin():  # the gate-then-up layout is an SM100 GLU option
+        with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
+            make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, glu_layout="gate_then_up")
     with pytest.raises(ValueError, match="compact_sfa_cta_release requires compact_sfa_sf_warp"):
         make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_cta_release=True)
     # K = 384 is a whole number of SF atoms but not of the SF warp's 4-K-tile loads.

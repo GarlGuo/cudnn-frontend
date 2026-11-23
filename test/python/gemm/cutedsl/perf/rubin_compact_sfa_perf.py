@@ -25,7 +25,10 @@ VARIANTS = {
     "signal_compact_cluster": dict(use_dynamic_sched=True, signal=True, compact_sfa_sf_warp=True),
     "signal_compact_cta": dict(use_dynamic_sched=True, signal=True, compact_sfa_sf_warp=True, compact_sfa_cta_release=True),
 }
-ROUNDS, REPS, WARMUP = 6, 10, 2
+import os
+
+# ROUNDS=<n> in the environment: more interleaved rounds (each REPS launches per variant).
+ROUNDS, REPS, WARMUP = int(os.environ.get("ROUNDS", "6")), 10, 2
 
 
 def build(kind, shape, variant, problem):
