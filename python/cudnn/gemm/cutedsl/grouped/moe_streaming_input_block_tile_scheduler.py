@@ -225,6 +225,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         streaming_signal_capacity: int,
         device_layout: bool,
         release_zero: ReleaseZero,
+        lane_end_m_tiles=None,
     ):
         self.params = params
         self.expert_freq_offsets = expert_freq_offsets
@@ -237,6 +238,12 @@ class MoEStreamingInputBlockSignalTileScheduler:
         self.device_layout = device_layout
         # The kernel's release-zero (python/cudnn/AGENTS.md Rule 11), wrapped once at kernel entry; never serialized.
         self.release_zero = release_zero
+        # The scheduler warp's registers: round j, lane l holds expert min(32 j + l, E - 1)'s end M tile (see
+        # ``_load_lane_end_m_tiles``).  Zeros until the first claim loads them (and in every other warp): the DSL carries
+        # the scheduler through the warp-role branches, so its value count must not change there.
+        if lane_end_m_tiles is None:
+            lane_end_m_tiles = [Int32(0) for _ in range(0, params.local_expert_count, cute.arch.WARP_SIZE)]
+        self._lane_end_m_tiles = lane_end_m_tiles
         check_linear_tile_idx_range(params.intermediate, params.cluster_tile_n, streaming_signal_capacity)
         # mapa.shared::cluster at one CTA is an illegal peer store.  check_dynamic_sched_cluster_shape admits (1, 1)
         # with the 1-CTA MMA, so this assert is what rejects it for the signal scheduler.
@@ -250,6 +257,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         values.extend(extract_mlir_values(self.expert_freq_offsets))
         values.extend(extract_mlir_values(self.cta_id_in_cluster))
         values.extend(extract_mlir_values(self._dynamic_state))
+        values.extend(extract_mlir_values(self._lane_end_m_tiles))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "MoEStreamingInputBlockSignalTileScheduler":
@@ -271,6 +279,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
             streaming_signal_capacity=self.streaming_signal_capacity,
             device_layout=const_expr(self.device_layout),
             release_zero=self.release_zero,
+            lane_end_m_tiles=take(self._lane_end_m_tiles),
         )
 
     @staticmethod
@@ -340,7 +349,30 @@ class MoEStreamingInputBlockSignalTileScheduler:
         layout)."""
         if const_expr(self.device_layout):
             self._wait_for_producer_layout()
+        self._load_lane_end_m_tiles()
         return self.advance_to_next_work()
+
+    @cute.jit
+    def _load_lane_end_m_tiles(self) -> None:
+        """Read every expert's end M tile once into the scheduler warp's registers (ceil(E / 32) per lane): the per-claim
+        expert lookup then loads nothing, and an L1 invalidate (one per claim, the claim's acquire) costs it no miss.
+        The layout is final here (``device_layout``: acquired above)."""
+        lane_idx = cute.arch.lane_idx()
+        local_expert_count = const_expr(self.params.local_expert_count)
+        self._lane_end_m_tiles = [
+            self._expert_end_m_tile(cutlass.min(first_expert + lane_idx, local_expert_count - 1))
+            for first_expert in range(0, local_expert_count, cute.arch.WARP_SIZE)
+        ]
+
+    @cute.jit
+    def _end_m_tile_from_lanes(self, expert: Int32) -> Int32:
+        """``_expert_end_m_tile(expert)`` from the registers, for a warp-uniform ``expert`` in a converged warp."""
+        end_m_tile = Int32(0)
+        for round_idx in cutlass.range_constexpr(len(self._lane_end_m_tiles)):
+            value = cute.arch.shuffle_sync(self._lane_end_m_tiles[round_idx], offset=expert % cute.arch.WARP_SIZE, mask=0xFFFFFFFF, mask_and_clamp=31)
+            if expert // cute.arch.WARP_SIZE == round_idx:
+                end_m_tile = value
+        return end_m_tile
 
     @cute.jit
     def wait_all_streaming_signal_slots_ready(self) -> None:
@@ -576,7 +608,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         # The other lanes hold 0, so the OR hands every lane lane 0's number.
         claim_idx = cute.arch.warp_redux_sync(claim_idx, "or")
         # One claim per (M tile, N tile); from there on a claim broadcasts END, the first index past every tile.
-        claim_count = self._total_m_tiles() * n_tiles_per_m_tile
+        claim_count = self._end_m_tile_from_lanes(Int32(const_expr(self.params.local_expert_count - 1))) * n_tiles_per_m_tile
         linear_tile_idx = claim_count
         if claim_idx < claim_count:
             # Every lane lands on the same side of this test: once ``assigned_claim_count``
@@ -649,14 +681,18 @@ class MoEStreamingInputBlockSignalTileScheduler:
         expert = Int32(local_expert_count)
         for first_expert in cutlass.range_constexpr(0, local_expert_count, cute.arch.WARP_SIZE):
             scanned_expert = first_expert + lane_idx
-            end_m_tile = self._expert_end_m_tile(cutlass.min(scanned_expert, local_expert_count - 1))
+            end_m_tile = self._lane_end_m_tiles[first_expert // cute.arch.WARP_SIZE]
             expert_candidate = Int32(local_expert_count)
             if scanned_expert < local_expert_count and m_tile < end_m_tile:
                 expert_candidate = scanned_expert
             expert = cutlass.min(expert, cute.arch.warp_redux_sync(expert_candidate, "min"))
         work_tile_info = MoEWorkTileInfo(expert_idx=Int32(-1), tile_m_idx=Int32(0), tile_n_idx=Int32(0), k_tile_cnt=Int32(0))
         if expert < local_expert_count:
-            m_tile_in_expert = m_tile - self._expert_first_m_tile(expert)
+            # The warp is converged here (``expert`` is a warp reduction): a shuffle reads expert - 1's end M tile.
+            first_m_tile = self._end_m_tile_from_lanes(cutlass.max(expert - 1, 0))
+            if expert == 0:
+                first_m_tile = Int32(0)
+            m_tile_in_expert = m_tile - first_m_tile
             cta_tile_m_idx = m_tile_in_expert * const_expr(self.params.cluster_shape_mn[0]) + self.cta_id_in_cluster[0]
             cta_tile_n_idx = n_tile * const_expr(self.params.cluster_shape_mn[1]) + self.cta_id_in_cluster[1]
             k_tile_cnt = self._compute_k_tile_cnt()
