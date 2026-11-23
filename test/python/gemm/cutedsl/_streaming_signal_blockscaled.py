@@ -74,6 +74,10 @@ def make_glu_kernel(experts, rubin=None, **options):
         act_func="swiglu",
     )
     common.update({name: options.pop(name) for name in list(options) if name in common})
+    # compact_sfa_sf_warp is the SM100 kernel's alone: off, it is not passed (the Rubin twin has no such argument).
+    test_compact = bool(options.get("compact_sfa_sf_warp"))
+    if not test_compact:
+        options.pop("compact_sfa_sf_warp", None)
     if rubin:
         from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_rubin import BlockScaledMoEGroupedGemmGluKernel
 
@@ -84,7 +88,7 @@ def make_glu_kernel(experts, rubin=None, **options):
         kernel = BlockScaledMoEGroupedGemmGluBiasKernel(**common, **options)
     kernel.test_rubin, kernel.test_glu = rubin, True
     # compact_sfa_sf_warp: SFA is the compact E8M0 rows [rows, K / 32] (problem["a_exp"]), not the SF atoms.
-    kernel.test_compact = bool(options.get("compact_sfa_sf_warp"))
+    kernel.test_compact = test_compact
     kernel.test_compile_key = (type(kernel).__module__, frozen({**common, **options}))
     return kernel
 
