@@ -1402,8 +1402,8 @@ def grouped_gemm_dglu_wrapper_sm100(
 ) -> TupleDict:
     """Dispatch grouped GEMM dGLU once from an immutable normalized call.
 
-    ``deterministic=True`` makes ``dprob`` bit-identical run to run (SM100 block-scaled or BF16
-    kernel, torch, no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
+    ``deterministic=True`` makes ``dprob`` bit-identical run to run (SM100 block-scaled kernel or
+    SM100/SM90 BF16 kernel, torch, no dbias). See docs/operations/gemm_fusions/grouped_gemm_dglu.md.
     ``glu_layout="gate_then_up"`` consumes canonical C and returns canonical
     gate/up halves in D, dbias and both D scale buffers. It is independent of
     the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
