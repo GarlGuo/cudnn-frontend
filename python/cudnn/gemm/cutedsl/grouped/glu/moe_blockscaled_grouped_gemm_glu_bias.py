@@ -20,6 +20,7 @@ from typing import Type, Tuple, Union, Optional
 import cuda.bindings.driver as cuda
 
 import cutlass
+from .. import _sigdiag
 import cutlass.cute as cute
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cutlass_dsl import dsl_user_op
@@ -1163,7 +1164,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
 
-        if cutlass.const_expr(self.use_streaming_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched and not _sigdiag.knob("SIGDIAG_STOCK_SCHED")):
             sched_params = MoEInputBlockSignalSchedulerParams(
                 expert_shape=sched_expert_shape,
                 cta_tile_shape_mnk=self.cta_tile_shape_mnk,
@@ -1971,7 +1972,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
         )
 
         zero = release_zero(release_zero_arg) if cutlass.const_expr(release_zero_arg is not None) else None
-        if cutlass.const_expr(self.use_streaming_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched and not _sigdiag.knob("SIGDIAG_STOCK_SCHED")):
             scheduler = MoEStreamingInputBlockSignalTileScheduler.create(
                 sched_params,
                 padded_offsets,
@@ -2134,6 +2135,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                     sInfo[(2, tile_info_producer_state.index)] = work_tile_info.tile_n_idx
                     sInfo[(3, tile_info_producer_state.index)] = work_tile_info.k_tile_cnt
                 cute.arch.fence_proxy("async.shared", space="cta")
+                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                    with cute.arch.elect_one():
+                        _sigdiag.tilelog(0, (work_tile_info.expert_idx, work_tile_info.tile_m_idx, work_tile_info.tile_n_idx))
 
                 self.sched_sync_barrier.arrive_and_wait()
                 tile_info_pipeline.producer_commit(tile_info_producer_state)
@@ -2288,6 +2292,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                 if cutlass.const_expr(self.use_streaming_signal_sched):
                     cute.arch.fence_proxy("async.global")
 
+                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                    with cute.arch.elect_one():
+                        _sigdiag.tilelog(1)
                 # Peek (try_wait) AB buffer empty
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -2511,6 +2518,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
+                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                    with cute.arch.elect_one():
+                        _sigdiag.tilelog(2)
                 k_tile_cnt = tile_info[3]
 
                 # Peek (try_wait) AB buffer full for k_tile = 0
@@ -3268,6 +3278,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
+                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                    if warp_idx == self.epilog_warp_id[0]:
+                        with cute.arch.elect_one():
+                            _sigdiag.tilelog(3)
                 #
                 # Advance to next tile
                 #
@@ -3297,7 +3311,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
             d_pipeline.producer_tail()
 
         # The signal scheduler's last cluster handoff writes into a peer's shared memory: all threads wait here.
-        if cutlass.const_expr(self.use_streaming_signal_sched):
+        if cutlass.const_expr(self.use_streaming_signal_sched and not _sigdiag.knob("SIGDIAG_STOCK_SCHED")):
             scheduler.internal_finalize()
         # Work after this kernel on the stream must also follow the grid this launch overlapped.
         if cutlass.const_expr(self.use_pdl):

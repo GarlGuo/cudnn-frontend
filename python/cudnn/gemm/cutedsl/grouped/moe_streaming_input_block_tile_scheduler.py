@@ -73,6 +73,7 @@ from .moe_kernel_helpers import (
     mbarrier_try_wait_parity_relaxed_cluster,
 )
 from .moe_utils import ceil_div
+from . import _sigdiag
 from cudnn.frost.tile_dsl.consume import ReleaseZero, consume_then_arrive_on_peer
 from .moe_persistent_scheduler import (
     atomic_add_i32,
@@ -323,14 +324,18 @@ class MoEStreamingInputBlockSignalTileScheduler:
         """Claim the cluster's next linear tile index and return its work tile, invalid past the last."""
         claimed_linear_tile_idx = self._broadcast_claimed_tile()
         work_tile_info = self._get_work_tile_for_linear_idx(claimed_linear_tile_idx)
-        # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier, each lane at an
-        # address computed from the slot word it read, so the read completes before the leader may refill the slot (Rule 11).
-        consume_then_arrive_on_peer(
-            self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index),
-            0,
-            claimed_linear_tile_idx,
-            self.release_zero,
-        )
+        if const_expr(_sigdiag.knob("SIGDIAG_HYBRID_BCAST")):
+            # DIAGNOSTIC: the stock scheduler's slot release.
+            self.cluster_pipeline.sync_object_empty.arrive(self._dynamic_state.consumer_state.index, Int32(0))
+        else:
+            # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier, each lane at an
+            # address computed from the slot word it read, so the read completes before the leader may refill the slot (Rule 11).
+            consume_then_arrive_on_peer(
+                self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index),
+                0,
+                claimed_linear_tile_idx,
+                self.release_zero,
+            )
         self._dynamic_state.consumer_state.advance()
         return work_tile_info
 
@@ -578,21 +583,38 @@ class MoEStreamingInputBlockSignalTileScheduler:
         # One claim per (M tile, N tile); from there on a claim broadcasts END, the first index past every tile.
         claim_count = self._total_m_tiles() * n_tiles_per_m_tile
         linear_tile_idx = claim_count
-        if claim_idx < claim_count:
-            # Every lane lands on the same side of this test: once ``assigned_claim_count``
-            # is ``claim_idx`` it stays there until this very warp moves it.
-            if _spin_until_at_least(self._state_region_ptr("assigned_claim_count"), claim_idx) == claim_idx:
-                self._open_expert_consecutive_m_batch(claim_idx, n_tiles_per_m_tile, lane_idx)
-            # ``assigned_claim_count`` is past ``claim_idx`` and every lane has acquired
-            # it, so the record at this claim index's M-tile order is written and visible.
-            first_claim_idx, first_m_tile, m_tile_count = self._get_expert_consecutive_m_batch_record(claim_idx // n_tiles_per_m_tile)
-            claim_idx_in_batch = claim_idx - first_claim_idx
-            n_tile = claim_idx_in_batch // m_tile_count
-            m_tile = first_m_tile + claim_idx_in_batch % m_tile_count
-            # No acquire of ``signal[m_tile]`` here: the opener read it ready and acquired it (``fence_acquire_gpu``)
-            # before its release of ``assigned_claim_count``, which the spin above acquired, so the producer's
-            # release of the M tile's rows happens before this claim (causality order is transitive).
-            linear_tile_idx = m_tile * n_tiles_per_m_tile + n_tile
+        if const_expr(_sigdiag.knob("SIGDIAG_HYBRID_CLAIM")):
+            # DIAGNOSTIC: no batches, no spins, no acquire (every tile ready): claim index -> tile, M fastest per expert.
+            if claim_idx < claim_count:
+                local_expert_count = const_expr(self.params.local_expert_count)
+                expert = Int32(local_expert_count)
+                for first_expert in cutlass.range_constexpr(0, local_expert_count, cute.arch.WARP_SIZE):
+                    scanned_expert = first_expert + lane_idx
+                    end_claim = self._expert_end_m_tile(cutlass.min(scanned_expert, local_expert_count - 1)) * n_tiles_per_m_tile
+                    expert_candidate = Int32(local_expert_count)
+                    if scanned_expert < local_expert_count and claim_idx < end_claim:
+                        expert_candidate = scanned_expert
+                    expert = cutlass.min(expert, cute.arch.warp_redux_sync(expert_candidate, "min"))
+                first_m_tile = self._expert_first_m_tile(expert)
+                m_tile_count = self._expert_end_m_tile(expert) - first_m_tile
+                claim_in_expert = claim_idx - first_m_tile * n_tiles_per_m_tile
+                linear_tile_idx = (first_m_tile + claim_in_expert % m_tile_count) * n_tiles_per_m_tile + claim_in_expert // m_tile_count
+        else:
+            if claim_idx < claim_count:
+                # Every lane lands on the same side of this test: once ``assigned_claim_count``
+                # is ``claim_idx`` it stays there until this very warp moves it.
+                if _spin_until_at_least(self._state_region_ptr("assigned_claim_count"), claim_idx) == claim_idx:
+                    self._open_expert_consecutive_m_batch(claim_idx, n_tiles_per_m_tile, lane_idx)
+                # ``assigned_claim_count`` is past ``claim_idx`` and every lane has acquired
+                # it, so the record at this claim index's M-tile order is written and visible.
+                first_claim_idx, first_m_tile, m_tile_count = self._get_expert_consecutive_m_batch_record(claim_idx // n_tiles_per_m_tile)
+                claim_idx_in_batch = claim_idx - first_claim_idx
+                n_tile = claim_idx_in_batch // m_tile_count
+                m_tile = first_m_tile + claim_idx_in_batch % m_tile_count
+                # No acquire of ``signal[m_tile]`` here: the opener read it ready and acquired it (``fence_acquire_gpu``)
+                # before its release of ``assigned_claim_count``, which the spin above acquired, so the producer's
+                # release of the M tile's rows happens before this claim (causality order is transitive).
+                linear_tile_idx = m_tile * n_tiles_per_m_tile + n_tile
         return linear_tile_idx
 
     @cute.jit
@@ -612,14 +634,24 @@ class MoEStreamingInputBlockSignalTileScheduler:
             if lane_idx < cluster_size:
                 cute.arch.store_async_dsmem(dynamic_state.broadcast_ptr, linear_tile_idx, full_barrier_ptr, lane_idx)
             # Fan out one arrive per CTA to the full barrier.
-            with cute.arch.elect_one():
-                fence_release_cluster()
-                for peer in cutlass.range_constexpr(cluster_size):
-                    mbarrier_arrive_expect_tx_on_peer_relaxed_cluster(full_barrier_ptr, Int32(4), peer)
+            if const_expr(_sigdiag.knob("SIGDIAG_HYBRID_BCAST")):
+                # DIAGNOSTIC: the stock scheduler's commit (one default-semantics arrive per peer lane).
+                from .moe_persistent_scheduler import mbarrier_arrive_expect_tx_on_peer
+
+                if lane_idx < cluster_size:
+                    mbarrier_arrive_expect_tx_on_peer(full_barrier_ptr, Int32(4), lane_idx)
+            else:
+                with cute.arch.elect_one():
+                    fence_release_cluster()
+                    for peer in cutlass.range_constexpr(cluster_size):
+                        mbarrier_arrive_expect_tx_on_peer_relaxed_cluster(full_barrier_ptr, Int32(4), peer)
         dynamic_state.producer_state.advance()
         consumer_full_barrier_ptr = self.cluster_pipeline.sync_object_full.get_barrier(dynamic_state.consumer_state.index)
         broadcast_arrived = Boolean(False)
-        if dynamic_state.is_leader_cta:
+        if const_expr(_sigdiag.knob("SIGDIAG_HYBRID_BCAST")):
+            # DIAGNOSTIC: the stock scheduler's consumer wait.
+            self.cluster_pipeline.consumer_wait(dynamic_state.consumer_state)
+        elif dynamic_state.is_leader_cta:
             # This very warp acquired the claim above and made the arrive: the default ``.acquire.cta`` try_wait
             # covers the ``st.async`` word, and the claim's acquire is already in program order.
             while not broadcast_arrived:
