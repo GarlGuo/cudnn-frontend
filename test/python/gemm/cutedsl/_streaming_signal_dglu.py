@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared by the streaming input signal tests of the dGLU (dSwiGLU) kernels, BF16 and MXFP8 on SM100: problems,
-buffers, launches and one compile cache.
+"""Shared by the streaming input signal tests of the dGLU (dSwiGLU) kernels: the BF16 and MXFP8 SM100 kernels and, on
+SM107, the MXFP8 Rubin twin; problems, buffers, launches and one compile cache.
 
 The backward dGLU reads the dispatched output gradient dY as A (and, for MXFP8, its scales), so the producer streams A
-and SFA exactly as for the forward GLU; C (the saved pre-activation), prob and B are ordinary inputs.  The kernels run
-with ``deterministic=True`` (one dprob slot per N tile), so dprob is compared bit for bit.
+and SFA exactly as for the forward GLU; C (the saved pre-activation), prob and B are ordinary inputs.  The SM100 kernels
+run with ``deterministic=True`` (one dprob slot per N tile), so dprob is compared bit for bit.  The Rubin kernel has no
+such option: it adds each tile's fp32 dprob partials with atomics in arrival order, so its dprob is not deterministic
+(not even across replays of the stock scheduler) and is compared with a tolerance there; D stays bit-exact.
 """
 
 import torch
@@ -30,6 +32,7 @@ def make_dglu_kernel(recipe, experts, **options):
     import cutlass
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 
+    rubin = recipe == "mxfp8" and is_rubin()
     common = dict(
         acc_dtype=cutlass.Float32,
         use_2cta_instrs=True,
@@ -41,16 +44,22 @@ def make_dglu_kernel(recipe, experts, **options):
         act_func="dswiglu",
     )
     common.update({name: options.pop(name) for name in list(options) if name in common})
-    # compact_sfa_sf_warp is the MXFP8 kernel's alone: off, it is not passed.
+    # compact_sfa_sf_warp is the SM100 MXFP8 kernel's alone: off, it is not passed (the Rubin kernel has no such argument).
     compact = bool(options.get("compact_sfa_sf_warp"))
     if not compact:
         options.pop("compact_sfa_sf_warp", None)
-    options.setdefault("deterministic", True)
+    if not rubin:
+        options.setdefault("deterministic", True)
     if recipe == "bf16":
         from cudnn.gemm.cutedsl.grouped.dglu.moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel
 
         kernel = MoEGroupedGemmDgluDbiasBf16Kernel(**common, **options)
         kernel.test_kind = "bf16"
+    elif rubin:
+        from cudnn.gemm.cutedsl.grouped.dglu.moe_blockscaled_grouped_gemm_dglu_rubin import BlockScaledMoEGroupedGemmDgluKernel
+
+        kernel = BlockScaledMoEGroupedGemmDgluKernel(sf_vec_size=bs.SF_VEC_SIZE, discrete_col_sfd=False, **common, **options)
+        kernel.test_kind = "rubin"
     else:
         from cudnn.gemm.cutedsl.grouped.dglu.moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel
 
@@ -62,15 +71,28 @@ def make_dglu_kernel(recipe, experts, **options):
     return kernel
 
 
+def dprob_is_bitwise(kernel):
+    """False for the Rubin kernel: its dprob is an fp32 atomic sum in tile arrival order."""
+    return kernel.test_kind != "rubin"
+
+
 def exact_outputs(kernel, out):
-    """The outputs the kernel promises bit for bit: D and dprob."""
-    return out
+    """The outputs the kernel promises bit for bit: D, and dprob unless its dprob is an atomic sum."""
+    return out if dprob_is_bitwise(kernel) else {name: value for name, value in out.items() if name != "dprob"}
 
 
 def assert_outputs_match(kernel, got, want, label=""):
-    """Raw-byte equal on ``exact_outputs``."""
+    """Raw-byte equal on ``exact_outputs``; an atomic dprob within fp32 reassociation of ``want``."""
     for name in exact_outputs(kernel, want):
         assert torch.equal(got[name].view(torch.int16), want[name].view(torch.int16)), f"{label}: {name} differs from the stock scheduler"
+    if not dprob_is_bitwise(kernel):
+        # Atomic dprob differs from want only by fp32 reassociation of its partials.  The rounding is relative to the
+        # partials, not to the sum: a token whose large partials cancel can differ by a few ulp of the largest
+        # partial (Rubin: 0.016-0.047 at |dprob| up to 2.7e5, relative 2.7e-3 on such small sums).  So the absolute
+        # tolerance scales with the output (8 fp32 eps of max |want|), plus a small relative one.  The existing
+        # dprob comparisons use fixed rtol / atol 1e-4 at unit-scale data, which this reduces to there.
+        atol = 8 * torch.finfo(torch.float32).eps * max(want["dprob"].abs().max().item(), 1.0)
+        torch.testing.assert_close(got["dprob"], want["dprob"], rtol=1e-5, atol=atol, msg=lambda m: f"{label}: dprob: {m}")
 
 
 def make_problem(recipe, tokens_per_expert, seed=0, rows=None):
@@ -117,8 +139,9 @@ def kernel_args(kernel, problem, d, dprob, workspace):
         # (c, d, padded_offsets, alpha, beta, prob, dprob, linear_offset, dbias)
         return [a, b, *sizes, c, d_cute, offsets, alpha, beta, prob, dprob_cute, cutlass.Float32(0.0), None]
     sfa = e8m0(problem["a_exp"] if kernel.test_compact else problem["sfa"])
-    # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, padded_offsets, alpha, beta, prob, dprob, dbias)
-    tail = [c, d_cute, d_cute, sfa, None, None, None, None, offsets, alpha, beta, prob, dprob_cute, None]
+    # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, padded_offsets, alpha, beta, prob, dprob, [linear_offset,] dbias)
+    tail = [c, d_cute, d_cute, sfa, None, None, None, None, offsets, alpha, beta, prob, dprob_cute]
+    tail += [cutlass.Float32(0.0), None] if kernel.test_kind == "rubin" else [None]
     return [a, b, e8m0(problem["sfb"]), *sizes, *tail]
 
 

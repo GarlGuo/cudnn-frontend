@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bitwise determinism of the streaming input signal on the MXFP8 block-scaled SwiGLU (FC1) forward kernel (SM100), with
-stock SFA atoms and with `compact_sfa_sf_warp`.
+"""Bitwise determinism of the streaming input signal on the MXFP8 block-scaled SwiGLU (FC1) forward kernel, with stock
+SFA atoms and with `compact_sfa_sf_warp` (SM100; the Rubin twin on SM107, stock SFA only).
 
 ``streaming_signal_capacity`` (with or without ``device_layout``) changes which cluster runs a tile and when, never the
 tile math, so the BF16 C and D must be raw-byte equal across replays, producer release orders, neighboring experts and
@@ -57,12 +57,16 @@ def require_sm10x_cutedsl():
     reason = cutedsl_arch_requirement_error((major, minor))
     if reason:
         pytest.skip(reason)
-    if is_rubin():
-        pytest.skip("the SM100 GLU kernel (the Rubin twin does not take a streaming input producer)")
+
+
+def skip_compact_on_rubin(compact):
+    if compact and is_rubin():
+        pytest.skip("compact_sfa_sf_warp: the SM100 kernel only (the Rubin GLU kernel takes SF atoms)")
 
 
 def signal_options(capacity, variant):
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity)
+    skip_compact_on_rubin(variant.startswith("compact"))
     if variant.startswith("compact"):
         options["compact_sfa_sf_warp"] = True
     if variant.endswith("signal_layout_trigger"):
@@ -94,6 +98,7 @@ def test_mxfp8_glu_producer_release_order_invariance(late, compact):
     in order, in reverse and in a seeded random order.  Every order gives the stock scheduler's bytes."""
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
 
+    skip_compact_on_rubin(compact)
     tokens = MANY_EXPERTS_64
     problem = make_problem(tokens, N, HIDDEN, seed=7)
     capacity = problem["rows"] // ROWS_ALIGNMENT
@@ -150,6 +155,7 @@ def test_mxfp8_glu_signal_slot_release_warm_stress(compact):
     per cluster, every byte against stock."""
     from warm_stress import StressCase, assert_warm_stress
 
+    skip_compact_on_rubin(compact)
     clusters = 4
     problem = make_problem(BIG_EXPERT, N, HIDDEN, seed=13)
     assert problem["rows"] == sum(padded(t) for t in BIG_EXPERT), "every C and D row is written, so the sentinel fill is overwritten"
