@@ -1475,6 +1475,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                 tma_atom_c,
                 bSG_sC[(None, c_buffer)],
                 bSG_gC[(None, real_subtile_idx)],
+                cache_policy=_sigdiag.l2_policy("CD"),
             )
             # Fence and barrier to make sure shared memory store is visible to TMA store
             c_pipeline.producer_commit()
@@ -2341,6 +2342,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                         tAsA_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=_sigdiag.l2_policy("A"),
                     )
                     # TMA load B (discrete, per-expert desc from workspace)
                     cute.copy(
@@ -2350,6 +2352,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_b,
+                        cache_policy=_sigdiag.l2_policy("B"),
                     )
                     # TMA load SFA (contiguous, global desc via domain_offset); the SF warp's when compact
                     if cutlass.const_expr(not self.compact_sfa_sf_warp):
@@ -2359,6 +2362,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                             tAsSFA_pipe,
                             tma_bar_ptr=tma_bar,
                             mcast_mask=sfa_full_mcast_mask,
+                            cache_policy=_sigdiag.l2_policy("A"),
                         )
                     # Each CTA receives two distinct half-tile multicasts. Their
                     # combined bytes fill one local SFB stage; cta_group::1 gives
@@ -2376,6 +2380,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                         tma_bar_ptr=sfb_bar,
                         mcast_mask=sfb_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_sfb,
+                        cache_policy=_sigdiag.l2_policy("B"),
                     )
 
                     # Peek (try_wait) AB buffer empty for next k_tile
@@ -3266,12 +3271,14 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                             tma_atom_d,
                             bSG_sD[(None, d_buffer)],
                             bSG_gD[(None, real_subtile_idx)],
+                            cache_policy=_sigdiag.l2_policy("CD"),
                         )
                         if cutlass.const_expr(self.generate_sfd_col):
                             cute.copy(
                                 tma_atom_d_col,
                                 bSG_sD_col[(None, d_buffer)],
                                 bSG_gD_col[(None, real_subtile_idx)],
+                                cache_policy=_sigdiag.l2_policy("CD"),
                             )
                         # Fence and barrier to make sure shared memory store is visible to TMA store
                         d_pipeline.producer_commit()

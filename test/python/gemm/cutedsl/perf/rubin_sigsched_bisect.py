@@ -7,6 +7,8 @@ atoms), every M tile ready, dsv3 and qwen35 EP4 per-rank shapes.  From test/pyth
     ncu --metrics gpu__time_duration.sum -k regex:kernel_kernel --csv python -m gemm.cutedsl.perf.rubin_sigsched_bisect ncu
     # (1) + (2) per-tile log, stock vs signal (no ncu)
     python -m gemm.cutedsl.perf.rubin_sigsched_bisect tilelog
+    # L2 eviction-policy x epilogue-phase sweep (L2CFGS / SLEEPS env lists)
+    ncu --metrics gpu__time_duration.sum,dram__bytes_op_read.sum,lts__t_sector_hit_rate.pct -k regex:kernel_kernel --csv python -m gemm.cutedsl.perf.rubin_sigsched_bisect ncu sweep
     # TMA coordinates per tile, stock vs signal / signal_stock_sched / signal_hyb_both (no ncu)
     python -m gemm.cutedsl.perf.rubin_sigsched_bisect coords
 
@@ -67,7 +69,40 @@ KNOBS = (
     "SIGDIAG_EPI_ATOMIC",
     "SIGDIAG_EPI_STORE",
     "SIGDIAG_EPI_WAITALL",
+    "SIGDIAG_L2_A",
+    "SIGDIAG_L2_B",
+    "SIGDIAG_L2_CD",
 )
+L2_CONFIGS = {
+    "none": {},
+    "b_last": {"SIGDIAG_L2_B": "last"},
+    "b_last_a_first": {"SIGDIAG_L2_B": "last", "SIGDIAG_L2_A": "first"},
+    "b_last_a_first_cd_first": {"SIGDIAG_L2_B": "last", "SIGDIAG_L2_A": "first", "SIGDIAG_L2_CD": "first"},
+    "cd_first": {"SIGDIAG_L2_CD": "first"},
+    "b_last_cd_first": {"SIGDIAG_L2_B": "last", "SIGDIAG_L2_CD": "first"},
+    "a_last": {"SIGDIAG_L2_A": "last"},
+    "a_last_cd_first": {"SIGDIAG_L2_A": "last", "SIGDIAG_L2_CD": "first"},
+}
+
+
+def sweep_variants():
+    """``sweep``: {stock, signal} x L2 policy (L2CFGS, default none,cd_first,a_last,a_last_cd_first,b_last_cd_first) x
+    epilogue tile-end sleep in ns (SLEEPS, default 0,1000,3000).  A phase-robust configuration is flat across the sleeps.
+    (M-fastest tile order: an A tile is reused by every N tile of its expert, far apart; a B tile by the expert's few M
+    tiles, back to back.  A evict_first doubles DRAM traffic on GB200: not in the default list.)"""
+    configs = os.environ.get("L2CFGS", "none,cd_first,a_last,a_last_cd_first,b_last_cd_first").split(",")
+    sleeps = os.environ.get("SLEEPS", "0,1000,3000").split(",")
+    variants = {}
+    for cfg in configs:
+        for ns in sleeps:
+            for build_name, signal in (("stock", False), ("signal", True)):
+                env = dict(L2_CONFIGS[cfg])
+                if int(ns) > 0:
+                    env["SIGDIAG_EPI_SLEEP"] = ns
+                variants[f"{build_name}_{cfg}_s{ns}"] = (signal, env)
+    return variants
+
+
 LOG = None  # the device log every logging variant writes (its address is baked into the kernel)
 
 
@@ -217,7 +252,10 @@ def coords(shapes):
 
 if __name__ == "__main__":
     shapes = os.environ.get("DIAG_SHAPES", ",".join(SHAPES)).split(",")
-    if "tilelog" in sys.argv[1:]:
+    if "sweep" in sys.argv[1:]:
+        VARIANTS = sweep_variants()
+        bisect(shapes)
+    elif "tilelog" in sys.argv[1:]:
         tilelog(shapes)
     elif "coords" in sys.argv[1:]:
         coords(shapes)

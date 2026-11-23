@@ -17,6 +17,8 @@ signal scheduler's Rubin overhead.  Every knob is read at trace time; unset, not
       TILELOG role-3 point), epilogue warp 0: a nanosleep / a returning gmem atomic whose result is used (address:
       TILELOG_SCRATCH) / a plain gmem store (TILELOG_SCRATCH) / cp.async.bulk.wait_group 0 (every D/C store complete,
       not only read).  Which part of the role-3 log removes the Rubin gap.
+  SIGDIAG_L2_A / SIGDIAG_L2_B / SIGDIAG_L2_CD = first | last | normal: an L2 eviction-priority cache policy on the
+      A + SFA loads / B + SFB loads / C + D + D_col stores (CUTLASS's CacheHintSm90 constants).  Unset: no policy.
   SIGDIAG_NO_FINALIZE=1   a signal-scheduler build without the final cluster barrier (internal_finalize)
   SIGDIAG_STOCK_FINALIZE=1  with SIGDIAG_STOCK_SCHED: add that cluster barrier to the stock scheduler
 """
@@ -104,3 +106,15 @@ def epi_tile_end():
         log[0] = cute.arch.globaltimer_lo()
     if knob("SIGDIAG_EPI_WAITALL"):
         cute.arch.cp_async_bulk_wait_group(0, read=False)
+
+
+# CUTLASS cute/arch/copy_sm90_tma.hpp CacheHintSm90 (createpolicy encodings, fraction 1.0).
+_L2_POLICY = {"normal": 0x1000000000000000, "first": 0x12F0000000000000, "last": 0x14F0000000000000}
+
+
+def l2_policy(operand: str):
+    """The cache_policy for ``operand`` ("A", "B" or "CD") from SIGDIAG_L2_<operand>, or None (no hint argument)."""
+    name = os.environ.get(f"SIGDIAG_L2_{operand}", "")
+    if not name:
+        return None
+    return cutlass.Int64(_L2_POLICY[name])

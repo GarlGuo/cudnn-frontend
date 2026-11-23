@@ -1360,6 +1360,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 tma_atom_c,
                 bSG_sC[(None, c_buffer)],
                 bSG_gC[(None, real_subtile_idx)],
+                cache_policy=_sigdiag.l2_policy("CD"),
             )
             # Fence and barrier to make sure shared memory store is visible to TMA store
             c_pipeline.producer_commit()
@@ -2203,6 +2204,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         tAsA_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=a_full_mcast_mask,
+                        cache_policy=_sigdiag.l2_policy("A"),
                     )
                     # TMA load B (discrete, per-expert desc from workspace)
                     cute.copy(
@@ -2212,6 +2214,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         tma_bar_ptr=tma_bar,
                         mcast_mask=b_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_b,
+                        cache_policy=_sigdiag.l2_policy("B"),
                     )
                     # TMA load SFA (contiguous, global desc via domain_offset)
                     cute.copy(
@@ -2220,6 +2223,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         tAsSFA_pipe,
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfa_full_mcast_mask,
+                        cache_policy=_sigdiag.l2_policy("A"),
                     )
                     # TMA load SFB (discrete, per-expert desc from workspace)
                     cute.copy(
@@ -2229,6 +2233,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
                         tma_bar_ptr=tma_bar,
                         mcast_mask=sfb_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_sfb,
+                        cache_policy=_sigdiag.l2_policy("B"),
                     )
                     # Peek (try_wait) AB buffer empty for next k_tile
                     ab_producer_state.advance()
@@ -3125,12 +3130,14 @@ class BlockScaledMoEGroupedGemmGluKernel:
                                 tma_atom_d,
                                 bSG_sD[(None, d_buffer)],
                                 _bSG_gD_h[(None, real_subtile_idx)],
+                                cache_policy=_sigdiag.l2_policy("CD"),
                             )
                             if cutlass.const_expr(self.generate_sfd):
                                 cute.copy(
                                     tma_atom_d_col,
                                     bSG_sD_col[(None, d_buffer)],
                                     _bSG_gD_col_h[(None, real_subtile_idx)],
+                                    cache_policy=_sigdiag.l2_policy("CD"),
                                 )
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             d_pipeline.producer_commit()
