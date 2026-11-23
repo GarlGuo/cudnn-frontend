@@ -58,7 +58,11 @@ class GroupedGemmSm100(APIBase):
         generate_c: bool = False,
         b_major: str = "k",
         use_dynamic_sched: bool = False,
+        kernel_schedule: Optional[str] = None,
     ) -> None:
+        """``kernel_schedule`` picks the SM90 kernel's warp-group schedule: None (the default, today cooperative),
+        "cooperative" or "pingpong"; with mma_tiler_mn=None, pingpong takes a (128, 192) tile. Other GPUs need None.
+        """
         super().__init__()
         self._pending_init_kwargs = dict(locals())
         self._pending_init_kwargs.pop("self")
@@ -315,6 +319,7 @@ def grouped_gemm_wrapper_sm100(
     generate_c: bool = False,
     use_dynamic_sched: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
+    kernel_schedule: Optional[str] = None,
 ) -> TupleDict:
     # Hot-loop memo. Everything between here and op.execute() is derivation -- resolving
     # dtypes, deriving (m, n, experts), and rebuilding the op cache key -- and it is a
@@ -347,6 +352,7 @@ def grouped_gemm_wrapper_sm100(
         m_aligned,
         generate_c,
         use_dynamic_sched,
+        kernel_schedule,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
     )
     memo = _wrapper_memo.get(_memo_key)
@@ -456,6 +462,7 @@ def grouped_gemm_wrapper_sm100(
         m_aligned,
         generate_c,
         use_dynamic_sched,
+        kernel_schedule,
         overlap_margin,
         workspace_signature,
     )
@@ -482,6 +489,7 @@ def grouped_gemm_wrapper_sm100(
             generate_c=generate_c,
             b_major=b_major,
             use_dynamic_sched=use_dynamic_sched,
+            kernel_schedule=kernel_schedule,
         )
         assert op.check_support(), "Unsupported configuration"
         op.compile()

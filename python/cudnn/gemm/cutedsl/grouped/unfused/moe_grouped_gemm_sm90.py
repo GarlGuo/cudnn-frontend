@@ -10,6 +10,7 @@ A (tokens_sum, K) x B (N, K, experts) -> C/D (tokens_sum, N).
 
 Supports:
     - Dynamic persistent tile scheduling (MoEPersistentTileScheduler, gmem atomic counter)
+    - Cooperative (both MMA warp groups on one tile) or pingpong (each warp group owns alternate tiles) schedules
     - Dense (contiguous 3-D B) weights, K-major (forward) or N-major (dgrad)
     - Routing-probability (prob) fusion and optional C output (generate_c)
 
@@ -52,6 +53,29 @@ def _widen_for_cluster(tma_tensor, mode, tile, cluster_count):
     return rewrite_tensor_shape(tma_tensor, tuple(shape))
 
 
+KERNEL_SCHEDULES = ("cooperative", "pingpong")
+
+
+def sm90_default_mma_tiler(pingpong: bool, glu_generate_c: bool = False) -> Tuple[int, int]:
+    """The SM90 CTA tile when the caller gives none: (128, 256) cooperative; pingpong (128, 192), (128, 128) for a GLU with C."""
+    if not pingpong:
+        return (128, 256)
+    return (128, 128) if glu_generate_c else (128, 192)
+
+
+def check_kernel_schedule(kernel_schedule: Optional[str], is_sm90: bool, mma_tiler_mn: Tuple[int, int], glu_generate_c: bool = False) -> None:
+    """Validate an API's ``kernel_schedule``: None (the default), or an SM90 schedule on an SM90 device."""
+    if kernel_schedule is None:
+        return
+    if kernel_schedule not in KERNEL_SCHEDULES:
+        raise ValueError(f"kernel_schedule must be None, 'cooperative' or 'pingpong', got {kernel_schedule!r}")
+    if not is_sm90:
+        raise ValueError(f"kernel_schedule={kernel_schedule!r} selects an SM90 (Hopper) schedule; leave it None on other GPUs")
+    error = MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(mma_tiler_mn, glu_generate_c) if kernel_schedule == "pingpong" else None
+    if error is not None:
+        raise ValueError(f"SM90 pingpong: {error}, got mma_tiler_mn={tuple(mma_tiler_mn)}")
+
+
 class MoEGroupedGemmBf16KernelSm90:
     """Plain BF16 grouped GEMM kernel with MoE tile scheduling for Hopper.
 
@@ -68,9 +92,26 @@ class MoEGroupedGemmBf16KernelSm90:
     :param expert_cnt: Number of experts.
     :param weight_mode: Must be ``MoEWeightMode.DENSE``.
     :param use_dynamic_sched: Must be True.
+    :param pingpong: Each MMA warp group owns whole tiles (alternate tiles of the scheduler's sequence) and
+        the two overlap one's epilogue with the other's mainloop; tile M * N <= 128 * 192 (128 * 128 for a GLU with C).
     """
 
     FIX_PAD_SIZE = 256
+    # A pingpong warp group holds the whole tile's accumulator: M * N / 128 fp32 registers per thread.
+    # A GLU that also stores C keeps gate and up C subtiles live too: 128x192 spills (ptxas -v), 128x128 does not.
+    PINGPONG_MAX_TILE_ELEMS = 128 * 192
+    PINGPONG_GLU_C_MAX_TILE_ELEMS = 128 * 128
+
+    @staticmethod
+    def _pingpong_tile_error(mma_tiler_mn: Tuple[int, int], glu_generate_c: bool = False) -> Optional[str]:
+        """Why a pingpong CTA tile is unsupported, or None."""
+        cls = MoEGroupedGemmBf16KernelSm90
+        tile = f"{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
+        if mma_tiler_mn[0] * mma_tiler_mn[1] > cls.PINGPONG_MAX_TILE_ELEMS:
+            return f"a pingpong warp group holds the whole {tile} accumulator: tile M * N must be <= 128 * 192"
+        if glu_generate_c and mma_tiler_mn[0] * mma_tiler_mn[1] > cls.PINGPONG_GLU_C_MAX_TILE_ELEMS:
+            return f"a GLU with generate_c holds the {tile} accumulator plus C: tile M * N must be <= 128 * 128"
+        return None
 
     @staticmethod
     def can_implement(
@@ -89,7 +130,10 @@ class MoEGroupedGemmBf16KernelSm90:
         b_major: str,
         cd_major: str,
         m_aligned: int,
+        pingpong: bool = False,
     ) -> bool:
+        if pingpong and MoEGroupedGemmBf16KernelSm90._pingpong_tile_error(mma_tiler_mn) is not None:
+            return False
         fix_pad_size = MoEGroupedGemmBf16KernelSm90.FIX_PAD_SIZE
         is_power_of_2 = lambda x: x > 0 and (x & (x - 1)) == 0
         return (
@@ -126,6 +170,7 @@ class MoEGroupedGemmBf16KernelSm90:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         use_dynamic_sched: bool = True,
         act_func: Optional[str] = None,
+        pingpong: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if act_func not in (None, "swiglu", "geglu"):
@@ -149,6 +194,9 @@ class MoEGroupedGemmBf16KernelSm90:
             raise ValueError(f"SM90 CTA tile M must be 64 or 128, got {mma_tile_m}.")
         if mma_tiler_mn[1] not in range(32, 257, 32):
             raise ValueError(f"SM90 CTA tile N must be a multiple of 32 in [32, 256], got {mma_tiler_mn[1]}.")
+        pingpong_error = self._pingpong_tile_error(mma_tiler_mn, act_func is not None and generate_c) if pingpong else None
+        if pingpong_error is not None:
+            raise ValueError(f"SM90 pingpong: {pingpong_error}.")
 
         self.expert_cnt = expert_cnt
         self.acc_dtype = acc_dtype
@@ -158,8 +206,12 @@ class MoEGroupedGemmBf16KernelSm90:
         self.occupancy = 1
 
         # WGMMA's M is 64: a CTA tile M of 128 with N > 128 takes a second MMA warp group (no acc spill).
-        self.atom_layout_mnk = (2, 1, 1) if (mma_tiler_mn[0] > 64 and mma_tiler_mn[1] > 128) else (1, 1, 1)
-        self.num_mma_warp_groups = self.atom_layout_mnk[0] * self.atom_layout_mnk[1] * self.atom_layout_mnk[2]
+        # Pingpong: one warp group per tile, two warp groups on alternate tiles.
+        self.pingpong = pingpong
+        self.atom_layout_mnk = (2, 1, 1) if (not pingpong and mma_tiler_mn[0] > 64 and mma_tiler_mn[1] > 128) else (1, 1, 1)
+        self.num_mma_warp_groups = 2 if pingpong else self.atom_layout_mnk[0] * self.atom_layout_mnk[1] * self.atom_layout_mnk[2]
+        # Warp groups with their own tile, epilogue barrier, TMA-store warp and C/D SMEM buffers.
+        self.num_epi_groups = 2 if pingpong else 1
         self.num_warps_per_warp_group = 4
         self.threads_per_warp = 32
         self.num_threads_per_warp_group = self.num_warps_per_warp_group * self.threads_per_warp
@@ -170,6 +222,7 @@ class MoEGroupedGemmBf16KernelSm90:
         self.tma_warp_id = self.num_mma_warp_groups * self.num_warps_per_warp_group
         self.sched_warp_id = self.tma_warp_id + 1
         self.num_mma_threads = self.num_mma_warp_groups * self.num_threads_per_warp_group
+        self.num_epi_threads = self.num_mma_threads // self.num_epi_groups
         self.threads_per_cta = (self.num_mma_warp_groups + 1) * self.num_threads_per_warp_group
         self.threads_wo_sched = self.num_mma_threads + self.threads_per_warp
         self.load_register_requirement = 40
@@ -187,6 +240,10 @@ class MoEGroupedGemmBf16KernelSm90:
             barrier_id=4,
             num_threads=self.threads_per_warp,
         )
+        # Pingpong: warp group w's epilogue barrier is 2 + w; its mainloop / epilogue turns are 5 + w / 7 + w.
+        self.epilog_barrier_id_base = 2
+        self.mma_order_barrier_id_base = 5
+        self.epi_order_barrier_id_base = 7
 
         self.num_smem_capacity = get_smem_capacity_in_bytes("sm_90")
         self.vectorized_f32 = vectorized_f32
@@ -263,6 +320,7 @@ class MoEGroupedGemmBf16KernelSm90:
             self.num_smem_capacity,
             self.occupancy,
             self.generate_c,
+            self.num_epi_groups,
         )
 
         self.a_smem_layout_staged = sm90_utils.make_smem_layout_a(
@@ -281,13 +339,13 @@ class MoEGroupedGemmBf16KernelSm90:
             self.c_dtype,
             self.c_layout,
             self.epi_tile,
-            self.num_c_stage,
+            self.num_c_stage * self.num_epi_groups,
         )
         self.d_smem_layout_staged = sm90_utils.make_smem_layout_epi(
             self.d_dtype,
             self.d_layout,
             self.epi_tile,
-            self.num_d_stage,
+            self.num_d_stage * self.num_epi_groups,
         )
 
     # ------------------------------------------------------------------
@@ -309,7 +367,9 @@ class MoEGroupedGemmBf16KernelSm90:
         num_smem_capacity,
         occupancy,
         generate_c,
+        num_epi_groups=1,
     ):
+        """A/B, C, D and tile-info stage counts; C/D stages are per epilogue group (each has its own buffers)."""
         num_tile_stage = 2
 
         a_smem_layout_stage_one = sm90_utils.make_smem_layout_a(a_layout, mma_tiler_mnk, a_dtype, 1)
@@ -320,8 +380,8 @@ class MoEGroupedGemmBf16KernelSm90:
         ab_bytes_per_stage = cute.size_in_bytes(a_dtype, a_smem_layout_stage_one) + cute.size_in_bytes(b_dtype, b_smem_layout_stage_one)
         mbar_helpers_bytes = 1024
         sinfo_bytes = 4 * 4 * num_tile_stage
-        c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one)
-        d_bytes = cute.size_in_bytes(d_dtype, d_smem_layout_stage_one)
+        c_bytes = cute.size_in_bytes(c_dtype, c_smem_layout_stage_one) * num_epi_groups
+        d_bytes = cute.size_in_bytes(d_dtype, d_smem_layout_stage_one) * num_epi_groups
 
         free_bytes = num_smem_capacity // occupancy - (mbar_helpers_bytes + c_bytes + d_bytes + sinfo_bytes)
         num_ab_stage = free_bytes // ab_bytes_per_stage
@@ -564,16 +624,24 @@ class MoEGroupedGemmBf16KernelSm90:
         c_pipeline,
         c_buffer,
         gmem_coord,
+        epilog_barrier,
+        epi_store_warp,
     ):
         tRS_rC_out.store(tRS_rC.load().to(self.c_dtype))
         cute.copy(tiled_copy_r2s_c, tRS_rC_out, tRS_sC[(None, None, None, c_buffer)])
         cute.arch.fence_proxy("async.shared", space="cta")
-        self.epilog_sync_barrier.arrive_and_wait()
-        if warp_idx == self.epi_store_warp_id:
+        epilog_barrier.arrive_and_wait()
+        if warp_idx == epi_store_warp:
             cute.copy(tma_atom_c, bSG_sC[(None, c_buffer)], bSG_gC[(None, gmem_coord)])
             c_pipeline.producer_commit()
             c_pipeline.producer_acquire()
-        self.epilog_sync_barrier.arrive_and_wait()
+        epilog_barrier.arrive_and_wait()
+
+    def _epi_buffer(self, subtile, num_stage, buffer_base):
+        """SMEM buffer of an epilogue subtile; pingpong warp groups own disjoint buffer ranges."""
+        if cutlass.const_expr(self.pingpong):
+            return subtile % num_stage + buffer_base
+        return subtile % num_stage
 
     # ------------------------------------------------------------------
     # GPU device kernel
@@ -627,7 +695,8 @@ class MoEGroupedGemmBf16KernelSm90:
         # Hopper consumers are whole warp groups: one lane per warp per multicast partner arrives on the empty barrier.
         ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        ab_consumer_arrive_cnt = mcast_size * self.num_mma_warp_groups * self.num_warps_per_warp_group
+        # Pingpong: each A/B stage belongs to one warp group's tile, so one warp group releases it.
+        ab_consumer_arrive_cnt = mcast_size * (self.num_mma_warp_groups // self.num_epi_groups) * self.num_warps_per_warp_group
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, ab_consumer_arrive_cnt)
         ab_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.ab_mbar_ptr.data_ptr(),
@@ -677,8 +746,12 @@ class MoEGroupedGemmBf16KernelSm90:
 
         # SMEM fragments for WGMMA plus the register accumulator shared by MMA and epilogue.
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
-        mma_warp_group_thread_layout = cute.make_layout(self.num_mma_warp_groups, stride=self.num_threads_per_warp_group)
-        thr_mma = tiled_mma.get_slice(mma_warp_group_thread_layout(warp_group_idx))
+        if cutlass.const_expr(self.pingpong):
+            # The tiled MMA spans one warp group: each pingpong warp group takes the whole tile.
+            thr_mma = tiled_mma.get_slice(0)
+        else:
+            mma_warp_group_thread_layout = cute.make_layout(self.num_mma_warp_groups, stride=self.num_threads_per_warp_group)
+            thr_mma = tiled_mma.get_slice(mma_warp_group_thread_layout(warp_group_idx))
         tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sA))
         tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sB))
         # Shape the accumulator from the CTA tile, not D: a fused GLU's D has half the N columns.
@@ -693,10 +766,15 @@ class MoEGroupedGemmBf16KernelSm90:
         if total_token <= 0:
             cute.arch.nvvm.exit()
 
-        if warp_idx >= self.tma_warp_id:
-            cute.arch.setmaxregister_decrease(self.load_register_requirement)
+        if cutlass.const_expr(self.pingpong):
+            # The increase sits in the MMA branch: ptxas keeps setmaxnreg only if no MMA code is reachable after the decrease.
+            if warp_idx >= self.tma_warp_id:
+                cute.arch.setmaxregister_decrease(self.load_register_requirement)
         else:
-            cute.arch.setmaxregister_increase(self.mma_register_requirement)
+            if warp_idx >= self.tma_warp_id:
+                cute.arch.setmaxregister_decrease(self.load_register_requirement)
+            else:
+                cute.arch.setmaxregister_increase(self.mma_register_requirement)
 
         # ==== Scheduler warp (MoE Persistent Tile Scheduler) ====
         if warp_idx == self.sched_warp_id:
@@ -808,7 +886,27 @@ class MoEGroupedGemmBf16KernelSm90:
         # ==== MMA + epilogue warp group(s) ====
         # WGMMA accumulates in these threads' registers, so the mainloop and the epilogue live in the same warps.
         if warp_idx < self.tma_warp_id and total_token > 0:
+            if cutlass.const_expr(self.pingpong):
+                cute.arch.setmaxregister_increase(self.mma_register_requirement)
             epi_tidx = tidx
+            epilog_barrier = self.epilog_sync_barrier
+            epi_store_warp = self.epi_store_warp_id
+            c_buffer_base = 0
+            d_buffer_base = 0
+            if cutlass.const_expr(self.pingpong):
+                epi_tidx = tidx % self.num_threads_per_warp_group
+                epilog_barrier = pipeline.NamedBarrier(
+                    barrier_id=self.epilog_barrier_id_base + warp_group_idx,
+                    num_threads=self.num_epi_threads,
+                )
+                epi_store_warp = warp_group_idx * self.num_warps_per_warp_group
+                c_buffer_base = warp_group_idx * self.num_c_stage
+                d_buffer_base = warp_group_idx * self.num_d_stage
+                # A warp group waits on its own turn barriers and arrives on the other's.
+                mma_turn = pipeline.NamedBarrier(barrier_id=self.mma_order_barrier_id_base + warp_group_idx, num_threads=self.num_mma_threads)
+                mma_turn_next = pipeline.NamedBarrier(barrier_id=self.mma_order_barrier_id_base + 1 - warp_group_idx, num_threads=self.num_mma_threads)
+                epi_turn = pipeline.NamedBarrier(barrier_id=self.epi_order_barrier_id_base + warp_group_idx, num_threads=self.num_mma_threads)
+                epi_turn_next = pipeline.NamedBarrier(barrier_id=self.epi_order_barrier_id_base + 1 - warp_group_idx, num_threads=self.num_mma_threads)
             num_k_blocks = cute.size(tCrA, mode=[2])
             k_pipe_mmas = 1
 
@@ -839,9 +937,9 @@ class MoEGroupedGemmBf16KernelSm90:
             epi_ext = ContiguousGroupedGemmSchedExtension()
             ab_consumer_read_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
             ab_consumer_release_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_ab_stage)
-            c_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_threads)
+            c_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_epi_threads)
             c_pipeline = pipeline.PipelineTmaStore.create(num_stages=self.num_c_stage, producer_group=c_producer_group)
-            d_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_threads)
+            d_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_epi_threads)
             d_pipeline = pipeline.PipelineTmaStore.create(num_stages=self.num_d_stage, producer_group=d_producer_group)
 
             tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
@@ -853,6 +951,24 @@ class MoEGroupedGemmBf16KernelSm90:
             cute.arch.fence_proxy("async.shared", space="cta")
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
+
+            if cutlass.const_expr(self.pingpong):
+                if warp_group_idx == 0:
+                    # Warp group 0 takes the first turns.
+                    mma_turn.arrive()
+                    epi_turn.arrive()
+                else:
+                    # Warp group 1 starts at the second tile; skipping a tile skips its A/B stages.
+                    if is_valid_tile:
+                        ab_consumer_read_state.advance(cutlass.Int32(tile_info[3]))
+                        ab_consumer_release_state.advance(cutlass.Int32(tile_info[3]))
+                        tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                        for idx in cutlass.range(4, unroll_full=True):
+                            tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                        is_valid_tile = tile_info[0] >= cutlass.Int32(0)
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                        tile_info_consumer_state.advance()
 
             num_prev_subtiles = cutlass.Int32(0)
             while is_valid_tile:
@@ -870,8 +986,13 @@ class MoEGroupedGemmBf16KernelSm90:
                 # ---- mainloop: one accumulator init and one wgmma fence per output tile ----
                 ab_consumer_read_state.reset_count()
                 ab_consumer_release_state.reset_count()
-                accumulators.fill(0.0)
-                tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
+                if cutlass.const_expr(self.pingpong):
+                    # The first k-block zero-inits: a register fill of the second m64 atom can sink past the first WGMMA.
+                    tiled_mma.set(warpgroup.Field.ACCUMULATE, False)
+                    mma_turn.arrive_and_wait()
+                else:
+                    accumulators.fill(0.0)
+                    tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                 warpgroup.fence()
 
                 prologue_mma_cnt = cutlass.min(k_pipe_mmas, k_tile_cnt)
@@ -880,6 +1001,8 @@ class MoEGroupedGemmBf16KernelSm90:
                     for kblock_idx in cutlass.range_constexpr(num_k_blocks):
                         kblock_coord = (None, None, kblock_idx, ab_consumer_read_state.index)
                         cute.gemm(tiled_mma, accumulators, tCrA[kblock_coord], tCrB[kblock_coord], accumulators)
+                        if cutlass.const_expr(self.pingpong):
+                            tiled_mma.set(warpgroup.Field.ACCUMULATE, True)
                     warpgroup.commit_group()
                     ab_consumer_read_state.advance()
 
@@ -894,10 +1017,16 @@ class MoEGroupedGemmBf16KernelSm90:
                     ab_consumer_release_state.advance()
                     ab_consumer_read_state.advance()
 
+                if cutlass.const_expr(self.pingpong):
+                    # All of this tile's WGMMAs are issued: the other warp group's mainloop may start.
+                    mma_turn_next.arrive()
                 warpgroup.wait_group(0)
                 for k_tile in cutlass.range(0, prologue_mma_cnt, 1, unroll=1):
                     ab_pipeline.consumer_release(ab_consumer_release_state)
                     ab_consumer_release_state.advance()
+                if cutlass.const_expr(self.pingpong):
+                    if k_tile_cnt == 0:
+                        accumulators.fill(0.0)
 
                 # ---- epilogue ----
                 real_d, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
@@ -933,6 +1062,8 @@ class MoEGroupedGemmBf16KernelSm90:
                 subtile_shape = gD_epi.shape[1]
                 subtile_layout = cute.make_layout(subtile_shape, stride=(subtile_shape[1], 1))
 
+                if cutlass.const_expr(self.pingpong):
+                    epi_turn.arrive_and_wait()
                 for subtile_idx in cutlass.range_constexpr(subtile_cnt):
                     gmem_coord = subtile_layout.get_hier_coord(subtile_idx)
                     if cutlass.const_expr(self.fused_glu):
@@ -982,8 +1113,10 @@ class MoEGroupedGemmBf16KernelSm90:
                             bSG_gC,
                             bSG_sC,
                             c_pipeline,
-                            (2 * num_prev_subtiles) % self.num_c_stage,
+                            self._epi_buffer(2 * num_prev_subtiles, self.num_c_stage, c_buffer_base),
                             c_subtile_layout.get_hier_coord(2 * subtile_idx),
+                            epilog_barrier,
+                            epi_store_warp,
                         )
                         self.store_c(
                             tiled_copy_r2s_c,
@@ -995,8 +1128,10 @@ class MoEGroupedGemmBf16KernelSm90:
                             bSG_gC,
                             bSG_sC,
                             c_pipeline,
-                            (2 * num_prev_subtiles + 1) % self.num_c_stage,
+                            self._epi_buffer(2 * num_prev_subtiles + 1, self.num_c_stage, c_buffer_base),
                             c_subtile_layout.get_hier_coord(2 * subtile_idx + 1),
+                            epilog_barrier,
+                            epi_store_warp,
                         )
                     elif cutlass.const_expr(self.generate_c):
                         self.store_c(
@@ -1009,21 +1144,27 @@ class MoEGroupedGemmBf16KernelSm90:
                             bSG_gC,
                             bSG_sC,
                             c_pipeline,
-                            num_prev_subtiles % self.num_c_stage,
+                            self._epi_buffer(num_prev_subtiles, self.num_c_stage, c_buffer_base),
                             gmem_coord,
+                            epilog_barrier,
+                            epi_store_warp,
                         )
 
                     tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
-                    d_buffer = num_prev_subtiles % self.num_d_stage
+                    d_buffer = self._epi_buffer(num_prev_subtiles, self.num_d_stage, d_buffer_base)
                     num_prev_subtiles = num_prev_subtiles + 1
                     cute.copy(tiled_copy_r2s, tRS_rD_out, tRS_sD[(None, None, None, d_buffer)])
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    self.epilog_sync_barrier.arrive_and_wait()
-                    if warp_idx == self.epi_store_warp_id:
+                    epilog_barrier.arrive_and_wait()
+                    if warp_idx == epi_store_warp:
                         cute.copy(tma_atom_d, bSG_sD[(None, d_buffer)], bSG_gD[(None, gmem_coord)])
                         d_pipeline.producer_commit()
                         d_pipeline.producer_acquire()
-                    self.epilog_sync_barrier.arrive_and_wait()
+                    epilog_barrier.arrive_and_wait()
+
+                if cutlass.const_expr(self.pingpong):
+                    # Own C/D buffers: no store drain before the other warp group's epilogue.
+                    epi_turn_next.arrive()
 
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
@@ -1032,6 +1173,18 @@ class MoEGroupedGemmBf16KernelSm90:
                 cute.arch.fence_proxy("async.shared", space="cta")
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+                if cutlass.const_expr(self.pingpong):
+                    # Skip the other warp group's next tile.
+                    if is_valid_tile:
+                        ab_consumer_read_state.advance(cutlass.Int32(tile_info[3]))
+                        ab_consumer_release_state.advance(cutlass.Int32(tile_info[3]))
+                        tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                        for idx in cutlass.range(4, unroll_full=True):
+                            tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+                        is_valid_tile = tile_info[0] >= cutlass.Int32(0)
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                        tile_info_consumer_state.advance()
 
             if cutlass.const_expr(self.generate_c):
                 c_pipeline.producer_tail()

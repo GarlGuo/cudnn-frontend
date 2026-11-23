@@ -31,6 +31,7 @@ class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
 
     :param act_func: "swiglu" or "geglu".
     :param glu_layout: Must be "interleaved_32".
+    :param pingpong: The pingpong warp-group schedule (see the base kernel).
     """
 
     def __init__(
@@ -47,6 +48,7 @@ class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
         use_dynamic_sched: bool = True,
         act_func: str = "swiglu",
         glu_layout: str = "interleaved_32",
+        pingpong: bool = False,
     ):
         if act_func not in ("swiglu", "geglu"):
             raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {act_func!r}")
@@ -64,6 +66,7 @@ class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
             weight_mode,
             use_dynamic_sched,
             act_func=act_func,
+            pingpong=pingpong,
         )
         self.glu_layout = glu_layout
 
@@ -84,18 +87,17 @@ class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
         b_major: str,
         cd_major: str,
         m_aligned: int,
+        pingpong: bool = False,
     ) -> bool:
         # C carries the accumulator's N, D half of it: both must fit the base kernel's rules.
+        args = (ab_dtype, c_dtype, d_dtype, acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m)
+        layout = (k, l, a_major, b_major, cd_major, m_aligned, pingpong)
         return (
             b_major == "k"
             and mma_tiler_mn[1] % 64 == 0
             and n % 64 == 0
-            and MoEGroupedGemmBf16KernelSm90.can_implement(
-                ab_dtype, c_dtype, d_dtype, acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m, n, k, l, a_major, b_major, cd_major, m_aligned
-            )
-            and MoEGroupedGemmBf16KernelSm90.can_implement(
-                ab_dtype, c_dtype, d_dtype, acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m, n // 2, k, l, a_major, b_major, cd_major, m_aligned
-            )
+            and MoEGroupedGemmBf16KernelSm90.can_implement(*args, n, *layout)
+            and MoEGroupedGemmBf16KernelSm90.can_implement(*args, n // 2, *layout)
         )
 
     @cute.jit
