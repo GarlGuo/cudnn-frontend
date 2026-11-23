@@ -236,7 +236,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         a dedicated SF warp writes each tile's atoms to shared memory and the TMA warp loads no SFA. MXFP8 only,
         ``K % 512 == 0``, cluster (2, 1) with the 2-CTA MMA.
     :param compact_sfa_cta_release: With ``compact_sfa_sf_warp``: the SF warp arrives on the MMA leader's full barrier once
-        per K tile with a CTA-scope release instead of one cluster-scope release per 4 K tiles, and the MMA warp does no
+        per K tile with a CTA-scope release instead of the default shared::cta-restricted cluster release, and the MMA warp does no
         cluster-scope acquire. Formally outside the PTX memory model (see the GLU kernel's option of the same name).
     """
 
