@@ -21,7 +21,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass._mlir.dialects import nvvm, llvm
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import nvvm, llvm, vector
 from cutlass.cutlass_dsl import dsl_user_op
 from cudnn._cutlass_compat import LayoutEnum, SmemAllocator, TmemAllocator, get_smem_capacity_in_bytes
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -64,13 +65,15 @@ from ..moe_kernel_helpers import (
     warp_amax_with_nan,
     epilog_gmem_copy_and_partition,
     check_dynamic_sched_cluster_shape,
+    fence_release_cluster,
+    mbarrier_try_wait_parity_acquire_cluster,
 )
 from ..moe_streaming_input_block_tile_scheduler import (
     MoEInputBlockSignalSchedulerParams,
     MoEStreamingInputBlockSignalTileScheduler,
     streaming_signal_workspace_bytes_after_counter,
 )
-from cudnn.frost.tile_dsl.consume import release_zero
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 """
 High-performance persistent blockscaled contiguous grouped dense GEMM (D = alpha * (SFA * A) * (SFB * B)) example for the NVIDIA Blackwell architecture
@@ -267,6 +270,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         for that grid before it exits.
     :param launch_pdl_dependents_at_all_streaming_signal_slots_ready: With ``streaming_signal_capacity``: one extra warp per
         CTA lets this kernel's programmatic dependent launch once it has seen every ``signal[]`` entry (M tile) ready.
+    :param compact_sfa_sf_warp: ``sfa`` is compact E8M0 rows ``[M, K / 32]`` (as an EP dispatch delivers them), not SF atoms:
+        a dedicated SF warp writes each tile's atoms to shared memory and the TMA warp loads no SFA. MXFP8 only,
+        ``K % 512 == 0``, cluster (2, 1) with the 2-CTA MMA.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -333,6 +339,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         device_layout: bool = False,
         use_pdl: bool = False,
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
+        compact_sfa_sf_warp: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -425,6 +432,12 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         self.trigger_warp_id = len(all_warps) if launch_pdl_dependents_at_all_streaming_signal_slots_ready else None
         if launch_pdl_dependents_at_all_streaming_signal_slots_ready:
             all_warps.append(self.trigger_warp_id)
+        # compact_sfa_sf_warp: the SF warp goes last; it consumes tile_info like the TMA warp.
+        self.compact_sfa_sf_warp = compact_sfa_sf_warp
+        self.sf_warp_id = len(all_warps) if compact_sfa_sf_warp else None
+        if compact_sfa_sf_warp:
+            all_warps.append(self.sf_warp_id)
+            warps_wo_sched.append(self.sf_warp_id)
         self.threads_per_cta = self.threads_per_warp * len(all_warps)
         self.threads_wo_sched = self.threads_per_warp * len(warps_wo_sched)
 
@@ -476,6 +489,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
         if self.use_streaming_signal_sched:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
+        if compact_sfa_sf_warp and (sf_vec_size != 32 or not use_2cta_instrs or tuple(cluster_shape_mn) != (2, 1) or self.use_sfb_reorder_warp):
+            raise ValueError("compact_sfa_sf_warp requires MXFP8 (sf_vec_size 32), cluster (2, 1) with the 2-CTA MMA and the interleaved GLU layout")
         self.device_layout = device_layout
         self.use_pdl = use_pdl
         self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
@@ -881,6 +896,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         if cutlass.const_expr(scheduler_counter is not None):
             workspace_ptr = scheduler_counter.iterator
         a = kernel_facing_mx(a)
+        # The SF warp loads 4 K tiles' words per row at once: 16-byte aligned compact rows.
+        if cutlass.const_expr(self.compact_sfa_sf_warp and cute.is_static(a.shape[1]) and cute.size(a, mode=[1]) % 512 != 0):
+            raise ValueError(f"compact_sfa_sf_warp requires K % 512 == 0, got K = {cute.size(a, mode=[1])}")
         c = kernel_facing_mx(c)
         d = kernel_facing_mx(d)
         d_col = kernel_facing_mx(d_col)
@@ -1057,7 +1075,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
+        # compact_sfa_sf_warp: the SF warp, not the TMA, fills sSFA (it arrives on the full barrier itself).
+        sfa_copy_size = 0 if cutlass.const_expr(self.compact_sfa_sf_warp) else cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size) * atom_thr_size
         self.num_sfb_load_bytes = sfb_copy_size
@@ -1257,7 +1276,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             glu_clamp_min,
             situ_beta1,
             situ_beta2,
-            Int32(0) if self.use_streaming_signal_sched else None,
+            Int32(0) if self.use_streaming_signal_sched or self.compact_sfa_sf_warp else None,
+            cute.recast_ptr(sfa.iterator, dtype=cutlass.Int32) if cutlass.const_expr(self.compact_sfa_sf_warp) else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1820,12 +1840,14 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         situ_beta1: cutlass.Float32 = 4.0,
         situ_beta2: cutlass.Float32 = 25.0,
         release_zero_arg: Optional[Int32] = None,
+        compact_sfa_words: Optional[cute.Pointer] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
 
-        ``release_zero_arg``: with the signal scheduler, the release-zero (python/cudnn/AGENTS.md Rule 11): the host passes
-        the literal 0 and its only use is ``release_zero()``; None otherwise.
+        ``release_zero_arg``: with the signal scheduler or the SF warp, the release-zero (python/cudnn/AGENTS.md Rule 11): the
+        host passes the literal 0 and its only use is ``release_zero()``; None otherwise.
+        ``compact_sfa_words``: with ``compact_sfa_sf_warp``, the compact SFA rows as int32 words (4 scales each).
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1886,7 +1908,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             cute.arch.mbarrier_init_fence()
 
         # Initialize mainloop ab_pipeline (barrier) and states
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        # compact_sfa_sf_warp: each CTA's SF warp also arrives once per stage on the leader's full barrier.
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 1 + (2 if self.compact_sfa_sf_warp else 0))
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_tma_producer)
         ab_pipeline = pipeline.PipelineTmaUmma.create(
@@ -1926,6 +1949,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             consumer_group=tile_info_pipeline_consumer_group,
         )
 
+        zero = release_zero(release_zero_arg) if cutlass.const_expr(release_zero_arg is not None) else None
         if cutlass.const_expr(self.use_streaming_signal_sched):
             scheduler = MoEStreamingInputBlockSignalTileScheduler.create(
                 sched_params,
@@ -1933,7 +1957,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
                 sched_storage=sched_storage,
                 streaming_signal_capacity=self.streaming_signal_capacity,
-                release_zero=release_zero(release_zero_arg),
+                release_zero=zero,
                 device_layout=self.device_layout,
             )
         else:
@@ -2289,14 +2313,15 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                         mcast_mask=b_full_mcast_mask,
                         tma_desc_ptr=desc_ptr_b,
                     )
-                    # TMA load SFA (contiguous, global desc via domain_offset)
-                    cute.copy(
-                        tma_atom_sfa,
-                        tAgSFA_k,
-                        tAsSFA_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfa_full_mcast_mask,
-                    )
+                    # TMA load SFA (contiguous, global desc via domain_offset); the SF warp's when compact
+                    if cutlass.const_expr(not self.compact_sfa_sf_warp):
+                        cute.copy(
+                            tma_atom_sfa,
+                            tAgSFA_k,
+                            tAsSFA_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfa_full_mcast_mask,
+                        )
                     # Each CTA receives two distinct half-tile multicasts. Their
                     # combined bytes fill one local SFB stage; cta_group::1 gives
                     # each CTA a local completion signal without a peer notify.
@@ -2332,6 +2357,24 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
+
+        #
+        # SF warp (compact_sfa_sf_warp): this CTA's 128 compact SFA rows into the stage's SF atom, per K tile
+        #
+        if cutlass.const_expr(self.compact_sfa_sf_warp):
+            if warp_idx == self.sf_warp_id:
+                self.compact_sfa_sf_warp_loop(
+                    compact_sfa_words,
+                    sSFA,
+                    mA_mkl,
+                    padded_offsets,
+                    sInfo,
+                    tile_info_pipeline,
+                    ab_pipeline,
+                    cta_rank_in_cluster - mma_tile_coord_v,
+                    lane_idx,
+                    zero,
+                )
 
         #
         # Scale reorder warp: observe each CTA's local SFB multicast completion.
@@ -2516,6 +2559,12 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                             _wait_sfb_cluster(sfb_pair_barrier_base + ab_consumer_state.index, ab_consumer_state.phase)
                         else:
                             ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                        # compact_sfa_sf_warp: the peer SF warp's sSFA stores arrive with .release.cluster; acquire them.
+                        if cutlass.const_expr(self.compact_sfa_sf_warp):
+                            full_barrier = ab_pipeline.sync_object_full.get_barrier(ab_consumer_state.index)
+                            sf_acquired = cutlass.Boolean(False)
+                            while not sf_acquired:
+                                sf_acquired = mbarrier_try_wait_parity_acquire_cluster(full_barrier, ab_consumer_state.phase)
                         if cutlass.const_expr(self.glu_layout == "gate_then_up" and not self.use_2cta_instrs):
                             self.interleave_sfb_in_place(sSFB, ab_consumer_state.index, lane_idx)
 
@@ -3228,6 +3277,76 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             cute.arch.griddepcontrol_wait()
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+    #: K tiles of compact SFA words the SF warp loads at once: one 16-byte L2-only load per row (K % 512 == 0).
+    SF_WARP_K_TILES_PER_LOAD = 4
+
+    @cute.jit
+    def compact_sfa_sf_warp_loop(self, compact_sfa_words, sSFA, mA_mkl, padded_offsets, sInfo, tile_info_pipeline, ab_pipeline, leader_cta, lane_idx, zero):
+        """Per tile and K tile: wait for the stage, store this CTA's SF atom from the compact rows, arrive on the leader's
+        full barrier.  Lane l owns rows l + 32 r (r < 4) of the CTA's 128 rows; a row's word of a K tile is its 4 scales."""
+        rows_total, k = mA_mkl.shape[0], mA_mkl.shape[1]
+        words_per_row = k // (4 * self.sf_vec_size)
+        # (row, row_group, K tile) words of the compact rows; (lane, row_group, stage) words of the SF atoms in sSFA.
+        words = cute.make_tensor(compact_sfa_words, cute.make_layout((rows_total, 4, words_per_row), stride=(words_per_row, 32 * words_per_row, 1)))
+        lines = cute.make_tensor(cute.recast_ptr(sSFA.iterator, dtype=cutlass.Int32), cute.make_layout((32, 4, self.num_ab_stage), stride=(4, 1, 128)))
+        group = self.SF_WARP_K_TILES_PER_LOAD
+        queue = [cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32) for _ in range(group)]
+        sf_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_ab_stage)
+        tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
+        tile_info = cute.make_rmem_tensor((4,), cutlass.Int32)
+        is_valid_tile = self._sf_warp_next_tile(sInfo, tile_info, tile_info_pipeline, tile_info_consumer_state, zero)
+        tile_info_consumer_state.advance()
+        while is_valid_tile:
+            k_tile_cnt = tile_info[3]
+            token_offset, _ = compute_expert_token_range(padded_offsets, tile_info[0])
+            # A 64-bit row: row x words per row passes 2^31 at large M.
+            row = cutlass.Int64(token_offset) + cutlass.Int64(tile_info[1]) * self.cta_tile_shape_mnk[0] + cutlass.Int64(lane_idx)
+            rows = words[(row, None, None)]
+            self._load_compact_sfa_group(queue, rows, 0)
+            sf_producer_state.reset_count()
+            for k_tile_base in cutlass.range(0, k_tile_cnt, group, unroll=1):
+                for j in cutlass.range_constexpr(group):
+                    ab_pipeline.sync_object_empty.wait(sf_producer_state.index, sf_producer_state.phase)
+                    # The MMA's tcgen05.cp read the stage through the async proxy: order that before these generic stores.
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    for row_group in cutlass.range_constexpr(4):
+                        lines[(lane_idx, row_group, sf_producer_state.index)] = queue[j][row_group]
+                    # tcgen05.cp reads the atom through the async proxy; the peer's stores reach the leader's MMA.
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        fence_release_cluster()
+                        cute.arch.mbarrier_arrive(
+                            ab_pipeline.producer_get_barrier(sf_producer_state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER
+                        )
+                    sf_producer_state.advance()
+                if k_tile_base + group < k_tile_cnt:
+                    self._load_compact_sfa_group(queue, rows, k_tile_base + group)
+            is_valid_tile = self._sf_warp_next_tile(sInfo, tile_info, tile_info_pipeline, tile_info_consumer_state, zero)
+            tile_info_consumer_state.advance()
+
+    @cute.jit
+    def _load_compact_sfa_group(self, queue, rows, first_k_tile):
+        """K tiles ``first_k_tile`` .. + 3 of this lane's 4 rows, one 16-byte L2-only load per row: the producer wrote them
+        while this kernel ran, so no L1 line may serve them."""
+        for row_group in cutlass.range_constexpr(4):
+            vec = cute.arch.load(
+                (rows.iterator + cute.crd2idx((row_group, first_k_tile), rows.layout)).llvm_ptr,
+                ir.VectorType.get([self.SF_WARP_K_TILES_PER_LOAD], cutlass.Int32.mlir_type),
+                cop="cg",
+            )
+            for j in cutlass.range_constexpr(self.SF_WARP_K_TILES_PER_LOAD):
+                queue[j][row_group] = cutlass.Int32(vector.extract(vec, [], [j]))
+
+    @cute.jit
+    def _sf_warp_next_tile(self, sInfo, tile_info, tile_info_pipeline, tile_info_consumer_state, zero):
+        """Read the next tile_info slot and release it with an arrive that depends on the values read (Rule 11)."""
+        tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+        for idx in cutlass.range(4, unroll_full=True):
+            tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
+        consume_then_arrive(tile_info_pipeline.sync_object_empty.get_barrier(tile_info_consumer_state.index), [tile_info[idx] for idx in range(4)], zero)
+        return tile_info[0] >= cutlass.Int32(0)
 
     def epilog_tmem_copy_and_partition(
         self,
