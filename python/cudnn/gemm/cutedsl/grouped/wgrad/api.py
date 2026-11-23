@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Unified FE API for grouped GEMM wgrad on SM100+."""
+"""Unified FE API for grouped GEMM wgrad on SM90 (BF16) and SM100+."""
 
 from __future__ import annotations
 
@@ -133,7 +133,7 @@ class GroupedGemmWgradSm100(APIBase):
         sample_global_scale_a: Optional[torch.Tensor] = None,
         sample_global_scale_b: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -309,7 +309,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
     global_scale_b: Optional[torch.Tensor] = None,
     acc_dtype: Optional[torch.dtype] = None,
     wgrad_dtype: Optional[torch.dtype] = None,
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -340,7 +340,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
             offsets_tensor,
             wgrad_dtype=wgrad_dtype if wgrad_dtype is not None else cutlass.BFloat16,
             acc_dtype=acc_dtype if acc_dtype is not None else cutlass.Float32,
-            mma_tiler_mn=mma_tiler_mn,
+            mma_tiler_mn=mma_tiler_mn or (256, 256),
             cluster_shape_mn=cluster_shape_mn,
             accumulate_on_output=accumulate_on_output,
             input_order=input_order,
@@ -365,7 +365,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         wrapper_operand_meta(global_scale_b),
         acc_dtype,
         wgrad_dtype,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         None if cluster_shape_mn is None else tuple(cluster_shape_mn),
         sf_vec_size,
         sf_fp8_dtype_override,
@@ -451,7 +451,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         _wgrad_tensor_signature(global_scale_b, exact_stride=True),
         acc_dtype,
         wgrad_dtype,
-        tuple(mma_tiler_mn),
+        None if mma_tiler_mn is None else tuple(mma_tiler_mn),
         tuple(cluster_shape_mn) if cluster_shape_mn is not None else None,
         sf_vec_size,
         sf_fp8_dtype_override,
