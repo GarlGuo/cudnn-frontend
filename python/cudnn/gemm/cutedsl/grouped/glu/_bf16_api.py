@@ -275,7 +275,7 @@ class GroupedGemmGluBf16API(APIBase):
 
         if self.acc_dtype is not cutlass.Float32:
             raise ValueError(f"acc_dtype must be torch.float32, got {self.acc_dtype}")
-        check_pingpong_tile(self._pingpong, self.mma_tiler_mn, self.cluster_shape_mn, glu_generate_c=self.generate_c)
+        check_pingpong_tile(self._pingpong, self.mma_tiler_mn, self.cluster_shape_mn)
         if self._is_sm90:
             if self.weight_mode != MoEWeightMode.DENSE:
                 raise NotImplementedError("SM90 grouped GEMM GLU supports dense weights (sample_b) only, not discrete b_ptrs")

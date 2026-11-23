@@ -170,7 +170,7 @@ def test_sm90_glu_rejects_unsupported():
             run_glu(problem, mma_tiler_mn=tile, cluster_shape_mn=cluster)
 
 
-# ---- GLU forward, pingpong schedule: 128x192 tiles on (2, 1) clusters, without the saved C ----
+# ---- GLU forward, pingpong schedule: 128x192 tiles on (2, 1) clusters ----
 
 NO_C = dict(schedule="pingpong", generate_c=False)
 
@@ -206,21 +206,33 @@ def test_sm90_glu_pingpong_matches_cooperative_and_fp16():
     check_glu(fp16, run_glu(fp16, "geglu", linear_offset=0.25, **NO_C), "geglu", 0.25, with_c=False)
 
 
+@pytest.mark.parametrize("act", ["swiglu", "geglu"])
+def test_sm90_glu_pingpong_with_c(act):
+    # Pingpong stores C before the activation; C and D match the cooperative 128x192 bitwise. Odd and even tile counts.
+    problem = make_problem((512, 0, 1280, 256, 0, 768, 1024), n=1536, k=320, seed=41)
+    tile = dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1))
+    pingpong = run_glu(problem, act, schedule="pingpong", **tile)
+    check_glu(problem, pingpong, act)
+    cooperative = run_glu(problem, act, schedule="cooperative", **tile)
+    for name in ("c_tensor", "d_tensor"):
+        assert torch.equal(pingpong[name], cooperative[name]), name
+    fp16 = make_problem((256, 512), n=576, k=256, out_dtype=torch.float16)
+    check_glu(fp16, run_glu(fp16, "geglu", linear_offset=0.25, schedule="pingpong"), "geglu", 0.25)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
-        dict(),
-        dict(mma_tiler_mn=(128, 192)),
         dict(mma_tiler_mn=(128, 128), generate_c=False),
         dict(mma_tiler_mn=(128, 160), generate_c=False),
         dict(mma_tiler_mn=(128, 256), generate_c=False),
         dict(mma_tiler_mn=(64, 256), cluster_shape_mn=(1, 2), generate_c=False),
         dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(1, 2), generate_c=False),
     ],
-    ids=["default-with-c", "128x192-with-c", "128x128", "128x160", "128x256", "64x256-c12", "128x192-c12"],
+    ids=["128x128", "128x160", "128x256", "64x256-c12", "128x192-c12"],
 )
 def test_sm90_glu_pingpong_rejects(kwargs):
-    # A GLU with C has no pingpong schedule; without C, pingpong runs only 128x192 on (2, 1) clusters.
+    # Pingpong runs only 128x192 on (2, 1) clusters.
     problem = make_problem((256, 256), n=256, k=256)
     with pytest.raises(ValueError, match="pingpong"):
         run_glu(problem, schedule="pingpong", **kwargs)
