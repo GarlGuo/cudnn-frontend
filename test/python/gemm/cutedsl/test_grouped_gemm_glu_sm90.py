@@ -183,15 +183,17 @@ def test_sm90_glu_pingpong_tiles(act, tile, cluster):
     check_glu(problem, run_glu(problem, act, mma_tiler_mn=tile, cluster_shape_mn=cluster, **NO_C), act, with_c=False)
 
 
+@pytest.mark.parametrize("with_c", [False, True], ids=["no-c", "with-c"])
 @pytest.mark.parametrize("counts,n", [((256,), 192), ((256, 0, 768, 0, 256), 576), ((256, 0, 512, 256), 576)], ids=["one-tile", "odd-15", "even-12"])
-def test_sm90_glu_pingpong_one_cluster_parity(monkeypatch, counts, n):
+def test_sm90_glu_pingpong_one_cluster_parity(monkeypatch, counts, n, with_c):
     # One (2, 1) cluster of 128x192 tiles: per CTA 1, 15 and 12 tiles; warp group 1 skips the odd tiles' A/B stages.
     import cutlass
 
     clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
     monkeypatch.setenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", str(clusters - 1))
     problem = make_problem(counts, n=n, k=576, seed=len(counts) + n)
-    check_glu(problem, run_glu(problem, mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1), **NO_C), with_c=False)
+    result = run_glu(problem, mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1), schedule="pingpong", generate_c=with_c)
+    check_glu(problem, result, with_c=with_c)
 
 
 def test_sm90_glu_pingpong_matches_cooperative_and_fp16():
@@ -218,6 +220,21 @@ def test_sm90_glu_pingpong_with_c(act):
         assert torch.equal(pingpong[name], cooperative[name]), name
     fp16 = make_problem((256, 512), n=576, k=256, out_dtype=torch.float16)
     check_glu(fp16, run_glu(fp16, "geglu", linear_offset=0.25, schedule="pingpong"), "geglu", 0.25)
+
+
+@pytest.mark.parametrize("act", ["swiglu", "geglu"])
+def test_sm90_glu_pingpong_with_c_zero_rows(act):
+    # Pingpong with C on a rank with no routed tokens (0-row A, C and prob; unique N/K, see the fwd zero-row test) and
+    # with every expert empty (no tile is claimed).
+    problem = make_problem((0, 0), n=704, k=192)
+    problem.update(a=problem["a"][:0], prob=problem["prob"][:0], c=problem["c"][:0])
+    result = run_glu(problem, act, schedule="pingpong")
+    torch.cuda.synchronize()
+    assert result["c_tensor"].shape == (0, 704) and result["d_tensor"].shape == (0, 352)
+    empty = make_problem((0, 0, 0), n=1536, k=320)
+    result = run_glu(empty, act, schedule="pingpong")
+    torch.cuda.synchronize()
+    assert result["c_tensor"].shape == (256, 1536) and result["d_tensor"].shape == (256, 768)
 
 
 @pytest.mark.parametrize(

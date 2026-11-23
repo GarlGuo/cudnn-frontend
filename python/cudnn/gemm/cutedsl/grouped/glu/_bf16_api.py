@@ -130,7 +130,7 @@ class GroupedGemmGluBf16API(APIBase):
         self._is_sm90 = has_wgmma(major)
         # The SM90 schedule comes from the GEMM's (N, K) and the tile: N is the pre-activation 2I (B is (2I, K, experts)).
         dense_b = self.b_desc is not None and self.b_desc.ndim == 3
-        self._pingpong = self._is_sm90 and dense_b and use_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn, generate_c)
+        self._pingpong = self._is_sm90 and dense_b and use_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn)
         self.mma_tiler_mn = tuple(mma_tiler_mn or (default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))

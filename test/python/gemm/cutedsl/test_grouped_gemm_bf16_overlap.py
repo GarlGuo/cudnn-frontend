@@ -71,7 +71,7 @@ def _launch(op, problem, sched, schedule=None):
         result = gemm.run(problem, schedule=schedule, **kwargs)
         return {"c": result["c_tensor"], "d": result["d_tensor"]}
     if op == "glu" and schedule == "pingpong":
-        # SM90 pingpong runs a GLU without the saved C only.
+        # The forced pingpong case runs a GLU without the saved C; the heuristic case covers pingpong with C.
         return {"d": glu.run_glu(problem, schedule=schedule, generate_c=False, **kwargs)["d_tensor"]}
     if op == "glu":
         result = glu.run_glu(problem, schedule=schedule, **kwargs)
@@ -129,7 +129,7 @@ def test_sm100_bf16_overlapping_streams(op, sched):
     _assert_overlap_matches_serial(op.split("-")[0], sched, discrete=op.endswith("discrete"))
 
 
-# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad, cooperative for GLU with C and wgrad; dGLU has one schedule.
+# N=4096, K=1024: the shape rule picks pingpong for fwd / dgrad / GLU with C, cooperative for wgrad (N=1024); dGLU has one schedule.
 SM90_CASES = [(op, schedule) for op in ("fwd", "dgrad", "glu", "wgrad") for schedule in (None, "cooperative", "pingpong")] + [("dglu", None)]
 
 
