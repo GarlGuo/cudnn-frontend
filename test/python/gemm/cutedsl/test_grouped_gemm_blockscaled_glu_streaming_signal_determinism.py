@@ -25,6 +25,7 @@ from gemm.cutedsl._streaming_signal_blockscaled import (
     expert_bank,
     make_glu_kernel,
     make_problem,
+    is_rubin,
     pack,
     poison_inputs,
     produce_tiles,
@@ -58,8 +59,14 @@ def require_sm10x_cutedsl():
         pytest.skip(reason)
 
 
+def skip_compact_on_rubin(compact):
+    if compact and is_rubin():
+        pytest.skip("compact_sfa_sf_warp: the SM100 kernel only (the Rubin GLU kernel takes SF atoms)")
+
+
 def signal_options(capacity, variant):
     options = dict(use_dynamic_sched=True, streaming_signal_capacity=capacity)
+    skip_compact_on_rubin(variant.startswith("compact"))
     if variant.startswith("compact"):
         options["compact_sfa_sf_warp"] = True
     if variant.endswith("signal_layout_trigger"):
@@ -91,6 +98,7 @@ def test_mxfp8_glu_producer_release_order_invariance(late, compact):
     in order, in reverse and in a seeded random order.  Every order gives the stock scheduler's bytes."""
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
 
+    skip_compact_on_rubin(compact)
     tokens = MANY_EXPERTS_64
     problem = make_problem(tokens, N, HIDDEN, seed=7)
     capacity = problem["rows"] // ROWS_ALIGNMENT
@@ -147,6 +155,7 @@ def test_mxfp8_glu_signal_slot_release_warm_stress(compact):
     per cluster, every byte against stock."""
     from warm_stress import StressCase, assert_warm_stress
 
+    skip_compact_on_rubin(compact)
     clusters = 4
     problem = make_problem(BIG_EXPERT, N, HIDDEN, seed=13)
     assert problem["rows"] == sum(padded(t) for t in BIG_EXPERT), "every C and D row is written, so the sentinel fill is overwritten"

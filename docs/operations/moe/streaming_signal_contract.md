@@ -17,7 +17,8 @@ Kernels:
   - output direction: `BlockScaledMoEGroupedGemmQuantKernel` in `quant/grouped_gemm_quant.py` (SM100) and its Rubin twin in
     `quant/moe_blockscaled_grouped_gemm_quant_rubin.py` (SM107), the FC2 forward;
   - input direction: `BlockScaledMoEGroupedGemmGluBiasKernel` in `glu/moe_blockscaled_grouped_gemm_glu_bias.py` (SM100),
-    the FC1 forward, with the stock (swizzled) SFA.
+    the FC1 forward, with stock (swizzled) or compact SFA, and its Rubin twin `BlockScaledMoEGroupedGemmGluKernel` in
+    `glu/moe_blockscaled_grouped_gemm_glu_rubin.py` (SM107) with stock SFA.
 
 Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the
 same as without this feature.
@@ -186,9 +187,9 @@ The block-scaled quant kernels (FC2 forward) take the output direction with the 
 | inputs | Unchanged: E4M3 / E2M1 codes with SF atoms, read in full before any chunk is published. |
 | other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`. |
 
-### Input direction (SM100 GLU, stock SFA)
+### Input direction (GLU, stock SFA)
 
-The block-scaled GLU kernel (FC1 forward) takes the BF16 GLU kernel's input-direction options: `streaming_signal_capacity`,
+The block-scaled GLU kernels (FC1 forward; SM100 and the Rubin twin) take the BF16 GLU kernel's input-direction options: `streaming_signal_capacity`,
 `device_layout`, `use_pdl` and `launch_pdl_dependents_at_all_streaming_signal_slots_ready`. Sections 1 and 2 hold
 unchanged, and `signal[t]` covers M tile t's scale factors as well as its rows of A:
 
@@ -198,12 +199,12 @@ unchanged, and `signal[t]` covers M tile t's scale factors as well as its rows o
 | M tile t | A rows `[256 t, 256 (t + 1))` and SFA atom rows 2t and 2t + 1: the contiguous bytes `[t * 256 * Kc, (t + 1) * 256 * Kc)`, `Kc = round_up(ceil(K / sf_vec_size), 4)`. |
 | producer | Writes both, padding rows and padding scale columns included, before the release store of `signal[t]` (section 1, memory ordering). |
 | GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
-| other | Dense weights, `padded_offsets` in global memory, no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA. |
+| other | Dense weights, `padded_offsets` in global memory, no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA; on Rubin no B-reuse. |
 
 ### Input direction with compact SFA (`compact_sfa_sf_warp=True`)
 
-An EP dispatch delivers each token's scales as a compact row, not as SF atoms. With `compact_sfa_sf_warp=True` the GLU
-kernel takes `sfa` as those rows and builds the atoms itself:
+An EP dispatch delivers each token's scales as a compact row, not as SF atoms. With `compact_sfa_sf_warp=True` the SM100
+GLU kernel (not yet the Rubin twin) takes `sfa` as those rows and builds the atoms itself:
 
 | Item | Contract |
 |---|---|
