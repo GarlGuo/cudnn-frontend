@@ -306,6 +306,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         compact_sfa_cta_release: bool = False,
         tight_sf_tmem_cols: bool = False,
         stage_sfd_smem: bool = False,
+        sfd_col_lane_scales: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -453,6 +454,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
             raise ValueError(reason)
         self.compact_sfa_cta_release = compact_sfa_cta_release
         self.tight_sf_tmem_cols = tight_sf_tmem_cols
+        # sfd_col_lane_scales: the column SFD's 32 warp maxima go through a per-warp smem scratch; lane l computes only
+        # column l's scale (one E8M0 round trip and reciprocal, not 32), and the scales come back through the scratch.
+        self.sfd_col_lane_scales = sfd_col_lane_scales
         self.stage_sfd_smem_requested = stage_sfd_smem
         # K tiles the SF warp stores per arrive round: one CTA-scope arrive each, or one cluster release per batch.
         self.sf_warp_release_batch = 1 if compact_sfa_cta_release else self.SF_WARP_RELEASE_BATCH
@@ -595,8 +599,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
             self.occupancy,
             self.store_d_directly,
             self.generate_dbias,
-            # stage_sfd_smem's 4 KB stage (validated in __call__).
-            4096 if self.stage_sfd_smem_requested else 0,
+            # stage_sfd_smem's 4 KB stage (validated in __call__); sfd_col_lane_scales' 64 FP32 per epilogue warp.
+            (4096 if self.stage_sfd_smem_requested else 0) + (4 * 64 * self.num_epilog_warps if self.sfd_col_lane_scales else 0),
         )
 
         # Compute A/B/D/Scale shared memory layout
@@ -1220,6 +1224,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                 cute.struct.MemRange[cutlass.Int32, 1024 if self.stage_sfd_smem else 0],
                 16,
             ]
+            # sfd_col_lane_scales: per epilogue warp, 32 column maxima then 32 column scales
+            sColScratch: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 64 * self.num_epilog_warps if self.sfd_col_lane_scales else 0],
+                16,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -1573,6 +1582,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         norm_const,
         rcp_limit,
         tRSrD,
+        scratch=None,
     ):
         # Get absolute max across a vector and Compute SFD
         tCompute = cute.make_rmem_tensor(src.shape, self.acc_dtype)
@@ -1586,7 +1596,34 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         fp32_max = cutlass.Float32(3.40282346638528859812e38)
         tidx, _, _ = cute.arch.thread_idx()
 
-        for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
+        if cutlass.const_expr(self.sfd_col_lane_scales):
+            # Same values as the loop below (NaN-propagating max, rn products, E8M0 round trip, rcp, fmin): one warp
+            # redux per column, then lane l's column scale only, shared through the warp's scratch.
+            lane = cute.arch.lane_idx()
+            col_max = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
+            for vi in cutlass.range_constexpr(self.sf_vec_size):
+                col_max[vi] = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+            scratch_max = cute.make_tensor(scratch.iterator, cute.make_layout(self.sf_vec_size))
+            scratch_scale = cute.make_tensor(scratch.iterator + self.sf_vec_size, cute.make_layout(self.sf_vec_size))
+            cute.arch.sync_warp()
+            cute.autovec_copy(col_max, scratch_max)
+            cute.arch.sync_warp()
+            scale = rcp_limit * norm_const
+            max_value, _ = cute.arch.mul_packed_f32x2((scratch_max[lane], scratch_max[lane]), (scale, scale), rnd="rn", ftz=False)
+            pvscale[None, None, tile_idx][0] = max_value
+            max_value_rcp = cute.arch.rcp_approx(self.cvt_f32_to_f8_to_f32(max_value, self.sf_dtype))
+            max_value_rcp = fmin(max_value_rcp, fp32_max, nan=True)
+            acc_scale_col, _ = cute.arch.mul_packed_f32x2((norm_const, norm_const), (max_value_rcp, max_value_rcp), rnd="rn", ftz=False)
+            scratch_scale[lane] = acc_scale_col
+            cute.arch.sync_warp()
+            col_scale = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
+            cute.autovec_copy(scratch_scale, col_scale)
+            for vi in cutlass.range_constexpr(0, self.sf_vec_size, 2):
+                tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1] = cute.arch.mul_packed_f32x2(
+                    (tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1]), (col_scale[vi], col_scale[vi + 1]), rnd="rn", ftz=False
+                )
+
+        for vi in cutlass.range_constexpr(0, 0 if self.sfd_col_lane_scales else acc_frg.shape[0], 4):
             max_value0 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
             max_value1 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 1, 0]))
             max_value2 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 2, 0]))
@@ -3131,6 +3168,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
 
                 norm_const = cutlass.Float32(norm_const_tensor[0])
                 d_rcp_limits = get_dtype_rcp_limits(self.d_dtype)
+                column_scratch = None
+                if cutlass.const_expr(self.sfd_col_lane_scales):
+                    sColScratch = storage.sColScratch.get_tensor(cute.make_layout((64, self.num_epilog_warps), stride=(1, 64)))
+                    column_scratch = sColScratch[(None, warp_idx % self.num_epilog_warps)]
                 if cutlass.const_expr(self.stage_sfd_smem):
                     sSFDStage = storage.sSFDStage.get_tensor(cute.make_layout(1024))
                     sSFDStage_u8 = cute.make_tensor(cute.recast_ptr(sSFDStage.iterator, dtype=cutlass.Uint8), cute.make_layout(4096))
@@ -3503,6 +3544,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                             norm_const,
                             d_rcp_limits,
                             tRS_rD1_col,
+                            column_scratch,
                         )
                         self.quant_sfd_row(
                             (real_subtile_idx * 2 + 1) % 4,
@@ -3521,6 +3563,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                             norm_const,
                             d_rcp_limits,
                             tRS_rD2_col,
+                            column_scratch,
                         )
 
                         if subtile_idx % 2 == 1:
@@ -3694,7 +3737,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                     # global row SFD), 64-127 the 4 column atoms (512 B each in the expert's column SFD).
                     self.epilog_sync_barrier.arrive_and_wait()
                     sf_n_d = cute.size(mD_mnl, mode=[1])
-                    sf_local_row0 = (epi_work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape)) * self.mma_tiler[0] + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+                    sf_local_row0 = (epi_work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape)) * self.mma_tiler[
+                        0
+                    ] + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
                     sf_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
                     for word_idx in cutlass.range_constexpr(8):
                         sf_words[word_idx] = sSFDStage[epi_tidx * 8 + word_idx]
