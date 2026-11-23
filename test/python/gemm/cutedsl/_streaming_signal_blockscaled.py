@@ -83,6 +83,8 @@ def make_glu_kernel(experts, rubin=None, **options):
 
         kernel = BlockScaledMoEGroupedGemmGluBiasKernel(**common, **options)
     kernel.test_rubin, kernel.test_glu = rubin, True
+    # compact_sfa_sf_warp: SFA is the compact E8M0 rows [rows, K / 32] (problem["a_exp"]), not the SF atoms.
+    kernel.test_compact = bool(options.get("compact_sfa_sf_warp"))
     kernel.test_compile_key = (type(kernel).__module__, frozen({**common, **options}))
     return kernel
 
@@ -201,7 +203,8 @@ def kernel_args(kernel, problem, *buffers):
         OperandMajorMode.K,
         from_dlpack(workspace, assumed_align=128).iterator,
     ]
-    sfa, offsets = tensor(problem["sfa"].view(torch.float8_e8m0fnu)), from_dlpack(problem["offsets"], assumed_align=4)
+    sfa_bytes = problem["a_exp"] if getattr(kernel, "test_compact", False) else problem["sfa"]
+    sfa, offsets = tensor(sfa_bytes.view(torch.float8_e8m0fnu)), from_dlpack(problem["offsets"], assumed_align=4)
     alpha, prob = tensor(problem["alpha"]), tensor(problem["prob"])
     if kernel.test_glu:
         # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias), SM100 and Rubin alike.
@@ -230,7 +233,7 @@ def compile_once(kernel, problem, buffers, max_active_clusters=None):
 
     if max_active_clusters is None:
         max_active_clusters = HardwareInfo().get_max_active_clusters(2 if kernel.use_2cta_instrs else 1)
-    layouts = [problem[name] for name in ("a", "b", "sfa", "sfb", "offsets", "alpha", "prob")] + list(buffers)
+    layouts = [problem[name] for name in ("a", "a_exp", "b", "sfa", "sfb", "offsets", "alpha", "prob")] + list(buffers)
     key = (kernel.test_compile_key, max_active_clusters, tuple((tuple(x.shape), tuple(x.stride()), str(x.dtype)) for x in layouts))
     compiled = COMPILED.get(key)
     if compiled is None:
@@ -404,18 +407,21 @@ def signal_view(kernel, workspace):
 
 
 def poison_inputs(problem, late):
-    """Overwrite the operands ``late`` names ("a", "sfa" or "both") with NaN codes; returns their final bytes."""
-    final = {"a": problem["a"].view(torch.uint8).clone(), "sfa": problem["sfa"].clone()}
+    """Overwrite the operands ``late`` names ("a", "sfa" or "both") with NaN codes, both SFA forms (atoms and compact
+    rows); returns their final bytes."""
+    final = {"a": problem["a"].view(torch.uint8).clone(), "sfa": problem["sfa"].clone(), "a_exp": problem["a_exp"].clone()}
     if late in ("a", "both"):
         problem["a"].view(torch.uint8).fill_(A_POISON)
     if late in ("sfa", "both"):
         problem["sfa"].fill_(SF_POISON)
+        problem["a_exp"].fill_(SF_POISON)
     return final
 
 
 def produce_tiles(problem, final, late, signal, order):
     """The fake producer, enqueued on the current stream: per M tile in ``order``, write the late operands' rows and
-    SFA bytes, then ``signal[t] = t`` (a stream-ordered copy and fill: the GEMM acquires the flag)."""
+    SFA bytes (the atom bytes and the compact rows alike), then ``signal[t] = t`` (stream-ordered: the GEMM acquires the
+    flag)."""
     k = problem["k"]
     a_bytes, sf_bytes = problem["a"].view(torch.uint8), sfa_tile_bytes(k)
     for tile in order:
@@ -425,6 +431,7 @@ def produce_tiles(problem, final, late, signal, order):
         if late in ("sfa", "both"):
             sf = slice(tile * sf_bytes, (tile + 1) * sf_bytes)
             problem["sfa"][sf].copy_(final["sfa"][sf])
+            problem["a_exp"][rows].copy_(final["a_exp"][rows])
         signal[tile].fill_(tile)
 
 
