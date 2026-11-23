@@ -80,7 +80,7 @@ from .moe_persistent_scheduler import (
 
 #: Most M-tiles in one expert-consecutive-M batch: its A rows must stay in L2 beside the N-tile
 #: of weights they multiply.
-EXPERT_BATCH_MAX_M_TILES = 16
+EXPERT_BATCH_MAX_M_TILES = int(__import__("cudnn.gemm.cutedsl.grouped._sigdiag", fromlist=["diag"]).diag("BATCH_CAP", "16"))
 
 
 def _state_region_offsets(streaming_signal_capacity: int, local_expert_count: int) -> dict:
@@ -582,7 +582,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             m_tile = first_m_tile + claim_idx_in_batch % m_tile_count
             # A batch holds only ready M-tiles, so this returns at once.  It is here for its
             # acquire, which pairs the producer's release and makes the M-tile's rows visible.
-            _spin_until_at_least(streaming_signal_ptr(dynamic_state.counter_ptr) + m_tile, 0)
+            if const_expr(__import__("cudnn.gemm.cutedsl.grouped._sigdiag", fromlist=["diag"]).diag("NO_CLAIM_SPIN") != "1"):
+                _spin_until_at_least(streaming_signal_ptr(dynamic_state.counter_ptr) + m_tile, 0)
             linear_tile_idx = m_tile * n_tiles_per_m_tile + n_tile
         return linear_tile_idx
 

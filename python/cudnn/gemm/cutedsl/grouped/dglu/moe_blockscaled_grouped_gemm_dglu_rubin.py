@@ -77,6 +77,7 @@ from ..moe_streaming_input_block_tile_scheduler import (
     streaming_signal_workspace_bytes_after_counter,
 )
 from cudnn.frost.tile_dsl.consume import release_zero
+from .._sigdiag import diag as _diag
 from ..compact_sfa_sf_warp import CompactSfaSfWarpMixin, check_compact_sfa_options
 from ..moe_kernel_helpers import mbarrier_try_wait_parity_acquire_cluster
 
@@ -604,6 +605,8 @@ class BlockScaledMoEGroupedGemmDgluKernel(CompactSfaSfWarpMixin):
             self.generate_dbias,
             self.enable_breuse,
         )
+        if self.use_streaming_signal_sched and _diag("TILE_STAGES"):
+            self.num_tile_stage = int(_diag("TILE_STAGES"))
 
         # Compute A/B/D/Scale shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -2645,7 +2648,7 @@ class BlockScaledMoEGroupedGemmDgluKernel(CompactSfaSfWarpMixin):
                 tBgSFB_slice = tBgSFB[(None, slice_n, None, 0)]
 
                 # The producer wrote A and SFA through the generic proxy: order both before this tile's TMA loads.
-                if cutlass.const_expr(self.use_streaming_signal_sched):
+                if cutlass.const_expr(self.use_streaming_signal_sched and _diag("NO_PROXY_FENCE") != "1"):
                     cute.arch.fence_proxy("async.global")
 
                 # Peek (try_wait) AB buffer empty
