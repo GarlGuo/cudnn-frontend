@@ -143,6 +143,24 @@ def mbarrier_arrive_expect_tx_on_peer(
 # =============================================================================
 
 
+from cutlass.cute.typing import AddressSpace as _ClaimlogAS
+
+
+def _claimlog(claim, value):
+    """DIAGNOSTIC (wip/sigsched-claimlog-diag): with CLAIMLOG_ADDR (a device address, read at trace time) set, the
+    claiming lane writes ``buf[4 * claim:4 * claim + 4] = (value, %globaltimer_lo, cluster id, 1)``.  Unset: nothing."""
+    import os
+
+    addr = int(os.environ.get("CLAIMLOG_ADDR", "0"))
+    if addr == 0:
+        return
+    log = cute.make_tensor(cute.make_ptr(Int32, addr, _ClaimlogAS.gmem, assumed_align=16), cute.make_layout((1 << 22,)))
+    log[4 * claim] = value
+    log[4 * claim + 1] = cute.arch.globaltimer_lo()
+    log[4 * claim + 2] = cute.arch.cluster_idx()[0] + 8 * cute.arch.cluster_idx()[1] + 64 * cute.arch.cluster_idx()[2]
+    log[4 * claim + 3] = Int32(1)
+
+
 class MoEWorkTileInfo:
     """
     Work tile information for MoE scheduler.
@@ -879,6 +897,8 @@ class MoEPersistentTileScheduler:
                     mask=0xFFFFFFFF,
                     mask_and_clamp=31,
                 )
+                if lane_idx == 0:
+                    _claimlog(atomic_idx, atomic_idx)
 
                 if lane_idx < Int32(cluster_size):
                     store_i32_to_peer_cluster_smem_async(

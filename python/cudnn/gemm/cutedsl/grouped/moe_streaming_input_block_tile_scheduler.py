@@ -119,6 +119,24 @@ def streaming_signal_workspace_bytes_after_counter(streaming_signal_capacity: in
     return streaming_scheduler_state_offset(streaming_signal_capacity) - 4 + 4 * _state_region_offsets(streaming_signal_capacity, local_expert_count)["total"]
 
 
+from cutlass.cute.typing import AddressSpace as _ClaimlogAS
+
+
+def _claimlog(claim, value):
+    """DIAGNOSTIC (wip/sigsched-claimlog-diag): with CLAIMLOG_ADDR (a device address, read at trace time) set, the
+    claiming lane writes ``buf[4 * claim:4 * claim + 4] = (value, %globaltimer_lo, cluster id, 1)``.  Unset: nothing."""
+    import os
+
+    addr = int(os.environ.get("CLAIMLOG_ADDR", "0"))
+    if addr == 0:
+        return
+    log = cute.make_tensor(cute.make_ptr(Int32, addr, _ClaimlogAS.gmem, assumed_align=16), cute.make_layout((1 << 22,)))
+    log[4 * claim] = value
+    log[4 * claim + 1] = cute.arch.globaltimer_lo()
+    log[4 * claim + 2] = cute.arch.cluster_idx()[0] + 8 * cute.arch.cluster_idx()[1] + 64 * cute.arch.cluster_idx()[2]
+    log[4 * claim + 3] = Int32(1)
+
+
 @cute.jit
 def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     """Block, without bound, until ``*ptr >= floor`` and return it, acquiring the writer's earlier stores.
@@ -593,6 +611,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             # before its release of ``assigned_claim_count``, which the spin above acquired, so the producer's
             # release of the M tile's rows happens before this claim (causality order is transitive).
             linear_tile_idx = m_tile * n_tiles_per_m_tile + n_tile
+            if lane_idx == 0:
+                _claimlog(claim_idx, linear_tile_idx)
         return linear_tile_idx
 
     @cute.jit
