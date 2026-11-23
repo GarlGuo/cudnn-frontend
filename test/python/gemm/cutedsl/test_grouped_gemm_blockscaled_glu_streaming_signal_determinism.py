@@ -93,7 +93,9 @@ def test_mxfp8_glu_signal_replays_match_dynamic(variant, routing):
 
 @pytest.mark.L0
 @pytest.mark.parametrize(
-    "late, compact", [("a", False), ("sfa", False), ("sfa", True), ("sfa", "cta")], ids=["late_a", "late_sfa", "late_compact_sfa", "late_compact_sfa_cta_release"]
+    "late, compact",
+    [("a", False), ("sfa", False), ("sfa", True), ("sfa", "cta")],
+    ids=["late_a", "late_sfa", "late_compact_sfa", "late_compact_sfa_cta_release"],
 )
 def test_mxfp8_glu_producer_release_order_invariance(late, compact):
     """The GEMM starts while every M tile reads not-ready and the late operand holds NaN; a producer releases the tiles
