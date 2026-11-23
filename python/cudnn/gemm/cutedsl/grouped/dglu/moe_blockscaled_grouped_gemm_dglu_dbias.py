@@ -304,6 +304,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         launch_pdl_dependents_at_entry: bool = False,
         compact_sfa_sf_warp: bool = False,
         compact_sfa_cta_release: bool = False,
+        tight_sf_tmem_cols: bool = False,
+        stage_sfd_smem: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -450,6 +452,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         if reason is not None:
             raise ValueError(reason)
         self.compact_sfa_cta_release = compact_sfa_cta_release
+        self.tight_sf_tmem_cols = tight_sf_tmem_cols
+        self.stage_sfd_smem_requested = stage_sfd_smem
         # K tiles the SF warp stores per arrive round: one CTA-scope arrive each, or one cluster release per batch.
         self.sf_warp_release_batch = 1 if compact_sfa_cta_release else self.SF_WARP_RELEASE_BATCH
         self.device_layout = device_layout
@@ -591,6 +595,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
             self.occupancy,
             self.store_d_directly,
             self.generate_dbias,
+            # stage_sfd_smem's 4 KB stage (validated in __call__).
+            4096 if self.stage_sfd_smem_requested else 0,
         )
 
         # Compute A/B/D/Scale shared memory layout
@@ -659,7 +665,24 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            # The footprints of the SF TMEM layouts the MMA warp builds (what tcgen05.cp writes, every SF address an MMA
+            # of the K tile reads), not mma_inst_tile_k columns per 32 rows: MXFP8 at 256 x 256 takes 4 + 8 columns, 16
+            # with the granule, instead of 48.  The overlapping accumulator then overlaps the SF region by 16 columns
+            # and releases after the first epilogue subtile.
+            sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            )
+            sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+            )
+            self.num_sfa_tmem_cols = utils.compute_tmem_cols_from_layout(sfa_tmem_layout, self.sf_dtype)
+            self.num_sfb_tmem_cols = utils.compute_tmem_cols_from_layout(sfb_tmem_layout, self.sf_dtype)
+            # tcgen05.cp writes 4-column groups: SFB starts on one.
+            assert self.num_sfa_tmem_cols % 4 == 0, f"SFA's {self.num_sfa_tmem_cols} TMEM columns misalign SFB's tcgen05.cp"
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            self.num_sf_tmem_cols = -(-self.num_sf_tmem_cols // 16) * 16
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         )
@@ -667,6 +690,21 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         self.epi_tile_n_required = cute.size(self.epi_tile[1])
         # Only when overlapping_accum is enabled, we need to release accumulator buffer early in epilogue
         self.iter_acc_early_release_in_epilogue = (self.num_sf_tmem_cols + self.epi_tile_n_required - 1) // self.epi_tile_n_required - 1
+
+    def _stage_sfd_smem_supported(self, n_d) -> bool:
+        """stage_sfd_smem's conditions (host-side Python, not traced)."""
+        n_static = isinstance(n_d, int)
+        return (
+            self.generate_sfd
+            and self.sf_vec_size == 32
+            and self.discrete_col_sfd
+            and self.d_layout == LayoutEnum.ROW_MAJOR
+            and tuple(self.cta_tile_shape_mnk[:2]) == (128, 256)
+            and self.num_epilog_warps == 4
+            and self.glu_layout == "interleaved_32"
+            and n_static
+            and n_d % 512 == 0
+        )
 
     def get_desc_workspace_bytes(self) -> int:
         """Return descriptor workspace size in bytes."""
@@ -924,6 +962,15 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         # discrete_col_sfd is enabled via __init__, padded_offsets contains the same info as m_split_cumsum
         if cutlass.const_expr(self.generate_sfd == False):
             self.discrete_col_sfd = False
+        # stage_sfd_smem: a tile's E8M0 row and column SFD bytes (128 rows x 512 D columns: 4 row atoms, 4 column atoms)
+        # go to a 4 KB shared-memory stage in global byte order and leave as one 32-byte store per epilogue thread.
+        self.stage_sfd_smem = self.stage_sfd_smem_requested
+        stage_sfd_smem_ok = self._stage_sfd_smem_supported(n_d) if self.stage_sfd_smem else True
+        if cutlass.const_expr(self.stage_sfd_smem and not stage_sfd_smem_ok):
+            raise ValueError(
+                "stage_sfd_smem requires MXFP8 E4M3 D with row and discrete column SFD, row-major D, a 128 x 256 CTA tile, "
+                "the interleaved GLU layout and a static 2N % 512 == 0"
+            )
         if cutlass.const_expr(self.generate_sfd):
             output_sfd_shape = (m, n_d, l)
             sfd_layout = blockscaled_utils.tile_atom_to_shape_SF(output_sfd_shape, self.sf_vec_size)
@@ -1167,6 +1214,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                     128 * self.epi_tile[1] * 2 if self.generate_dbias else 1,
                 ],
                 128 if self.generate_dbias else 4,
+            ]
+            # stage_sfd_smem: a tile's E8M0 bytes, [0, 2048) the four row atoms, [2048, 4096) the four column atoms
+            sSFDStage: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 1024 if self.stage_sfd_smem else 0],
+                16,
             ]
 
         self.shared_storage = SharedStorage
@@ -3079,6 +3131,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
 
                 norm_const = cutlass.Float32(norm_const_tensor[0])
                 d_rcp_limits = get_dtype_rcp_limits(self.d_dtype)
+                if cutlass.const_expr(self.stage_sfd_smem):
+                    sSFDStage = storage.sSFDStage.get_tensor(cute.make_layout(1024))
+                    sSFDStage_u8 = cute.make_tensor(cute.recast_ptr(sSFDStage.iterator, dtype=cutlass.Uint8), cute.make_layout(4096))
 
             # Extension for per-expert domain conversion in epilogue
             epi_ext = self._make_extension(workspace_ptr)
@@ -3516,6 +3571,17 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                                     if paired_n < two_n:
                                         real_sfd_row[(mPosition, canonical_n, 0)] = tCrSFDRow[scale_slot]
                                         real_sfd_col[(mPosition - tidx % 32, canonical_n + tidx % 32, 0)] = tCrSFDCol[scale_slot]
+                            elif cutlass.const_expr(self.stage_sfd_smem):
+                                # Atom a = real_subtile_idx // 2 of the tile.  Row atom: this row's 4 scales are the word
+                                # at byte a*512 + (row%32)*16 + (row//32)*4; column atom: column c's scale over this warp's
+                                # 32 rows at byte 2048 + a*512 + (c%32)*16 + ((c//32)%4)*4 + warp.
+                                sf_lane = cute.arch.lane_idx()
+                                sf_warp = warp_idx % self.num_epilog_warps
+                                sf_atom = real_subtile_idx // 2
+                                sSFDStage[sf_atom * 128 + sf_lane * 4 + sf_warp] = cute.recast_tensor(tCrSFDRow, cutlass.Int32)[0]
+                                sf_col_bytes = cute.recast_tensor(tCrSFDCol, cutlass.Uint8)
+                                for sf_block in cutlass.range_constexpr(4):
+                                    sSFDStage_u8[2048 + sf_atom * 512 + sf_lane * 16 + sf_block * 4 + sf_warp] = sf_col_bytes[sf_block]
                             else:
                                 if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
                                     cute.autovec_copy(tCrSFDRow, tCgSFDRow)
@@ -3621,6 +3687,35 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
                                 )
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             d_pipeline.producer_commit()
+                    self.epilog_sync_barrier.arrive_and_wait()
+
+                if cutlass.const_expr(self.stage_sfd_smem):
+                    # The tile's staged bytes, 32 per epilogue thread: threads 0-63 the 4 row atoms (2 KB contiguous in the
+                    # global row SFD), 64-127 the 4 column atoms (512 B each in the expert's column SFD).
+                    self.epilog_sync_barrier.arrive_and_wait()
+                    sf_n_d = cute.size(mD_mnl, mode=[1])
+                    sf_local_row0 = (epi_work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape)) * self.mma_tiler[0] + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+                    sf_words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
+                    for word_idx in cutlass.range_constexpr(8):
+                        sf_words[word_idx] = sSFDStage[epi_tidx * 8 + word_idx]
+                    sf_addr = cutlass.Int64(0)
+                    if epi_tidx < 64:
+                        sf_addr = (
+                            mSFDRow_mnl.iterator.toint()
+                            + cutlass.Int64((epi_ext.token_offset + sf_local_row0) // 128) * (4 * sf_n_d)
+                            + cutlass.Int64(epi_work_tile_info.tile_n_idx * 2048 + epi_tidx * 32)
+                        )
+                    else:
+                        sf_thread_idx = epi_tidx - 64
+                        sf_addr = (
+                            mSFDCol_mnl.iterator.toint()
+                            + cutlass.Int64(epi_ext.token_offset) * (sf_n_d // 32)
+                            + cutlass.Int64(epi_work_tile_info.tile_n_idx * 4 + sf_thread_idx // 16) * (4 * epi_ext.tokens_i)
+                            + cutlass.Int64((sf_local_row0 // 128) * 512 + (sf_thread_idx % 16) * 32)
+                        )
+                    sf_dst = cute.make_tensor(cute.make_ptr(cutlass.Int32, sf_addr, AddressSpace.gmem, assumed_align=32), cute.make_layout(8))
+                    self.store_global_memory_256b(sf_dst, sf_words)
+                    # The stage is rewritten from the next tile's second subtile on: every thread's loads are stored first.
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 #
@@ -3970,6 +4065,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         occupancy: int,
         store_d_directly: bool,
         generate_dbias: bool = False,
+        epi_scratch_bytes: int = 0,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/D operands based on heuristics.
 
@@ -4074,7 +4170,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(CompactSfaSfWarpMixin):
         # dBias transpose buffer: (128, 64) column-major FP32 = 32 KB
         dbias_bytes = 128 * 64 * cute.size_in_bytes(cutlass.Float32, cute.make_layout((1,))) if generate_dbias else 0
         # Epilogue bytes
-        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes
+        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes + epi_scratch_bytes
 
         # Calculate A/B stages:
         # Start with total smem per CTA (capacity / occupancy)
