@@ -1,0 +1,125 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileContributor: Wentao Guo, Phuong Nguyen
+
+"""
+MoE BF16 Grouped GEMM + GLU Kernel for Hopper (SM90).
+
+The SM90 counterpart of moe_grouped_gemm_glu_bias.py: the SM90 grouped GEMM with a fused
+SwiGLU / GeGLU epilogue. B and C keep the interleaved 32-column gate/up blocks
+(``glu_layout="interleaved_32"``); D has half of C's columns.
+
+Supports:
+    - Dynamic persistent tile scheduling only, dense K-major weights, no bias
+    - Routing-probability (prob) fusion and optional pre-activation C output (generate_c)
+"""
+
+from typing import Optional, Tuple, Type
+
+import cuda.bindings.driver as cuda
+
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.typing import Int32
+
+from ..moe_utils import MoEWeightMode
+from ..unfused.moe_grouped_gemm_sm90 import MoEGroupedGemmBf16KernelSm90
+
+
+class MoEGroupedGemmGluBf16KernelSm90(MoEGroupedGemmBf16KernelSm90):
+    """BF16 grouped GEMM with a fused GLU for Hopper; takes the SM100 GLU kernel's arguments.
+
+    :param act_func: "swiglu" or "geglu".
+    :param glu_layout: Must be "interleaved_32".
+    """
+
+    def __init__(
+        self,
+        acc_dtype: Type[cutlass.Numeric],
+        use_2cta_instrs: bool,
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
+        vectorized_f32: bool,
+        generate_c: bool,
+        enable_bias: bool,
+        expert_cnt: int,
+        weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
+        use_dynamic_sched: bool = True,
+        act_func: str = "swiglu",
+        glu_layout: str = "interleaved_32",
+    ):
+        if act_func not in ("swiglu", "geglu"):
+            raise ValueError(f"act_func must be 'swiglu' or 'geglu', got {act_func!r}")
+        if glu_layout != "interleaved_32":
+            raise ValueError(f"SM90 GLU supports glu_layout='interleaved_32' only, got {glu_layout!r}")
+        super().__init__(
+            acc_dtype,
+            use_2cta_instrs,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            vectorized_f32,
+            generate_c,
+            enable_bias,
+            expert_cnt,
+            weight_mode,
+            use_dynamic_sched,
+            act_func=act_func,
+        )
+        self.glu_layout = glu_layout
+
+    @staticmethod
+    def can_implement(
+        ab_dtype: Type[cutlass.Numeric],
+        c_dtype: Type[cutlass.Numeric],
+        d_dtype: Type[cutlass.Numeric],
+        acc_dtype: Type[cutlass.Numeric],
+        use_2cta_instrs: bool,
+        mma_tiler_mn: Tuple[int, int],
+        cluster_shape_mn: Tuple[int, int],
+        m: int,
+        n: int,
+        k: int,
+        l: int,
+        a_major: str,
+        b_major: str,
+        cd_major: str,
+        m_aligned: int,
+    ) -> bool:
+        # C carries the accumulator's N, D half of it: both must fit the base kernel's rules.
+        return (
+            b_major == "k"
+            and mma_tiler_mn[1] % 64 == 0
+            and n % 64 == 0
+            and MoEGroupedGemmBf16KernelSm90.can_implement(
+                ab_dtype, c_dtype, d_dtype, acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m, n, k, l, a_major, b_major, cd_major, m_aligned
+            )
+            and MoEGroupedGemmBf16KernelSm90.can_implement(
+                ab_dtype, c_dtype, d_dtype, acc_dtype, use_2cta_instrs, mma_tiler_mn, cluster_shape_mn, m, n // 2, k, l, a_major, b_major, cd_major, m_aligned
+            )
+        )
+
+    @cute.jit
+    def __call__(
+        self,
+        a: cute.Tensor,
+        b: cute.Tensor,
+        n: Int32,
+        k: Int32,
+        b_stride_size: cutlass.Int64,
+        b_major_mode: cutlass.Constexpr,
+        workspace_ptr,
+        c: cute.Tensor,
+        d: cute.Tensor,
+        padded_offsets: cute.Tensor,
+        alpha: cute.Tensor,
+        prob: cute.Tensor,
+        bias: Optional[cute.Tensor],
+        max_active_clusters: cutlass.Constexpr,
+        stream: cuda.CUstream,
+        linear_offset: cutlass.Float32 = 0.0,
+    ):
+        """Execute the GEMM; ``prob`` comes before ``bias`` as in the SM100 GLU kernel.
+
+        ``n``, ``k``, ``b_stride_size`` and ``bias`` are unused; ``linear_offset`` is the GeGLU up offset.
+        """
+        self._launch(a, b, b_major_mode, workspace_ptr, c, d, padded_offsets, alpha, prob, max_active_clusters, stream, linear_offset)

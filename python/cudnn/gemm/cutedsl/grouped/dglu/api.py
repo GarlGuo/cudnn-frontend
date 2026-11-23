@@ -90,6 +90,13 @@ from ._bf16_api import GroupedGemmDgluBf16API
 from ._blockscaled_api import GroupedGemmDgluBlockScaledAPI
 
 
+def _default_mma_tiler(mma_tiler_mn: Optional[Tuple[int, int]]) -> Tuple[int, int]:
+    """The CTA tile when the caller gives none: (128, 256) on SM90 (Hopper kernel), else (256, 256)."""
+    if mma_tiler_mn is not None:
+        return tuple(mma_tiler_mn)
+    return (128, 256) if get_device_type() == "hopper" else (256, 256)
+
+
 @dataclass(frozen=True)
 class DgluCall:
     """Immutable normalized input for dGLU dispatch, allocation, and caching."""
@@ -206,7 +213,7 @@ class GroupedGemmDgluSm100(APIBase):
         sample_amax: Optional[torch.Tensor] = None,
         sample_norm_const: Optional[torch.Tensor] = None,
         acc_dtype: Optional[torch.dtype] = None,
-        mma_tiler_mn: Tuple[int, int] = (256, 256),
+        mma_tiler_mn: Optional[Tuple[int, int]] = None,
         cluster_shape_mn: Optional[Tuple[int, int]] = None,
         sf_vec_size: int = 16,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -240,6 +247,7 @@ class GroupedGemmDgluSm100(APIBase):
             raise ValueError(f"Unsupported tensor framework '{framework}' for GroupedGemmDgluSm100; pass torch tensors or JAX arrays")
         if acc_dtype is None:
             self._pending_init_kwargs["acc_dtype"] = cutlass.Float32
+        self._pending_init_kwargs["mma_tiler_mn"] = _default_mma_tiler(mma_tiler_mn)
         self._implementation = None
 
     def check_support(self) -> bool:
@@ -1143,8 +1151,8 @@ def _normalize_dglu_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     capability = major * 10 + minor
-    if not has_tcgen05(major):
-        raise RuntimeError(f"GroupedGemmDgluSm100 requires SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
+    if not (has_tcgen05(major) or capability == 90):
+        raise RuntimeError(f"GroupedGemmDgluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
     return normalized, backend
 
 
@@ -1367,7 +1375,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     acc_dtype: Optional[torch.dtype] = None,
     d_dtype: Optional[torch.dtype] = None,
     cd_major: str = "n",
-    mma_tiler_mn: Tuple[int, int] = (256, 256),
+    mma_tiler_mn: Optional[Tuple[int, int]] = None,
     cluster_shape_mn: Optional[Tuple[int, int]] = None,
     sf_vec_size: int = 16,
     sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
@@ -1399,6 +1407,7 @@ def grouped_gemm_dglu_wrapper_sm100(
     the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
     """
     validate_glu_layout(glu_layout)
+    mma_tiler_mn = _default_mma_tiler(mma_tiler_mn)
     if glu_layout == "gate_then_up":
         # Validate before both wrapper memo and dynamic-plan cache hits.
         n_weight = b_nkl(b_tensor, b_major)[0] if b_tensor is not None else n
@@ -1410,6 +1419,8 @@ def grouped_gemm_dglu_wrapper_sm100(
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_dglu_jax_sm100
 
+        if get_device_type() == "hopper":
+            raise NotImplementedError("SM90 grouped GEMM dGLU supports torch tensors only")
         check_jax_wrapper_options(
             acc_dtype=acc_dtype,
             cd_major=cd_major,
