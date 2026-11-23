@@ -208,10 +208,10 @@ GLU kernel (not yet the Rubin twin) takes `sfa` as those rows and builds the ato
 
 | Item | Contract |
 |---|---|
-| SFA | Compact E8M0 rows `[M, K / 32]` (row r = A row r's scales, K order), MXFP8 only, `K % 512 == 0`. |
+| SFA | Compact E8M0 rows `[M, K / 32]` (row r = A row r's scales, K order), MXFP8 only, `K % 512 == 0`, at least 4 A/B stages. |
 | M tile t | A rows and compact SFA rows `[256 t, 256 (t + 1))`: the contiguous bytes `[t * 256 * K / 32, (t + 1) * 256 * K / 32)`. |
 | producer | Writes both, padding rows included, before the release store of `signal[t]`. |
-| GEMM | A dedicated SF warp (the last warp) reads each tile's rows with L2-only loads (`ld.global.cg`, 64-bit row index) after the tile's acquire, and stores each row's 4-scale word into the stage's atom. It does `fence.proxy.async.shared::cta` before and after the stores, then `fence.release.cluster` and an arrive on the MMA leader's full barrier; the MMA warp acquires it at cluster scope. The TMA warp loads no SFA. |
+| GEMM | A dedicated SF warp (the last warp) reads each tile's rows with L2-only loads (`ld.global.cg`, 64-bit row index) after the tile's acquire, and stores each row's 4-scale word into the stage's atom. Per group of 4 K tiles it waits for the 4 stages, does `fence.proxy.async.shared::cta` before and after the stores, then one `fence.release.cluster` and 4 relaxed cluster arrives on the MMA leader's full barriers; the MMA warp acquires them at cluster scope. The TMA warp loads no SFA. |
 | other | As stock SFA; cluster (2, 1) with the 2-CTA MMA and the interleaved GLU layout. With every option off the generated code is unchanged. |
 
 ## 5. Programmatic dependent launch (PDL) options
