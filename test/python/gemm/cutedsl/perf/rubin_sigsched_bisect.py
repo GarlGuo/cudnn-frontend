@@ -44,6 +44,16 @@ for _role in "0123":
     VARIANTS[f"stock_log{_role}"] = (False, {"TILELOG_ROLES": _role, "TILELOG_ADDR": "@"})
     VARIANTS[f"signal_log{_role}"] = (True, {"TILELOG_ROLES": _role, "TILELOG_ADDR": "@"})
 VARIANTS["signal_log_all"] = (True, {"TILELOG_ADDR": "@"})
+# Which part of the role-3 log removes the gap (no log): a delay, a returning atomic, a plain store, a full store drain.
+for _name, _env in (
+    ("epi_sleep1000", {"SIGDIAG_EPI_SLEEP": "1000"}),
+    ("epi_sleep3000", {"SIGDIAG_EPI_SLEEP": "3000"}),
+    ("epi_atomic", {"SIGDIAG_EPI_ATOMIC": "1", "TILELOG_SCRATCH": "@"}),
+    ("epi_store", {"SIGDIAG_EPI_STORE": "1", "TILELOG_SCRATCH": "@"}),
+    ("epi_waitall", {"SIGDIAG_EPI_WAITALL": "1"}),
+):
+    VARIANTS[f"signal_{_name}"] = (True, _env)
+    VARIANTS[f"stock_{_name}"] = (False, _env)
 KNOBS = (
     "SIGDIAG_STOCK_SCHED",
     "SIGDIAG_HYBRID_CLAIM",
@@ -52,6 +62,11 @@ KNOBS = (
     "SIGDIAG_STOCK_FINALIZE",
     "TILELOG_ADDR",
     "TILELOG_ROLES",
+    "TILELOG_SCRATCH",
+    "SIGDIAG_EPI_SLEEP",
+    "SIGDIAG_EPI_ATOMIC",
+    "SIGDIAG_EPI_STORE",
+    "SIGDIAG_EPI_WAITALL",
 )
 LOG = None  # the device log every logging variant writes (its address is baked into the kernel)
 
@@ -98,7 +113,7 @@ def bisect(shapes):
         problem = bs.make_problem([rows] * experts, 2 * inter, hidden, seed=0)
         for name in VARIANTS:
             run = build(shape, name, problem)
-            if "TILELOG_ADDR" in VARIANTS[name][1]:
+            if "TILELOG_ADDR" in VARIANTS[name][1] or "TILELOG_SCRATCH" in VARIANTS[name][1]:
                 log_buffer().zero_()
             launch(problem, run)
             print(f"NCU_ORDER glu {shape} {name}", flush=True)

@@ -13,6 +13,10 @@ signal scheduler's Rubin overhead.  Every knob is read at trace time; unset, not
       (role 1) adds [9:16] its coordinates: expert, MMA tile m, MMA tile n, the A tensor's base coordinates (2), the B tensor's
       (1), CTA rank in the cluster.  TILELOG_ROLES=<subset of 0123> logs only those roles (0 scheduler, 1 TMA, 2 MMA,
       3 epilogue).
+  SIGDIAG_EPI_SLEEP=<ns> / SIGDIAG_EPI_ATOMIC=1 / SIGDIAG_EPI_STORE=1 / SIGDIAG_EPI_WAITALL=1: at the epilogue's tile end (the
+      TILELOG role-3 point), epilogue warp 0: a nanosleep / a returning gmem atomic whose result is used (address:
+      TILELOG_SCRATCH) / a plain gmem store (TILELOG_SCRATCH) / cp.async.bulk.wait_group 0 (every D/C store complete,
+      not only read).  Which part of the role-3 log removes the Rubin gap.
   SIGDIAG_NO_FINALIZE=1   a signal-scheduler build without the final cluster barrier (internal_finalize)
   SIGDIAG_STOCK_FINALIZE=1  with SIGDIAG_STOCK_SCHED: add that cluster barrier to the stock scheduler
 """
@@ -74,3 +78,29 @@ def coord_words(iterator, count: int):
     walk(iterator)
     words = [Int32(x) for x in flat[:count]]
     return words + [Int32(0)] * (count - len(words))
+
+
+def epi_tile_end_knobs_on() -> bool:
+    return any(os.environ.get(k, "0") not in ("", "0") for k in ("SIGDIAG_EPI_SLEEP", "SIGDIAG_EPI_ATOMIC", "SIGDIAG_EPI_STORE", "SIGDIAG_EPI_WAITALL"))
+
+
+def epi_tile_end():
+    """One thread of epilogue warp 0 at the tile end (see the module docstring)."""
+    from cutlass._mlir.dialects import nvvm
+
+    ns = int(os.environ.get("SIGDIAG_EPI_SLEEP", "0"))
+    if ns > 0:
+        nvvm.nanosleep(Int32(ns).ir_value())
+    scratch = int(os.environ.get("TILELOG_SCRATCH", "0"))
+    if knob("SIGDIAG_EPI_ATOMIC") and scratch:
+        from .moe_persistent_scheduler import atomic_add_i32
+
+        base = cute.make_ptr(Int32, scratch, AddressSpace.gmem, assumed_align=16)
+        old = atomic_add_i32(base.llvm_ptr, Int32(1))
+        log = cute.make_tensor(base + 64, cute.make_layout((1 << 16,)))
+        log[old & 0xFFFF] = Int32(1)  # uses the atomic's result, as the role-3 log does
+    if knob("SIGDIAG_EPI_STORE") and scratch:
+        log = cute.make_tensor(cute.make_ptr(Int32, scratch, AddressSpace.gmem, assumed_align=16) + 128, cute.make_layout((1,)))
+        log[0] = cute.arch.globaltimer_lo()
+    if knob("SIGDIAG_EPI_WAITALL"):
+        cute.arch.cp_async_bulk_wait_group(0, read=False)

@@ -3292,6 +3292,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                     if warp_idx == self.epilog_warp_id[0]:
                         with cute.arch.elect_one():
                             _sigdiag.tilelog(3)
+                if cutlass.const_expr(_sigdiag.epi_tile_end_knobs_on()):
+                    if warp_idx == self.epilog_warp_id[0]:
+                        with cute.arch.elect_one():
+                            _sigdiag.epi_tile_end()
                 #
                 # Advance to next tile
                 #
