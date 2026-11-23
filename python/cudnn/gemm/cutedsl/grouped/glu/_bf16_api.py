@@ -14,7 +14,7 @@ from cuda.bindings import driver as cuda
 from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
+from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
@@ -26,6 +26,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -38,7 +39,7 @@ from ..moe_utils import MoEWeightMode
 from ..glu_layout import validate_glu_layout
 from .moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
 from .moe_grouped_gemm_glu_sm90 import MoEGroupedGemmGluBf16KernelSm90
-from ..unfused.moe_grouped_gemm_sm90 import check_pingpong_tile, sm90_default_mma_tiler, sm90_schedule_is_pingpong
+from ..unfused.moe_grouped_gemm_sm90 import check_pingpong_tile, default_mma_tiler, use_pingpong
 
 
 def _output_dtypes():
@@ -124,11 +125,12 @@ class GroupedGemmGluBf16API(APIBase):
         self.b_dtype = _convert_to_cutlass_data_type(b_dtype) if b_dtype is not None else self.b_desc.dtype
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: tile M <= 128, a (2, 1) cluster by default and the dynamic scheduler always.
-        self._is_sm90 = is_sm90_device()
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        self._is_sm90 = has_wgmma(major)
         # The SM90 schedule comes from the GEMM's (N, K) and the tile: N is the pre-activation 2I (B is (2I, K, experts)).
         dense_b = self.b_desc is not None and self.b_desc.ndim == 3
-        self._pingpong = self._is_sm90 and dense_b and sm90_schedule_is_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, generate_c, cluster_shape_mn)
-        self.mma_tiler_mn = tuple(mma_tiler_mn or (sm90_default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
+        self._pingpong = self._is_sm90 and dense_b and use_pingpong(*self.b_desc.shape[:2], mma_tiler_mn, cluster_shape_mn, generate_c)
+        self.mma_tiler_mn = tuple(mma_tiler_mn or (default_mma_tiler(self._pingpong) if self._is_sm90 else (256, 256)))
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
         self.cluster_shape_mn = tuple(cluster_shape_mn or ((2, 1) if self.use_2cta_instrs or self._is_sm90 else (1, 1)))
         self.vector_f32 = vector_f32
@@ -137,7 +139,8 @@ class GroupedGemmGluBf16API(APIBase):
         self.glu_layout = validate_glu_layout(glu_layout)
         self.act_func = act_func
         self.b_major = b_major
-        self.use_dynamic_sched = use_dynamic_sched or self._is_sm90
+        # SM90's only scheduler is the dynamic one (the gmem atomic-counter claim), so it is the default there.
+        self.use_dynamic_sched = True if self._is_sm90 else use_dynamic_sched
         self._has_bias = self.bias_desc is not None
         self._kernel = MoEGroupedGemmGluBf16KernelSm90 if self._is_sm90 else MoEGroupedGemmGluBiasBf16Kernel
         self._workspace: Optional[torch.Tensor] = None
@@ -316,7 +319,7 @@ class GroupedGemmGluBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         compute_capability = major * 10 + minor
-        if not (has_tcgen05(major) or compute_capability == 90):
+        if not (has_tcgen05(major) or has_wgmma(major)):
             raise RuntimeError(f"GroupedGemmGluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
         if self.glu_layout == "gate_then_up":

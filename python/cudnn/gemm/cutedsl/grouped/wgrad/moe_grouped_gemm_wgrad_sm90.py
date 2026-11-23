@@ -44,12 +44,12 @@ from ..moe_persistent_scheduler import (
 )
 from ..moe_utils import MoEWeightMode, TensormapWorkspace, WGradInputOrder
 from ..moe_sched_extension import WgradGemmSchedExtension
-from ..unfused.moe_grouped_gemm_sm90 import sm90_pick_pingpong, sm90_pingpong_config_error
+from ..unfused.moe_grouped_gemm_sm90 import apply_schedule_override, pingpong_config_error
 
 
-def sm90_wgrad_schedule_is_pingpong(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]] = None) -> bool:
-    """The wgrad schedule: pingpong for output N >= 2048 (s6 H100 sweep) where tile and cluster allow it, or the forced one."""
-    return sm90_pick_pingpong(n >= 2048, sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
+def use_pingpong_wgrad(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
+    """The override, else pingpong for output N >= 2048 (s6 H100 sweep) on the 128x192 / (2, 1) configuration only."""
+    return apply_schedule_override(n >= 2048 and pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
 
 
 class MoEGroupedGemmWgradBF16KernelSm90:
@@ -121,7 +121,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
             and all(k >= 0 and k % MoEGroupedGemmWgradBF16KernelSm90.FIX_PAD_SIZE == 0 for k in group_k_list)
             and tile_m in (64, 128)
             and tile_n in range(32, 257, 32)
-            and (not pingpong or sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
+            and (not pingpong or pingpong_config_error(mma_tiler_mn, cluster_shape_mn) is None)
             and is_power_of_2(cluster_m)
             and is_power_of_2(cluster_n)
             and cluster_m * cluster_n <= 8
@@ -153,7 +153,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
         self.weight_mode = weight_mode
         self.input_order = input_order
 
-        pingpong_error = sm90_pingpong_config_error(mma_tiler_mn, cluster_shape_mn) if pingpong else None
+        pingpong_error = pingpong_config_error(mma_tiler_mn, cluster_shape_mn) if pingpong else None
         if pingpong_error is not None:
             raise ValueError(f"SM90 wgrad: {pingpong_error}")
         self.pingpong = pingpong

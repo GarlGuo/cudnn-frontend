@@ -20,6 +20,7 @@ from cudnn.tensor_adapter import (
     detect_framework,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -27,7 +28,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from .moe_grouped_gemm_sm90 import sm90_forced_schedule
+from .moe_grouped_gemm_sm90 import schedule_override
 from ..backend_utils import row_major_layout
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
@@ -247,7 +248,7 @@ def _normalize_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     compute_capability = major * 10 + minor
-    if not (has_tcgen05(major) or major == 9):
+    if not (has_tcgen05(major) or has_wgmma(major)):
         raise RuntimeError(f"GroupedGemmSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{compute_capability}")
 
     tensor_m, k = a_shape[:2]
@@ -349,7 +350,7 @@ def grouped_gemm_wrapper_sm100(
         generate_c,
         use_dynamic_sched,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
-        sm90_forced_schedule(),
+        schedule_override(),
     )
     memo = _wrapper_memo.get(_memo_key)
     if memo is not None:
@@ -461,7 +462,7 @@ def grouped_gemm_wrapper_sm100(
         overlap_margin,
         workspace_signature,
         # The SM90 schedule is a function of the shapes and tile above plus the forced one.
-        sm90_forced_schedule(),
+        schedule_override(),
     )
 
     op = _cache_of_GroupedGemmSm100Objects.get(cache_key)

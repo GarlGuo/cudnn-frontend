@@ -55,6 +55,7 @@ from cudnn.tensor_adapter import (
     framework_dtype,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_device,
     get_shape,
     get_strides,
@@ -94,7 +95,8 @@ def _default_mma_tiler(mma_tiler_mn: Optional[Tuple[int, int]]) -> Tuple[int, in
     """The CTA tile when the caller gives none: (128, 256) on SM90 (Hopper kernel), else (256, 256)."""
     if mma_tiler_mn is not None:
         return tuple(mma_tiler_mn)
-    return (128, 256) if get_device_type() == "hopper" else (256, 256)
+    major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+    return (128, 256) if has_wgmma(major) else (256, 256)
 
 
 @dataclass(frozen=True)
@@ -1151,7 +1153,7 @@ def _normalize_dglu_call(
         raise RuntimeError("CUDA is not available")
     major, minor = get_compute_capability()
     capability = major * 10 + minor
-    if not (has_tcgen05(major) or capability == 90):
+    if not (has_tcgen05(major) or has_wgmma(major)):
         raise RuntimeError(f"GroupedGemmDgluSm100 requires SM90, or SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
     return normalized, backend
 
@@ -1419,7 +1421,8 @@ def grouped_gemm_dglu_wrapper_sm100(
         from ..canonical_jax import check_jax_wrapper_options
         from .jax_api import grouped_gemm_dglu_jax_sm100
 
-        if get_device_type() == "hopper":
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        if has_wgmma(major):
             raise NotImplementedError("SM90 grouped GEMM dGLU supports torch tensors only")
         check_jax_wrapper_options(
             acc_dtype=acc_dtype,

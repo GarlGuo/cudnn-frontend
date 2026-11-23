@@ -13,7 +13,7 @@ import cutlass.cute as cute
 from cuda.bindings import driver as cuda
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
-from cudnn.api_base import APIBase, TensorDesc, is_sm90_device
+from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
@@ -26,6 +26,7 @@ from cudnn.tensor_adapter import (
     framework_dtype,
     get_compute_capability,
     has_tcgen05,
+    has_wgmma,
     get_data_ptr,
     get_device,
     get_shape,
@@ -37,8 +38,8 @@ from ..backend_utils import _torch_stream_context, debug_validate_offsets, debug
 from ..canonical import validate_once
 from ..moe_utils import MoEWeightMode, WGradInputOrder
 from .moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
-from ..unfused.moe_grouped_gemm_sm90 import sm90_pingpong_config_error
-from .moe_grouped_gemm_wgrad_sm90 import MoEGroupedGemmWgradBF16KernelSm90, sm90_wgrad_schedule_is_pingpong
+from ..unfused.moe_grouped_gemm_sm90 import pingpong_config_error
+from .moe_grouped_gemm_wgrad_sm90 import MoEGroupedGemmWgradBF16KernelSm90, use_pingpong_wgrad
 
 
 def _output_dtypes():
@@ -105,9 +106,10 @@ class GroupedGemmWgradBf16API(APIBase):
 
         self.acc_dtype = _convert_to_cutlass_data_type(acc_dtype)
         # SM90 runs the Hopper kernel: tile M <= 128 and a (2, 1) cluster by default.
-        self._is_sm90 = is_sm90_device()
+        major, _ = get_compute_capability() if cuda_is_available() else (0, 0)
+        self._is_sm90 = has_wgmma(major)
         # The SM90 schedule comes from the output N (wgrad_shape is (M, N)) and the tile.
-        self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and sm90_wgrad_schedule_is_pingpong(self.wgrad_shape[1], mma_tiler_mn, cluster_shape_mn)
+        self.pingpong = self._is_sm90 and len(self.wgrad_shape) == 2 and use_pingpong_wgrad(self.wgrad_shape[1], mma_tiler_mn, cluster_shape_mn)
         default_tile = ((128, 192) if self.pingpong else (128, 256)) if self._is_sm90 else (256, 256)
         self.mma_tiler_mn = tuple(mma_tiler_mn or default_tile)
         self.use_2cta_instrs = self.mma_tiler_mn[0] == 256
@@ -255,7 +257,7 @@ class GroupedGemmWgradBf16API(APIBase):
         # Per-expert token counts are device data (Rule 3); can_implement gets a split with the right total.
         groups = [tokens_sum] + [0] * (self.expert_cnt - 1)
 
-        pingpong_error = sm90_pingpong_config_error(self.mma_tiler_mn, self.cluster_shape_mn) if self.pingpong else None
+        pingpong_error = pingpong_config_error(self.mma_tiler_mn, self.cluster_shape_mn) if self.pingpong else None
         if pingpong_error is not None:
             raise ValueError(f"SM90 wgrad: {pingpong_error}")
         if not self._kernel.can_implement(
@@ -280,7 +282,7 @@ class GroupedGemmWgradBf16API(APIBase):
             raise RuntimeError("CUDA is not available")
         major, minor = get_compute_capability()
         capability = major * 10 + minor
-        if not (has_tcgen05(major) or capability == 90):
+        if not (has_tcgen05(major) or has_wgmma(major)):
             raise RuntimeError(f"GroupedGemmWgradSm100 requires SM90 or SM100+ with tcgen05 (not cc 12.x), found SM{capability}")
         self._is_supported = True
         return True

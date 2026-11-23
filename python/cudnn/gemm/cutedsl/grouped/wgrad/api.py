@@ -77,7 +77,7 @@ def get_grouped_gemm_wgrad_workspace_size_sm100(
 
 
 from ._bf16_api import GroupedGemmWgradBf16API
-from ..unfused.moe_grouped_gemm_sm90 import sm90_forced_schedule
+from ..unfused.moe_grouped_gemm_sm90 import schedule_override
 from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
@@ -373,7 +373,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         accumulate_on_output,
         input_order,
         os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"),
-        sm90_forced_schedule(),
+        schedule_override(),
     )
     memo = _wgrad_wrapper_memo.get(memo_key)
     if memo is not None:
@@ -461,7 +461,7 @@ def grouped_gemm_wgrad_wrapper_sm100(
         input_order,
         int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0")),
         # The SM90 schedule is a function of the shapes and tile above plus the forced one.
-        sm90_forced_schedule(),
+        schedule_override(),
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:
