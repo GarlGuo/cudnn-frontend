@@ -445,14 +445,15 @@ op.execute(
 )
 ```
 
-`use_dynamic_sched=False` uses static scheduling; `True` caches a dynamic-M
-callable for compatible shapes. Each BF16 wrapper call allocates its scheduler
-counter and discrete-mode tensor maps on the launch stream, so same-signature
-calls may overlap on different streams; a class-API object keeps one internal
-workspace, so do not overlap its `execute()` calls on different streams. Cache
-keys include compile-sensitive layouts, dtypes, features, activation,
-scheduler, tile/cluster, output policy, and overlap margin, but not the runtime
-GeGLU `linear_offset`.
+The wrapper's default `use_dynamic_sched=None` selects the dynamic scheduler for
+BF16 and keeps block-scaled inputs static; `False` selects static scheduling.
+Either caches a dynamic-M callable for compatible shapes. Each BF16 wrapper
+call allocates its scheduler counter and discrete-mode tensor maps on the
+launch stream, so same-signature calls may overlap on different streams; a
+class-API object keeps one internal workspace, so do not overlap its
+`execute()` calls on different streams. Cache keys include compile-sensitive
+layouts, dtypes, features, activation, scheduler, tile/cluster, output policy,
+and overlap margin, but not the runtime GeGLU `linear_offset`.
 
 ### Block-scaled
 

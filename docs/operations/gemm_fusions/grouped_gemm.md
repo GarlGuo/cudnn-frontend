@@ -162,12 +162,12 @@ For a discrete class instance, replace `sample_b` with
 
 ## Scheduling, caching, and errors
 
-- `use_dynamic_sched=False` uses the static scheduler.
-- `use_dynamic_sched=True` compiles a dynamic-M callable and reuses it for
-  compatible M values; discrete mode also allocates the per-expert tensor-map
-  workspace. Wrapper cache keys retain dtype, layout, expert count, optional
-  features, scheduler choice, output policy, tile/cluster shape, and overlap
-  margin.
+- The wrapper defaults to `use_dynamic_sched=True`, the dynamic scheduler;
+  `use_dynamic_sched=False` selects the static one. Both reuse one dynamic-M
+  callable for compatible M values; discrete mode also allocates the
+  per-expert tensor-map workspace.
+- Wrapper cache keys retain dtype, layout, expert count, optional features,
+  scheduler choice, output policy, tile/cluster shape, and overlap margin.
 - Each wrapper call allocates its scheduler counter and discrete-mode tensor
   maps on the launch stream, so same-signature calls may overlap on different
   streams. A class-API object keeps one internal workspace; do not overlap its
