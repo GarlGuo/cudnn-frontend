@@ -11,8 +11,9 @@ memory: the readiness signals.
 | GEMM → consumer | `streaming_output_notify=StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, ...)` | producer | one N chunk of D columns | `MoEStreamingOutputChunkSignalTileScheduler` |
 
 Kernels: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`,
-input direction only), BF16 on SM100-class GPUs. Both directions need `use_dynamic_sched=True`. Every option is off by
-default; with the defaults the generated code is the same as without this feature.
+input direction only), BF16 on SM100-class GPUs; the input direction also on the block-scaled GLU kernel (section 4a).
+Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is
+the same as without this feature.
 
 ## 1. Input direction: producer → GEMM
 
@@ -164,13 +165,28 @@ routing.
 - A GEMM with no rows (`padded_offsets[E-1] == 0`) exits before publishing anything. The consumer must not wait on
   `signal[]` when it received no rows.
 
+## 4a. Input direction on the block-scaled GLU and dGLU kernels
+
+The MXFP8 / NVFP4 block-scaled GLU kernel `BlockScaledMoEGroupedGemmGluBiasKernel` (`glu/`, FC1 forward, SM100) takes
+the BF16 GLU kernel's input-direction options: `streaming_signal_capacity`, `device_layout`, `use_pdl` and
+`launch_pdl_dependents_at_all_streaming_signal_slots_ready`. Sections 1 and 2 hold unchanged, and `signal[t]` also covers
+M tile t's scale factors:
+
+| Item | Contract |
+|---|---|
+| SFA | Swizzled SF atoms (the kernel's stock `sfa` layout): 128 rows x 4 scales per 512-byte atom, the K atoms of a 128-row block contiguous, block after block. |
+| M tile t | A rows `[256 t, 256 (t + 1))` and SFA atom rows 2t and 2t + 1: the contiguous bytes `[t * 256 * Kc, (t + 1) * 256 * Kc)`, `Kc = round_up(ceil(K / sf_vec_size), 4)`. |
+| producer | Writes both, padding rows and padding scale columns included, before the release store of `signal[t]` (section 1, memory ordering). |
+| GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
+| other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA. |
+
 ## 4. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |
 |---|---|---|
 | `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). | The GEMM runs beside its producer on one stream. |
 | `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
-| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernel, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
+| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernels, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
 
 ## 5. Sketches
 
@@ -229,8 +245,9 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - `streaming_signal_capacity` and `N_CHUNK` cannot be combined in one kernel; both need `use_dynamic_sched=True`.
 - N must be known at build time (dense B).
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
-  exists on the GLU kernel only and requires `streaming_signal_capacity`.
-- Covered today: the BF16 plain and GLU grouped GEMM forward kernels. Other recipes are not wired up yet.
+  exists on the GLU kernels only and requires `streaming_signal_capacity`.
+- Covered today: the BF16 plain and GLU grouped GEMM forward kernels, and the input direction on the block-scaled GLU
+  forward kernel (section 4a). Other recipes are not wired up yet.
 
 ## Acknowledgements
 

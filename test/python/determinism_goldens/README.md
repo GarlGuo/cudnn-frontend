@@ -1001,6 +1001,7 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` | `MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel` with `streaming_signal_capacity` (host / device layout, PDL) or `streaming_output_notify=N_CHUNK` | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
+| `gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py` | `BlockScaledMoEGroupedGemmGluBiasKernel` (SM100), MXFP8 SwiGLU, with `streaming_signal_capacity` (host / device layout, PDL trigger) | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
 | `gemm/cutedsl/test_grouped_gemm_dglu_bf16_determinism.py` | `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel with `deterministic=True` | — | dprob and D_row: replay under concurrent work (both activations, dense/discrete, static/dynamic scheduler, ragged and empty experts), expert reorder, duplicate and neighbor isolation in both GLU orders; launch-stream ordering; D_row equal to the atomic path |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
@@ -2630,6 +2631,32 @@ the strict 48 and the three sanitizer passes. The ordinary candidate-generator
 failure is a separate integration blocker; these explicit-plan results do
 not claim it is fixed. Existing measurements below are retained, not rerun
 as part of this addition.
+
+### Block-scaled GLU streaming input signal (FC1) — SM100, 2026-11-23
+
+`gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py` adds 9 L0 forward cases for
+`streaming_signal_capacity` on the MXFP8 block-scaled SwiGLU kernel (E4M3 A/B with E8M0 SF atoms quantized once, BF16
+C/D, dense weights, 256 x 256 tile, cluster (2, 1), dynamic scheduler). The signal scheduler only reorders tiles and
+waits, so every case compares raw C and D bytes with the stock dynamic scheduler:
+
+- Replay (4 cases): host layout, and `device_layout` with `use_pdl` and the all-slots-ready trigger, on 64 ragged
+  experts and a 5000-row expert; three launches each on fresh NaN-filled C/D and workspace beside concurrent work.
+- Producer release order (2 cases): A codes or SFA atoms poisoned (NaN) until a producer stream writes each M tile's
+  rows and SFA bytes and releases it, in order, in reverse and in a seeded random order; all orders give the same bytes.
+- Batch invariance (2 cases): the 700-row target expert alone, with neighbors, behind empty experts, among 1/255/257-row
+  experts, reordered and duplicated, under host and device layout.
+- Claim-slot warm stress (1 case, Rule 11): 0 wrong of 500 warm and 0 of 500 poisoned launches.
+
+`test_grouped_gemm_blockscaled_glu_streaming_signal.py` holds the producer tests with A and SFA poisoned independently
+and together, and a check that the poison reaches D. No golden is recorded. The kernel has no backward.
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0, one GPU: both files at
+`-m "L0 or L1"`: **40 passed**. SM103 is unverified. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal_determinism.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_glu_streaming_signal.py -m "L0 or L1" -q -rs
+```
 
 ### Grouped GEMM streaming signal options — SM100, 2026-11-20
 
