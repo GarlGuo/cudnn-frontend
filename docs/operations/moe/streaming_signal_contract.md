@@ -13,8 +13,11 @@ memory: the readiness signals.
 Kernels:
 - BF16 on SM100-class GPUs: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and
   `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`, input direction only).
-- MXFP8 / NVFP4 block-scaled, output direction only: `BlockScaledMoEGroupedGemmQuantKernel` in `quant/grouped_gemm_quant.py`
-  (SM100) and its Rubin twin in `quant/moe_blockscaled_grouped_gemm_quant_rubin.py` (SM107), the FC2 forward. See section 4.
+- MXFP8 / NVFP4 block-scaled (section 4):
+  - output direction: `BlockScaledMoEGroupedGemmQuantKernel` in `quant/grouped_gemm_quant.py` (SM100) and its Rubin twin in
+    `quant/moe_blockscaled_grouped_gemm_quant_rubin.py` (SM107), the FC2 forward;
+  - input direction: `BlockScaledMoEGroupedGemmGluBiasKernel` in `glu/moe_blockscaled_grouped_gemm_glu_bias.py` (SM100),
+    the FC1 forward, with the stock (swizzled) SFA.
 
 Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the
 same as without this feature.
@@ -183,10 +186,19 @@ The block-scaled quant kernels (FC2 forward) take the output direction with the 
 | inputs | Unchanged: E4M3 / E2M1 codes with SF atoms, read in full before any chunk is published. |
 | other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`. |
 
-The input direction is not wired for the block-scaled kernels yet. When it is, `signal[t]` must also cover M tile t's
-scale factors. The SF atom is 128 rows x 4 scales (512 bytes), and atoms are laid out row block by row block, so a
-256-row M tile owns two whole atom rows. Its SFA is the contiguous byte range
-`[t * 256 * Kc, (t + 1) * 256 * Kc)`, with `Kc = round_up(ceil(K / sf_vec_size), 4)`.
+### Input direction (SM100 GLU, stock SFA)
+
+The block-scaled GLU kernel (FC1 forward) takes the BF16 GLU kernel's input-direction options: `streaming_signal_capacity`,
+`device_layout`, `use_pdl` and `launch_pdl_dependents_at_all_streaming_signal_slots_ready`. Sections 1 and 2 hold
+unchanged, and `signal[t]` covers M tile t's scale factors as well as its rows of A:
+
+| Item | Contract |
+|---|---|
+| SFA | Swizzled SF atoms (the kernel's stock `sfa` layout): 128 rows x 4 scales per 512-byte atom, the K atoms of a 128-row block contiguous, block after block. |
+| M tile t | A rows `[256 t, 256 (t + 1))` and SFA atom rows 2t and 2t + 1: the contiguous bytes `[t * 256 * Kc, (t + 1) * 256 * Kc)`, `Kc = round_up(ceil(K / sf_vec_size), 4)`. |
+| producer | Writes both, padding rows and padding scale columns included, before the release store of `signal[t]` (section 1, memory ordering). |
+| GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
+| other | Dense weights, `padded_offsets` in global memory, no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA. |
 
 ## 5. Programmatic dependent launch (PDL) options
 
@@ -254,8 +266,9 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - N must be known at build time (dense B).
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
   exists on the GLU kernel only and requires `streaming_signal_capacity`.
-- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3), and `N_CHUNK` on the block-scaled
-  quant forward kernels with BF16 D (section 4). Other recipes are not wired up yet.
+- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3), `N_CHUNK` on the block-scaled
+  quant forward kernels with BF16 D, and the input direction on the SM100 block-scaled GLU kernel with stock SFA
+  (section 4). Other recipes are not wired up yet.
 
 ## Acknowledgements
 
