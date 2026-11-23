@@ -315,9 +315,7 @@ class BlockScaledMoEGroupedGemmQuantKernel:
                 raise ValueError("streaming_output_notify requires use_dynamic_sched=True")
             # signal[] counts D's bulk stores only (no C, SFD or amax), one CTA tile of cta_tile_m rows each.
             if generate_sfd or generate_c or self.enable_breuse or weight_mode != MoEWeightMode.DENSE or use_single_group_runtime_offsets:
-                raise ValueError(
-                    "streaming_output_notify requires BF16 D without C or SFD, no B-reuse, dense weights and padded_offsets in global memory"
-                )
+                raise ValueError("streaming_output_notify requires BF16 D without C or SFD, no B-reuse, dense weights and padded_offsets in global memory")
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
 
     # ------------------------------------------------------------------
