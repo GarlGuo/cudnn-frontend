@@ -9,7 +9,12 @@ signal scheduler's Rubin overhead.  Every knob is read at trace time; unset, not
   TILELOG_ADDR=<device address of int32[1 << 22]>: per CTA and tile, the scheduler's publish, the TMA warp's first
       load, the MMA warp's tile start and the epilogue's tile end (%globaltimer_lo), plus the tile and %smid.
       Layout: counters int32[CTA * 4 + role] in the first 65536 words, then records int32[16] at
-      65536 + (CTA * 256 + seq) * 16: [0:3] expert, tile m, tile n, [3] smid, [4 + role] time, [8] 1.
+      65536 + (CTA * 256 + seq) * 16: [0:3] expert, tile m, tile n, [3] smid, [4 + role] time, [8] 1; the TMA warp
+      (role 1) adds [9:16] its coordinates: expert, MMA tile m, MMA tile n, the A tensor's base coordinates (2), the B tensor's
+      (1), CTA rank in the cluster.  TILELOG_ROLES=<subset of 0123> logs only those roles (0 scheduler, 1 TMA, 2 MMA,
+      3 epilogue).
+  SIGDIAG_NO_FINALIZE=1   a signal-scheduler build without the final cluster barrier (internal_finalize)
+  SIGDIAG_STOCK_FINALIZE=1  with SIGDIAG_STOCK_SCHED: add that cluster barrier to the stock scheduler
 """
 
 import os
@@ -23,7 +28,7 @@ def knob(name: str) -> bool:
     return os.environ.get(name, "0") == "1"
 
 
-def tilelog(role: int, tile=None):
+def tilelog(role: int, tile=None, extra=None):
     """One thread per CTA and role: append this role's event for the CTA's next tile.  No-op without TILELOG_ADDR."""
     addr = int(os.environ.get("TILELOG_ADDR", "0"))
     if addr == 0:
@@ -43,7 +48,29 @@ def tilelog(role: int, tile=None):
         rec[2] = tile[2]
         rec[3] = cute.arch.smid()
         rec[8] = Int32(1)
+    if extra is not None:
+        for idx, value in enumerate(extra):
+            rec[9 + idx] = value
 
 
-def tilelog_on() -> bool:
-    return int(os.environ.get("TILELOG_ADDR", "0")) != 0
+def tilelog_on(role=None) -> bool:
+    """Logging enabled (TILELOG_ADDR) and, with ``role``, that role selected by TILELOG_ROLES (default "0123")."""
+    if int(os.environ.get("TILELOG_ADDR", "0")) == 0:
+        return False
+    return role is None or str(role) in os.environ.get("TILELOG_ROLES", "0123")
+
+
+def coord_words(iterator, count: int):
+    """The first ``count`` integer components of a TMA tensor's coordinate iterator (zeros past its rank)."""
+    flat = []
+
+    def walk(x):
+        if isinstance(x, (tuple, list)):
+            for y in x:
+                walk(y)
+        else:
+            flat.append(x)
+
+    walk(iterator)
+    words = [Int32(x) for x in flat[:count]]
+    return words + [Int32(0)] * (count - len(words))

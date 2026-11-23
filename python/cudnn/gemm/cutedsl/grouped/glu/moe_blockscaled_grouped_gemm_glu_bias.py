@@ -2135,7 +2135,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                     sInfo[(2, tile_info_producer_state.index)] = work_tile_info.tile_n_idx
                     sInfo[(3, tile_info_producer_state.index)] = work_tile_info.k_tile_cnt
                 cute.arch.fence_proxy("async.shared", space="cta")
-                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                if cutlass.const_expr(_sigdiag.tilelog_on(0)):
                     with cute.arch.elect_one():
                         _sigdiag.tilelog(0, (work_tile_info.expert_idx, work_tile_info.tile_m_idx, work_tile_info.tile_n_idx))
 
@@ -2292,9 +2292,19 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                 if cutlass.const_expr(self.use_streaming_signal_sched):
                     cute.arch.fence_proxy("async.global")
 
-                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                if cutlass.const_expr(_sigdiag.tilelog_on(1)):
                     with cute.arch.elect_one():
-                        _sigdiag.tilelog(1)
+                        _sigdiag.tilelog(
+                            1,
+                            extra=(
+                                work_tile_info.expert_idx,
+                                mma_tile_coord_m,
+                                mma_tile_coord_n,
+                                *_sigdiag.coord_words(real_a.iterator, 2),
+                                *_sigdiag.coord_words(real_b.iterator, 1),
+                                cute.arch.block_idx_in_cluster(),
+                            ),
+                        )
                 # Peek (try_wait) AB buffer empty
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -2518,7 +2528,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
-                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                if cutlass.const_expr(_sigdiag.tilelog_on(2)):
                     with cute.arch.elect_one():
                         _sigdiag.tilelog(2)
                 k_tile_cnt = tile_info[3]
@@ -3278,7 +3288,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
                         acc_pipeline.consumer_release(acc_consumer_state)
                     acc_consumer_state.advance()
 
-                if cutlass.const_expr(_sigdiag.tilelog_on()):
+                if cutlass.const_expr(_sigdiag.tilelog_on(3)):
                     if warp_idx == self.epilog_warp_id[0]:
                         with cute.arch.elect_one():
                             _sigdiag.tilelog(3)
@@ -3311,8 +3321,11 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(CompactSfaSfWarpMixin):
             d_pipeline.producer_tail()
 
         # The signal scheduler's last cluster handoff writes into a peer's shared memory: all threads wait here.
-        if cutlass.const_expr(self.use_streaming_signal_sched and not _sigdiag.knob("SIGDIAG_STOCK_SCHED")):
+        if cutlass.const_expr(self.use_streaming_signal_sched and not _sigdiag.knob("SIGDIAG_STOCK_SCHED") and not _sigdiag.knob("SIGDIAG_NO_FINALIZE")):
             scheduler.internal_finalize()
+        if cutlass.const_expr(self.use_streaming_signal_sched and _sigdiag.knob("SIGDIAG_STOCK_SCHED") and _sigdiag.knob("SIGDIAG_STOCK_FINALIZE")):
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
         # Work after this kernel on the stream must also follow the grid this launch overlapped.
         if cutlass.const_expr(self.use_pdl):
             cute.arch.griddepcontrol_wait()

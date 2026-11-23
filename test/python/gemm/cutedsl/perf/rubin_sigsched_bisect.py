@@ -7,6 +7,8 @@ atoms), every M tile ready, dsv3 and qwen35 EP4 per-rank shapes.  From test/pyth
     ncu --metrics gpu__time_duration.sum -k regex:kernel_kernel --csv python -m gemm.cutedsl.perf.rubin_sigsched_bisect ncu
     # (1) + (2) per-tile log, stock vs signal (no ncu)
     python -m gemm.cutedsl.perf.rubin_sigsched_bisect tilelog
+    # TMA coordinates per tile, stock vs signal / signal_stock_sched / signal_hyb_both (no ncu)
+    python -m gemm.cutedsl.perf.rubin_sigsched_bisect coords
 
 Variants (grouped/_sigdiag.py): stock_dynamic; signal; signal_stock_sched (the signal build running the stock
 scheduler); signal_hyb_claim (no batches: claim index -> tile); signal_hyb_bcast (stock broadcast / slot release);
@@ -33,8 +35,34 @@ VARIANTS = {
     "signal_hyb_claim": (True, {"SIGDIAG_HYBRID_CLAIM": "1"}),
     "signal_hyb_bcast": (True, {"SIGDIAG_HYBRID_BCAST": "1"}),
     "signal_hyb_both": (True, {"SIGDIAG_HYBRID_CLAIM": "1", "SIGDIAG_HYBRID_BCAST": "1"}),
+    "signal_nofinal": (True, {"SIGDIAG_NO_FINALIZE": "1"}),
+    "signal_hyb_both_nofinal": (True, {"SIGDIAG_HYBRID_CLAIM": "1", "SIGDIAG_HYBRID_BCAST": "1", "SIGDIAG_NO_FINALIZE": "1"}),
+    "signal_stock_sched_final": (True, {"SIGDIAG_STOCK_SCHED": "1", "SIGDIAG_STOCK_FINALIZE": "1"}),
 }
-KNOBS = ("SIGDIAG_STOCK_SCHED", "SIGDIAG_HYBRID_CLAIM", "SIGDIAG_HYBRID_BCAST", "TILELOG_ADDR")
+# Which logging point removes the gap: one role logged at a time (TILELOG_ADDR is filled in at build time).
+for _role in "0123":
+    VARIANTS[f"stock_log{_role}"] = (False, {"TILELOG_ROLES": _role, "TILELOG_ADDR": "@"})
+    VARIANTS[f"signal_log{_role}"] = (True, {"TILELOG_ROLES": _role, "TILELOG_ADDR": "@"})
+VARIANTS["signal_log_all"] = (True, {"TILELOG_ADDR": "@"})
+KNOBS = (
+    "SIGDIAG_STOCK_SCHED",
+    "SIGDIAG_HYBRID_CLAIM",
+    "SIGDIAG_HYBRID_BCAST",
+    "SIGDIAG_NO_FINALIZE",
+    "SIGDIAG_STOCK_FINALIZE",
+    "TILELOG_ADDR",
+    "TILELOG_ROLES",
+)
+LOG = None  # the device log every logging variant writes (its address is baked into the kernel)
+
+
+def log_buffer():
+    global LOG
+    if LOG is None:
+        LOG = torch.zeros(1 << 22, dtype=torch.int32, device="cuda")
+    return LOG
+
+
 if os.environ.get("DIAG_ONLY"):
     VARIANTS = {name: VARIANTS[name] for name in os.environ["DIAG_ONLY"].split(",")}
 
@@ -43,7 +71,7 @@ def build(shape, name, problem, extra_env=None, tag=""):
     signal, env = VARIANTS[name]
     for knob in KNOBS:
         os.environ.pop(knob, None)
-    os.environ.update(env)
+    os.environ.update({k: (str(log_buffer().data_ptr()) if v == "@" else v) for k, v in env.items()})
     os.environ.update(extra_env or {})
     options = dict(use_dynamic_sched=True)
     if signal:
@@ -69,7 +97,10 @@ def bisect(shapes):
         experts, rows, hidden, inter = SHAPES[shape]
         problem = bs.make_problem([rows] * experts, 2 * inter, hidden, seed=0)
         for name in VARIANTS:
-            launch(problem, build(shape, name, problem))
+            run = build(shape, name, problem)
+            if "TILELOG_ADDR" in VARIANTS[name][1]:
+                log_buffer().zero_()
+            launch(problem, run)
             print(f"NCU_ORDER glu {shape} {name}", flush=True)
 
 
@@ -133,9 +164,47 @@ def tilelog(shapes):
         print(f"  same SM for the same tile, stock vs signal: {same_sm:.2f} of {len(common)} tiles")
 
 
+def coords(shapes):
+    """(b): the TMA warp's coordinates per tile (expert, MMA tile m / n, CTA rank) -> the A / B tensors' base coordinates,
+    for stock, signal, signal_stock_sched and signal_hyb_both: any tile whose loads differ from stock's is printed."""
+    log = log_buffer()
+    for shape in shapes:
+        experts, rows, hidden, inter = SHAPES[shape]
+        problem = bs.make_problem([rows] * experts, 2 * inter, hidden, seed=0)
+        maps = {}
+        for name in ("stock_dynamic", "signal", "signal_stock_sched", "signal_hyb_both"):
+            run = build(shape, name, problem, {"TILELOG_ADDR": str(log.data_ptr()), "TILELOG_ROLES": "1"}, tag="coords")
+            log.zero_()
+            launch(problem, run)
+            words = log.cpu().numpy()
+            counts = words[:65536].reshape(-1, 4)
+            ctas = int((counts[:, 1] > 0).sum())
+            r = words[65536:].reshape(-1, 256, 16)[:ctas]
+            m = {}
+            for cta in range(ctas):
+                for seq in range(int(counts[cta, 1])):
+                    e, mm, nn, a0, a1, b0, rank = (int(x) for x in r[cta, seq, 9:16])
+                    m.setdefault((e, mm, nn, rank), []).append((a0, a1, b0))
+            maps[name] = m
+        ref = maps["stock_dynamic"]
+        print(f"== {shape}: stock loads {sum(len(v) for v in ref.values())} (expert, MMA m, MMA n, rank) tiles")
+        sample = sorted(ref.items())[:: max(1, len(ref) // 4)][:4]
+        print(f"  sample (expert, MMA m, MMA n, rank) -> [(A coord 0, A coord 1, B coord 0)]: {sample}")
+        for name, m in maps.items():
+            if name == "stock_dynamic":
+                continue
+            keys = set(ref) | set(m)
+            diff = [k for k in sorted(keys) if sorted(ref.get(k, [])) != sorted(m.get(k, []))]
+            print(f"  {name:20} tiles {sum(len(v) for v in m.values())}, differing from stock: {len(diff)}")
+            for k in diff[:8]:
+                print(f"    {k}: stock {ref.get(k)} vs {m.get(k)}")
+
+
 if __name__ == "__main__":
     shapes = os.environ.get("DIAG_SHAPES", ",".join(SHAPES)).split(",")
     if "tilelog" in sys.argv[1:]:
         tilelog(shapes)
+    elif "coords" in sys.argv[1:]:
+        coords(shapes)
     else:
         bisect(shapes)
