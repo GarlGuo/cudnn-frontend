@@ -17,6 +17,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
     cuda_is_available,
+    default_stream,
     detect_framework,
     get_compute_capability,
     has_tcgen05,
@@ -27,7 +28,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from ..backend_utils import row_major_layout
+from ..backend_utils import row_major_layout, wrapper_workspace
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
 
@@ -98,6 +99,7 @@ class GroupedGemmSm100(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        _workspace=None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -112,6 +114,7 @@ class GroupedGemmSm100(APIBase):
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
             current_stream=current_stream,
+            _workspace=_workspace,
         )
         self._is_supported = self._implementation._is_supported
         self._compiled_kernel = self._implementation._compiled_kernel
@@ -354,18 +357,21 @@ def grouped_gemm_wrapper_sm100(
         op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
         internal_c = c_tensor if c_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
         d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
-        op.execute(
-            a_tensor=a_tensor,
-            c_tensor=internal_c,
-            d_tensor=d_out,
-            padded_offsets=padded_offsets,
-            alpha_tensor=alpha_tensor,
-            b_tensor=b_tensor if is_dense else None,
-            b_ptrs=None if is_dense else b_ptrs,
-            bias_tensor=bias_tensor,
-            prob_tensor=prob_tensor,
-            current_stream=current_stream,
-        )
+        launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+        with wrapper_workspace(framework, op._implementation._scratch_nbytes, a_tensor.device, launch_stream) as ws:
+            op.execute(
+                a_tensor=a_tensor,
+                c_tensor=internal_c,
+                d_tensor=d_out,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                b_tensor=b_tensor if is_dense else None,
+                b_ptrs=None if is_dense else b_ptrs,
+                bias_tensor=bias_tensor,
+                prob_tensor=prob_tensor,
+                current_stream=current_stream,
+                _workspace=ws,
+            )
         return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
 
     framework = detect_framework(a_tensor)
@@ -489,18 +495,21 @@ def grouped_gemm_wrapper_sm100(
 
     _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
 
-    op.execute(
-        a_tensor=a_tensor,
-        c_tensor=internal_c,
-        d_tensor=d_tensor,
-        padded_offsets=padded_offsets,
-        alpha_tensor=alpha_tensor,
-        b_tensor=b_tensor if is_dense else None,
-        b_ptrs=None if is_dense else b_ptrs,
-        bias_tensor=bias_tensor,
-        prob_tensor=prob_tensor,
-        current_stream=current_stream,
-    )
+    launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, op._implementation._scratch_nbytes, a_tensor.device, launch_stream) as ws:
+        op.execute(
+            a_tensor=a_tensor,
+            c_tensor=internal_c,
+            d_tensor=d_tensor,
+            padded_offsets=padded_offsets,
+            alpha_tensor=alpha_tensor,
+            b_tensor=b_tensor if is_dense else None,
+            b_ptrs=None if is_dense else b_ptrs,
+            bias_tensor=bias_tensor,
+            prob_tensor=prob_tensor,
+            current_stream=current_stream,
+            _workspace=ws,
+        )
     return TupleDict(
         d_tensor=d_tensor,
         c_tensor=internal_c if generate_c else None,

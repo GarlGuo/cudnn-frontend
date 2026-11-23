@@ -17,6 +17,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.gemm.cutedsl.grouped.unfused._bf16_api import _validate_pointer_tensor
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
+    default_stream,
     detect_framework,
     framework_dtype,
     get_device,
@@ -30,6 +31,7 @@ from ..backend_utils import (
     backend_cache_key,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
+    wrapper_workspace,
 )
 from ..moe_utils import MoEWeightMode, WGradInputOrder, WgradSfTensormapConstructor
 
@@ -239,6 +241,7 @@ class GroupedGemmWgradSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         descriptor_workspace: Optional[torch.Tensor] = None,
+        _workspace=None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -261,6 +264,8 @@ class GroupedGemmWgradSm100(APIBase):
         )
         if descriptor_workspace is not None:
             execute_kwargs["descriptor_workspace"] = descriptor_workspace
+        if _workspace is not None:
+            execute_kwargs["_workspace"] = _workspace
         self._implementation.execute(**execute_kwargs)
 
 
@@ -378,19 +383,22 @@ def grouped_gemm_wgrad_wrapper_sm100(
         op, framework, wgrad_shape, memo_wgrad_dtype = memo
         if wgrad_tensor is None and wgrad_ptrs is None:
             wgrad_tensor = wgrad_allocate_output(framework, wgrad_shape, memo_wgrad_dtype, accumulate_on_output, a_tensor, current_stream)
-        op.execute(
-            a_tensor=a_tensor,
-            b_tensor=b_tensor,
-            sfa_tensor=sfa_tensor,
-            sfb_tensor=sfb_tensor,
-            offsets_tensor=offsets_tensor,
-            wgrad_tensor=wgrad_tensor,
-            wgrad_ptrs=wgrad_ptrs,
-            descriptor_workspace=descriptor_workspace,
-            global_scale_a=global_scale_a,
-            global_scale_b=global_scale_b,
-            current_stream=current_stream,
-        )
+        launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+        with wrapper_workspace(framework, getattr(op._implementation, "_scratch_nbytes", 0), a_tensor.device, launch_stream) as ws:
+            op.execute(
+                a_tensor=a_tensor,
+                b_tensor=b_tensor,
+                sfa_tensor=sfa_tensor,
+                sfb_tensor=sfb_tensor,
+                offsets_tensor=offsets_tensor,
+                wgrad_tensor=wgrad_tensor,
+                wgrad_ptrs=wgrad_ptrs,
+                descriptor_workspace=descriptor_workspace,
+                global_scale_a=global_scale_a,
+                global_scale_b=global_scale_b,
+                current_stream=current_stream,
+                _workspace=ws,
+            )
         return TupleDict(wgrad_tensor=wgrad_tensor)
 
     framework = detect_framework(a_tensor)
@@ -505,19 +513,22 @@ def grouped_gemm_wgrad_wrapper_sm100(
         op.compile()
         _cache_of_GroupedGemmWgradSm100Objects[cache_key] = op
     _wgrad_wrapper_memo[memo_key] = (op, framework, wgrad_shape, wgrad_dtype)
-    op.execute(
-        a_tensor=a_tensor,
-        b_tensor=b_tensor,
-        sfa_tensor=sfa_tensor,
-        sfb_tensor=sfb_tensor,
-        offsets_tensor=offsets_tensor,
-        wgrad_tensor=wgrad_tensor,
-        wgrad_ptrs=wgrad_ptrs,
-        descriptor_workspace=descriptor_workspace,
-        global_scale_a=global_scale_a,
-        global_scale_b=global_scale_b,
-        current_stream=current_stream,
-    )
+    launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, getattr(op._implementation, "_scratch_nbytes", 0), a_tensor.device, launch_stream) as ws:
+        op.execute(
+            a_tensor=a_tensor,
+            b_tensor=b_tensor,
+            sfa_tensor=sfa_tensor,
+            sfb_tensor=sfb_tensor,
+            offsets_tensor=offsets_tensor,
+            wgrad_tensor=wgrad_tensor,
+            wgrad_ptrs=wgrad_ptrs,
+            descriptor_workspace=descriptor_workspace,
+            global_scale_a=global_scale_a,
+            global_scale_b=global_scale_b,
+            current_stream=current_stream,
+            _workspace=ws,
+        )
     return TupleDict(wgrad_tensor=wgrad_tensor)
 
 

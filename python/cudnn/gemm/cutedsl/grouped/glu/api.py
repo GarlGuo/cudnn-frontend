@@ -29,6 +29,7 @@ from ..backend_utils import (
     row_major_layout,
     select_grouped_gemm_backend,
     wrapper_operand_meta,
+    wrapper_workspace,
 )
 from ..canonical import b_nkl, check_canonical_contiguous, check_packed_sf, is_canonical_b, is_flat_sf
 from ..moe_utils import MoEWeightMode
@@ -45,6 +46,7 @@ from cudnn.api_base import APIBase, TupleDict, ceil_div, get_device_type
 from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     cuda_is_available,
+    default_stream,
     detect_framework,
     framework_dtype,
     get_compute_capability,
@@ -373,6 +375,7 @@ class GroupedGemmGluSm100(APIBase):
         current_stream: Optional[cuda.CUstream] = None,
         *,
         scheduler_counter_tensor: Optional[torch.Tensor] = None,
+        _workspace=None,
     ) -> None:
         if self._implementation is None:
             raise RuntimeError("Kernel not compiled; call compile() first")
@@ -414,6 +417,7 @@ class GroupedGemmGluSm100(APIBase):
                 prob_tensor=prob_tensor,
                 linear_offset=linear_offset,
                 current_stream=current_stream,
+                _workspace=_workspace,
             )
         else:
             self._implementation.execute(
@@ -1230,30 +1234,33 @@ def _grouped_gemm_glu_bf16_call(call: GluCall, memo_key: Optional[tuple] = None)
     if memo_key is not None:
         _glu_wrapper_memo[memo_key] = (api, framework, valid_m, n_full, n_out, call.c_dtype, call.d_dtype)
 
-    api.execute(
-        a_tensor=call.a_tensor,
-        c_tensor=c_tensor,
-        d_tensor=d_tensor,
-        sfa_tensor=None,
-        padded_offsets=call.padded_offsets,
-        alpha_tensor=call.alpha_tensor,
-        b_tensor=call.b_tensor,
-        sfb_tensor=None,
-        bias_tensor=call.bias_tensor,
-        b_ptrs=call.b_ptrs,
-        sfb_ptrs=None,
-        d_col_tensor=None,
-        sfd_row_tensor=None,
-        sfd_col_tensor=None,
-        amax_tensor=None,
-        norm_const_tensor=None,
-        prob_tensor=call.prob_tensor,
-        linear_offset=call.linear_offset,
-        geglu_alpha=call.geglu_alpha,
-        glu_clamp_max=call.glu_clamp_max,
-        glu_clamp_min=call.glu_clamp_min,
-        current_stream=call.current_stream,
-    )
+    launch_stream = call.current_stream if call.current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, api._implementation._scratch_nbytes, call.a_tensor.device, launch_stream) as ws:
+        api.execute(
+            a_tensor=call.a_tensor,
+            c_tensor=c_tensor,
+            d_tensor=d_tensor,
+            sfa_tensor=None,
+            padded_offsets=call.padded_offsets,
+            alpha_tensor=call.alpha_tensor,
+            b_tensor=call.b_tensor,
+            sfb_tensor=None,
+            bias_tensor=call.bias_tensor,
+            b_ptrs=call.b_ptrs,
+            sfb_ptrs=None,
+            d_col_tensor=None,
+            sfd_row_tensor=None,
+            sfd_col_tensor=None,
+            amax_tensor=None,
+            norm_const_tensor=None,
+            prob_tensor=call.prob_tensor,
+            linear_offset=call.linear_offset,
+            geglu_alpha=call.geglu_alpha,
+            glu_clamp_max=call.glu_clamp_max,
+            glu_clamp_min=call.glu_clamp_min,
+            current_stream=call.current_stream,
+            _workspace=ws,
+        )
     return TupleDict(
         c_tensor=c_tensor if call.generate_c else None,
         d_tensor=d_tensor,
@@ -1427,30 +1434,33 @@ def grouped_gemm_glu_wrapper_sm100(
         canonical = len(get_shape(a_tensor)) == 2
         c_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_full, canonical), memo_c_dtype, a_tensor.device)
         d_out = _glu_allocate_output(framework, *row_major_layout(valid_m, n_out, canonical), memo_d_dtype, a_tensor.device)
-        api.execute(
-            a_tensor=a_tensor,
-            c_tensor=c_out,
-            d_tensor=d_out,
-            sfa_tensor=None,
-            padded_offsets=padded_offsets,
-            alpha_tensor=alpha_tensor,
-            b_tensor=b_tensor,
-            sfb_tensor=None,
-            bias_tensor=bias_tensor,
-            b_ptrs=b_ptrs,
-            sfb_ptrs=None,
-            d_col_tensor=None,
-            sfd_row_tensor=None,
-            sfd_col_tensor=None,
-            amax_tensor=None,
-            norm_const_tensor=None,
-            prob_tensor=prob_tensor,
-            linear_offset=linear_offset,
-            geglu_alpha=geglu_alpha,
-            glu_clamp_max=glu_clamp_max,
-            glu_clamp_min=glu_clamp_min,
-            current_stream=current_stream,
-        )
+        launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+        with wrapper_workspace(framework, api._implementation._scratch_nbytes, a_tensor.device, launch_stream) as ws:
+            api.execute(
+                a_tensor=a_tensor,
+                c_tensor=c_out,
+                d_tensor=d_out,
+                sfa_tensor=None,
+                padded_offsets=padded_offsets,
+                alpha_tensor=alpha_tensor,
+                b_tensor=b_tensor,
+                sfb_tensor=None,
+                bias_tensor=bias_tensor,
+                b_ptrs=b_ptrs,
+                sfb_ptrs=None,
+                d_col_tensor=None,
+                sfd_row_tensor=None,
+                sfd_col_tensor=None,
+                amax_tensor=None,
+                norm_const_tensor=None,
+                prob_tensor=prob_tensor,
+                linear_offset=linear_offset,
+                geglu_alpha=geglu_alpha,
+                glu_clamp_max=glu_clamp_max,
+                glu_clamp_min=glu_clamp_min,
+                current_stream=current_stream,
+                _workspace=ws,
+            )
         return TupleDict(
             c_tensor=c_out if generate_c else None,
             d_tensor=d_out,
