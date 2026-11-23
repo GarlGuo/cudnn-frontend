@@ -89,6 +89,9 @@ def make_glu_kernel(experts, rubin=None, **options):
     kernel.test_rubin, kernel.test_glu = rubin, True
     # compact_sfa_sf_warp: SFA is the compact E8M0 rows [rows, K / 32] (problem["a_exp"]), not the SF atoms.
     kernel.test_compact = test_compact
+    # generate_sfd: E4M3 D with its row SFD (and, unless generate_sfd_col=False, the column-quantized D and SFD).
+    kernel.test_sfd = common["generate_sfd"]
+    kernel.test_sfd_col = kernel.test_sfd and options.get("generate_sfd_col", True)
     kernel.test_compile_key = (type(kernel).__module__, frozen({**common, **options}))
     return kernel
 
@@ -177,6 +180,19 @@ def new_buffers(kernel, problem):
     workspace = torch.zeros(max(kernel.get_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
     if kernel.test_glu:
         c = torch.full((rows, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+        if getattr(kernel, "test_sfd", False):
+            # (C, D, D_col, SFD_row, SFD_col, norm_const, workspace): E4M3 NaN codes and 0xFF (NaN) scales; the column
+            # pair is empty without generate_sfd_col.
+            cols = n // 2 if kernel.test_sfd_col else 0
+
+            def codes(width):
+                return torch.full((rows, width), 0x7F, device="cuda", dtype=torch.uint8).view(torch.float8_e4m3fn)
+
+            def scales(width):
+                return torch.full((rows * width // SF_VEC_SIZE,), 0xFF, device="cuda", dtype=torch.uint8)
+
+            norm_const = torch.ones(1, device="cuda", dtype=torch.float32)
+            return c, codes(n // 2), codes(cols), scales(n // 2), scales(cols), norm_const, workspace
         d = torch.full((rows, n // 2), float("nan"), device="cuda", dtype=torch.bfloat16)
         return c, d, workspace
     d = torch.full((rows, n), float("nan"), device="cuda", dtype=torch.bfloat16)
@@ -213,6 +229,12 @@ def kernel_args(kernel, problem, *buffers):
     if kernel.test_glu:
         # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias), SM100 and Rubin alike.
         c_cute, d_cute = tensor(buffers[0]), tensor(buffers[1])
+        if getattr(kernel, "test_sfd", False):
+            d_col, sfd_row, sfd_col, norm_const = buffers[2:6]
+            d_col = tensor(d_col) if kernel.test_sfd_col else None
+            sfd_col = tensor(sfd_col.view(torch.float8_e8m0fnu)) if kernel.test_sfd_col else None
+            sfd_row = tensor(sfd_row.view(torch.float8_e8m0fnu))
+            return head + [c_cute, d_cute, d_col, sfa, sfd_row, sfd_col, None, tensor(norm_const), offsets, alpha, prob, None]
         return head + [c_cute, d_cute, d_cute, sfa, None, None, None, None, offsets, alpha, prob, None]
     d_cute = tensor(buffers[0])
     if kernel.test_rubin:
@@ -275,6 +297,12 @@ class Launcher:
 def outputs(kernel, problem, buffers):
     rows = valid_rows(problem)
     if kernel.test_glu:
+        if getattr(kernel, "test_sfd", False):
+            # Every row is a padded expert row here (the SFD atoms cover whole 128-row blocks).
+            named = {"c": buffers[0], "d": buffers[1].view(torch.uint8), "sfd_row": buffers[3]}
+            if kernel.test_sfd_col:
+                named.update(d_col=buffers[2].view(torch.uint8), sfd_col=buffers[4])
+            return {name: x[:rows] if name in ("c", "d", "d_col") else x for name, x in named.items()}
         return {"c": buffers[0][:rows], "d": buffers[1][:rows]}
     return {"d": buffers[0][:rows]}
 

@@ -936,11 +936,13 @@ def compute_stages(
     generate_sfd: bool,
     num_epilog_warps: int = 4,
     bias_dtype=None,
+    generate_sfd_col: bool = True,
 ) -> Tuple[int, int, int, int, int, int]:
     """Compute the number of pipeline stages for A/B/D operands based on heuristics.
 
     :param num_epilog_warps: Number of epilogue warps (default 4, may differ for DGLU).
     :param bias_dtype: Bias element type (e.g. cutlass.BFloat16) when bias enabled, None otherwise.
+    :param generate_sfd_col: With ``generate_sfd``: a column-quantized D is staged next to D (False: D only).
     :return: (num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage)
     """
     num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
@@ -1002,7 +1004,7 @@ def compute_stages(
     c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
     c_bytes = c_bytes_per_stage * num_c_stage
     d_bytes_per_stage = cute.size_in_bytes(d_dtype, d_smem_layout_staged_one)
-    d_bytes = d_bytes_per_stage * num_d_stage * (2 if generate_sfd else 1)
+    d_bytes = d_bytes_per_stage * num_d_stage * (2 if generate_sfd and generate_sfd_col else 1)
     amax_bytes = get_amax_smem_size(num_epilog_warps) if d_dtype == cutlass.BFloat16 else 0
     # Bias SMEM stages
     if bias_dtype is not None:

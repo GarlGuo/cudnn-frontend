@@ -205,8 +205,16 @@ def sm100_kernel_only():
         pytest.skip("compact_sfa_sf_warp: the SM100 kernel only (the Rubin GLU kernel takes SF atoms)")
 
 
-COMPACT_CASES = [(variant, routing) for variant in ("dynamic", "signal", "signal_layout_trigger") for routing in sorted(ROUTINGS)]
-COMPACT_L0 = {("dynamic", "big_expert"), ("signal", "many_experts_64"), ("signal_layout_trigger", "uneven")}
+# *_cta: compact_sfa_cta_release, the SF warp's per-K-tile CTA-scope arrive.
+COMPACT_VARIANTS = ("dynamic", "signal", "signal_layout_trigger", "dynamic_cta", "signal_cta", "signal_layout_trigger_cta")
+COMPACT_CASES = [(variant, routing) for variant in COMPACT_VARIANTS for routing in sorted(ROUTINGS)]
+COMPACT_L0 = {
+    ("dynamic", "big_expert"),
+    ("signal", "many_experts_64"),
+    ("signal_layout_trigger", "uneven"),
+    ("signal_cta", "big_expert"),
+    ("signal_layout_trigger_cta", "many_experts_64"),
+}
 
 
 @pytest.mark.parametrize("variant, routing", levels(COMPACT_CASES, COMPACT_L0, lambda variant, routing: f"{variant}-{routing}"))
@@ -216,12 +224,15 @@ def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing, sm100_kernel_only
     problem = make_problem(tokens, N, HIDDEN, seed=len(routing) + 1)
     expected, _ = Launcher(stock(tokens), problem)(problem)
     options = dict(use_dynamic_sched=True, compact_sfa_sf_warp=True)
-    if variant != "dynamic":
+    base = variant.removesuffix("_cta")
+    if base != variant:
+        options["compact_sfa_cta_release"] = True
+    if base != "dynamic":
         options["streaming_signal_capacity"] = problem["rows"] // ROWS_ALIGNMENT
-    if variant == "signal_layout_trigger":
+    if base == "signal_layout_trigger":
         options.update(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
     kernel = make_glu_kernel(len(tokens), **options)
-    got, _ = Launcher(kernel, problem)(problem, signal_ready(kernel) if variant != "dynamic" else None)
+    got, _ = Launcher(kernel, problem)(problem, signal_ready(kernel) if base != "dynamic" else None)
     torch.cuda.synchronize()
     assert_same_bytes(got, expected, variant)
 
@@ -237,19 +248,24 @@ def test_mxfp8_glu_compact_sfa_poison_reaches_d(sm100_kernel_only):
     assert torch.isnan(out["d"].float()).any()
 
 
-COMPACT_PRODUCER_CASES = [(late, order) for late in ("sfa", "both") for order in ("in_order", "reverse", "random")]
-COMPACT_PRODUCER_L0 = {("sfa", "reverse"), ("both", "random")}
+COMPACT_PRODUCER_CASES = [(late, order, release) for release in ("cluster", "cta") for late in ("sfa", "both") for order in ("in_order", "reverse", "random")]
+COMPACT_PRODUCER_L0 = {("sfa", "reverse", "cluster"), ("both", "random", "cluster"), ("both", "random", "cta")}
 
 
-@pytest.mark.parametrize("late, order", levels(COMPACT_PRODUCER_CASES, COMPACT_PRODUCER_L0, lambda late, order: f"late_{late}-{order}"))
-def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order, sm100_kernel_only):
+def compact_producer_id(late, order, release):
+    return f"late_{late}-{order}" + ("-cta_release" if release == "cta" else "")
+
+
+@pytest.mark.parametrize("late, order, release", levels(COMPACT_PRODUCER_CASES, COMPACT_PRODUCER_L0, compact_producer_id))
+def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order, release, sm100_kernel_only):
     """The producer writes each M tile's compact SFA rows (and A) before releasing it; the SF warp must not load a row
     early (it reads through L2 only, after the tile's acquire)."""
     tokens = ROUTINGS["many_experts_64"]
     problem = make_problem(tokens, N, HIDDEN, seed=7)
     expected, _ = Launcher(stock(tokens), problem)(problem)
-    results = run_with_producer(tokens, problem, late, [order], kernel_options=dict(compact_sfa_sf_warp=True))
-    assert_same_bytes(results[order], expected, f"compact, {late} late, {order} release")
+    options = dict(compact_sfa_sf_warp=True, compact_sfa_cta_release=release == "cta")
+    results = run_with_producer(tokens, problem, late, [order], kernel_options=options)
+    assert_same_bytes(results[order], expected, f"compact, {late} late, {order} release, {release}-scope SF arrive")
 
 
 @pytest.mark.L0
@@ -270,6 +286,8 @@ def test_mxfp8_glu_compact_sfa_rejects_invalid(sm100_kernel_only):
         make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1))
     with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
         make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, glu_layout="gate_then_up")
+    with pytest.raises(ValueError, match="compact_sfa_cta_release requires compact_sfa_sf_warp"):
+        make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_cta_release=True)
     # K = 384 is a whole number of SF atoms but not of the SF warp's 4-K-tile loads.
     import cuda.bindings.driver as cuda
     import cutlass.cute as cute
@@ -279,3 +297,39 @@ def test_mxfp8_glu_compact_sfa_rejects_invalid(sm100_kernel_only):
     kernel = make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True)
     with pytest.raises(Exception, match="K % 512"):
         cute.compile(kernel, *kernel_args(kernel, problem, *new_buffers(kernel, problem)), 4, cuda.CUstream(torch.cuda.current_stream().cuda_stream))
+
+
+# ---- generate_sfd_col=False: E4M3 D and its row SFD only (the column-quantized pair is not written) ----
+
+SFD_COL_VARIANTS = {
+    "dynamic": dict(use_dynamic_sched=True),
+    # The EP FC1 configuration: dispatch-fed compact SFA, device layout, PDL trigger, CTA-scope SF arrive.
+    "compact_signal_layout_trigger_cta": dict(
+        use_dynamic_sched=True,
+        compact_sfa_sf_warp=True,
+        compact_sfa_cta_release=True,
+        device_layout=True,
+        use_pdl=True,
+        launch_pdl_dependents_at_all_streaming_signal_slots_ready=True,
+    ),
+}
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("variant", sorted(SFD_COL_VARIANTS))
+def test_mxfp8_glu_without_sfd_col_matches_row_outputs(variant, sm100_kernel_only):
+    """C, the E4M3 D and its row SFD equal the bytes of the kernel that also writes the column-quantized D and SFD."""
+    tokens = ROUTINGS["many_experts_64"]
+    problem = make_problem(tokens, N, HIDDEN, seed=5)
+    expected, _ = Launcher(make_glu_kernel(len(tokens), use_dynamic_sched=True, generate_sfd=True), problem)(problem)
+    torch.cuda.synchronize()
+    assert set(expected) == {"c", "d", "sfd_row", "d_col", "sfd_col"}
+    options = dict(SFD_COL_VARIANTS[variant], generate_sfd=True, generate_sfd_col=False)
+    if options.get("compact_sfa_sf_warp"):
+        options["streaming_signal_capacity"] = problem["rows"] // ROWS_ALIGNMENT
+    kernel = make_glu_kernel(len(tokens), **options)
+    got, _ = Launcher(kernel, problem)(problem, signal_ready(kernel) if "streaming_signal_capacity" in options else None)
+    torch.cuda.synchronize()
+    assert set(got) == {"c", "d", "sfd_row"}
+    assert_same_bytes(got, {name: expected[name] for name in got}, f"generate_sfd_col=False, {variant}")
+    assert not (expected["d"] == 0x7F).all(), "D was written"

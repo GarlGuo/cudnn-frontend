@@ -214,6 +214,13 @@ GLU kernel (not yet the Rubin twin) takes `sfa` as those rows and builds the ato
 | GEMM | A dedicated SF warp (the last warp) reads each tile's rows with L2-only loads (`ld.global.cg`, 64-bit row index) after the tile's acquire, and stores each row's 4-scale word into the stage's atom. Per group of 4 K tiles it waits for the 4 stages, does `fence.proxy.async.shared::cta` before and after the stores, then one `fence.release.cluster` and 4 relaxed cluster arrives on the MMA leader's full barriers; the MMA warp acquires them at cluster scope. The TMA warp loads no SFA. |
 | other | As stock SFA; cluster (2, 1) with the 2-CTA MMA and the interleaved GLU layout. With every option off the generated code is unchanged. |
 
+Two opt-ins, both off by default, match an EP FC1's needs (SM100 GLU kernel):
+
+| Option | Effect |
+|---|---|
+| `compact_sfa_cta_release=True` (needs `compact_sfa_sf_warp`) | The SF warp arrives on the MMA leader's full barrier once per K tile with a CTA-scope release (`mbarrier.arrive.release.cta.shared::cluster`), and the MMA warp does no cluster-scope acquire. This is faster than the batched cluster release (GLU alone at 65536 x 4096 x 7168: about 1.50 ms against 1.83 ms; stock SF atoms 1.48 ms). It is formally outside the PTX memory model: a CTA-scope release does not order the peer CTA's stores for the leader. It relies on each SF warp storing only into its own CTA's shared memory, where the leader's `tcgen05.cp` reads the peer's atoms. |
+| `generate_sfd_col=False` (with `sfd_row` and `norm_const`) | Writes only the row-quantized E4M3 D and its row SFD. The column-quantized `d_col` and `sfd_col` are neither computed nor stored (both may be None), and their shared-memory stage is freed. |
+
 ## 5. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |

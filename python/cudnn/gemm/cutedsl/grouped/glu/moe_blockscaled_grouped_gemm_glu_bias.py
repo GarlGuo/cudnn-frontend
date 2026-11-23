@@ -273,6 +273,12 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
     :param compact_sfa_sf_warp: ``sfa`` is compact E8M0 rows ``[M, K / 32]`` (as an EP dispatch delivers them), not SF atoms:
         a dedicated SF warp writes each tile's atoms to shared memory and the TMA warp loads no SFA. MXFP8 only,
         ``K % 512 == 0``, cluster (2, 1) with the 2-CTA MMA.
+    :param compact_sfa_cta_release: With ``compact_sfa_sf_warp``: the SF warp arrives on the MMA leader's full barrier once
+        per K tile with a CTA-scope release instead of one cluster-scope release per 4 K tiles, and the MMA warp does no
+        cluster-scope acquire. Faster, but formally outside the PTX memory model: it relies on each SF warp storing only
+        into its own CTA's shared memory (the leader's MMA reads the peer's atoms there through tcgen05.cp).
+    :param generate_sfd_col: With ``sfd_row`` and ``norm_const``: also write the column-quantized ``d_col`` and its
+        ``sfd_col``. False writes only the row-quantized D and SFD (``d_col`` and ``sfd_col`` may then be None).
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -340,6 +346,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         use_pdl: bool = False,
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         compact_sfa_sf_warp: bool = False,
+        compact_sfa_cta_release: bool = False,
+        generate_sfd_col: bool = True,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -465,6 +473,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         self.vectorized_f32 = vectorized_f32
 
         self.generate_sfd = generate_sfd
+        # __call__ narrows it to generate_sfd (an SFD is written at all) and this request.
+        self.generate_sfd_col = generate_sfd_col
         self.discrete_col_sfd = discrete_col_sfd
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
@@ -491,6 +501,11 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
         if compact_sfa_sf_warp and (sf_vec_size != 32 or not use_2cta_instrs or tuple(cluster_shape_mn) != (2, 1) or self.use_sfb_reorder_warp):
             raise ValueError("compact_sfa_sf_warp requires MXFP8 (sf_vec_size 32), cluster (2, 1) with the 2-CTA MMA and the interleaved GLU layout")
+        if compact_sfa_cta_release and not compact_sfa_sf_warp:
+            raise ValueError("compact_sfa_cta_release requires compact_sfa_sf_warp")
+        self.compact_sfa_cta_release = compact_sfa_cta_release
+        # K tiles the SF warp stores per arrive round: one CTA-scope arrive each, or one cluster release per batch.
+        self.sf_warp_release_batch = 1 if compact_sfa_cta_release else self.SF_WARP_RELEASE_BATCH
         self.device_layout = device_layout
         self.use_pdl = use_pdl
         self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
@@ -629,6 +644,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             self.occupancy,
             self.generate_sfd,
             bias_dtype=self.bias_dtype if self.enable_bias else None,
+            generate_sfd_col=self.generate_sfd_col,
         )
 
         # Reserve local SFB-completion and paired-ready barriers for at most 16 stages.
@@ -964,12 +980,14 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
         # Setup sfd tensor by filling D tensor to scale factor atom layout
         self.generate_sfd = sfd_row_tensor is not None and norm_const_tensor is not None
+        self.generate_sfd_col = self.generate_sfd and self.generate_sfd_col
         # discrete_col_sfd is enabled via __init__, padded_offsets contains the same info as m_split_cumsum
-        if cutlass.const_expr(self.generate_sfd == False):
+        if cutlass.const_expr(self.generate_sfd_col == False):
             self.discrete_col_sfd = False
         if cutlass.const_expr(self.generate_sfd):
             sfd_row_layout = blockscaled_utils.tile_atom_to_shape_SF(d.shape, self.sf_vec_size)
             sfd_row_tensor = cute.make_tensor(sfd_row_tensor.iterator, sfd_row_layout)
+        if cutlass.const_expr(self.generate_sfd_col):
             sfd_col_layout = cute.tile_to_shape(
                 blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size, OperandMajorMode.MN).layout,
                 d.shape,
@@ -1103,9 +1121,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             d_smem_layout,
             self.epi_tile,
         )
+        # Without generate_sfd_col the d_col atom is an unused placeholder over d.
         tma_atom_d_col, tma_tensor_d_col = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileS2GOp(),
-            d_col,
+            d if cutlass.const_expr(self.generate_sfd and not self.generate_sfd_col) else d_col,
             d_smem_layout,
             self.epi_tile,
         )
@@ -1169,7 +1188,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
         # Define shared storage for kernel
         # sD_col is only needed when generating SFD; use size 0 to avoid wasting smem
-        sD_col_size = cute.cosize(self.d_smem_layout_staged.outer) if self.generate_sfd else 0
+        sD_col_size = cute.cosize(self.d_smem_layout_staged.outer) if self.generate_sfd_col else 0
         SchedulerStorage = MoEPersistentTileScheduler.make_storage_struct(self.num_tile_stage, self.use_dynamic_sched)
 
         @cute.struct
@@ -1867,7 +1886,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 cpasync.prefetch_descriptor(tma_atom_sfb)
             cpasync.prefetch_descriptor(tma_atom_c)
             cpasync.prefetch_descriptor(tma_atom_d)
-            if cutlass.const_expr(self.generate_sfd):
+            if cutlass.const_expr(self.generate_sfd_col):
                 cpasync.prefetch_descriptor(tma_atom_d_col)
 
         use_2cta_instrs = cute.size(tiled_mma.thr_id.shape) == 2
@@ -2016,7 +2035,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
         # (EPI_TILE_M, EPI_TILE_N, STAGE)
         # placeholder again
         sD_col = sD
-        if cutlass.const_expr(self.generate_sfd):
+        if cutlass.const_expr(self.generate_sfd_col):
             sD_col = storage.sD_col.get_tensor(d_smem_layout_staged.outer, swizzle=d_smem_layout_staged.inner)
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
@@ -2563,7 +2582,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                         else:
                             ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
                         # compact_sfa_sf_warp: the peer SF warp's sSFA stores arrive with .release.cluster; acquire them.
-                        if cutlass.const_expr(self.compact_sfa_sf_warp):
+                        if cutlass.const_expr(self.compact_sfa_sf_warp and not self.compact_sfa_cta_release):
                             full_barrier = ab_pipeline.sync_object_full.get_barrier(ab_consumer_state.index)
                             sf_acquired = cutlass.Boolean(False)
                             while not sf_acquired:
@@ -2803,6 +2822,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 tCrSFDRow_pvscale = cute.make_rmem_tensor_like(tCrSFDRow, cutlass.Float32)
                 d_rcp_limits = get_dtype_rcp_limits(self.d_dtype)
 
+            if cutlass.const_expr(self.generate_sfd_col):
                 # both SFDs are stored in row major mode.
                 sfd_col_tile = sfd_row_tile
                 gSFDCol_mnl = cute.local_tile(mSFDCol_mnl, sfd_col_tile, (None, None, None))
@@ -2897,7 +2917,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                 real_c, _ = epi_ext.get_gmem_tensor("c", mC_mnl, padded_offsets, epi_work_tile_info)
                 real_d, _ = epi_ext.get_gmem_tensor("d", mD_mnl, padded_offsets, epi_work_tile_info)
                 real_d_col = real_d
-                if cutlass.const_expr(self.generate_sfd):
+                if cutlass.const_expr(self.generate_sfd_col):
                     real_d_col, _ = epi_ext.get_gmem_tensor("d_col", mD_col_mnl, padded_offsets, epi_work_tile_info)
 
                 # local_tile + partition on per-expert tensors
@@ -2912,7 +2932,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
 
                 gD_col_mnl_loop = gD_mnl_loop
                 tCgD_col_loop = tCgD_loop
-                if cutlass.const_expr(self.generate_sfd):
+                if cutlass.const_expr(self.generate_sfd_col):
                     gD_col_mnl_loop = cute.local_tile(real_d_col, cute.slice_(self.mma_tiler_d, (None, None, 0)), (None, None, None))
                     tCgD_col_loop = thr_mma_epi_loop.partition_C(gD_col_mnl_loop)
                 _, bSG_sD_col, bSG_gD_col_partitioned = epilog_gmem_copy_and_partition(epi_tidx, tma_atom_d_col, tCgD_col_loop, epi_tile, sD_col)
@@ -2948,6 +2968,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                             0,
                         )
                     ]
+                if cutlass.const_expr(self.generate_sfd_col):
                     tCgSFDCol_mnl_new = tCgSFDCol_mnl
                     if cutlass.const_expr(self.discrete_col_sfd):
                         tCgSFDCol_mnl_new = self.create_and_partition_new_SFDCol(tile_info, mSFDCol_mnl, padded_offsets)
@@ -3117,8 +3138,9 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                         thread_tile_amax = amax_reduction_per_thread(tCompute, thread_tile_amax)
 
                     if cutlass.const_expr(self.generate_sfd):
-                        tCompute_col = cute.make_rmem_tensor(tCompute.layout, tCompute.element_type)
-                        tCompute_col.store(tCompute.load())
+                        if cutlass.const_expr(self.generate_sfd_col):
+                            tCompute_col = cute.make_rmem_tensor(tCompute.layout, tCompute.element_type)
+                            tCompute_col.store(tCompute.load())
                         #
                         # Generate row major SFD
                         #
@@ -3135,16 +3157,17 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                         #
                         # Generate col major SFD
                         #
-                        self.quant_sfd_col(
-                            real_subtile_idx,
-                            tiled_copy_r2s,
-                            tCompute_col,
-                            tCrSFDCol_pvscale,
-                            norm_const,
-                            d_rcp_limits,
-                            tRS_rD_col,
-                            tile_info,
-                        )
+                        if cutlass.const_expr(self.generate_sfd_col):
+                            self.quant_sfd_col(
+                                real_subtile_idx,
+                                tiled_copy_r2s,
+                                tCompute_col,
+                                tCrSFDCol_pvscale,
+                                norm_const,
+                                d_rcp_limits,
+                                tRS_rD_col,
+                                tile_info,
+                            )
 
                         # Assume subtile partitioned always happens on n dimension
                         # tile_m_idx is CTA-level (like bidx), use directly as raw_tile_m
@@ -3172,22 +3195,24 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                                 *sfd_row_idx_mn,
                             )
                         ]
-                        tCgSFDCol = tCgSFDCol_mn[
-                            (
-                                None,
-                                None,
-                                None,
-                                *sfd_col_idx_mn,
-                            )
-                        ]
+                        if cutlass.const_expr(self.generate_sfd_col):
+                            tCgSFDCol = tCgSFDCol_mn[
+                                (
+                                    None,
+                                    None,
+                                    None,
+                                    *sfd_col_idx_mn,
+                                )
+                            ]
 
                         if subtile_idx == subtile_cnt - 2:
                             if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
                                 tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
                                 cute.autovec_copy(tCrSFDRow, tCgSFDRow)
-                            if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
-                                tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
-                                cute.autovec_copy(tCrSFDCol, tCgSFDCol)
+                            if cutlass.const_expr(self.generate_sfd_col):
+                                if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
+                                    tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
+                                    cute.autovec_copy(tCrSFDCol, tCgSFDCol)
                     else:
                         #
                         # Convert to D type
@@ -3205,7 +3230,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                         tRS_rD,
                         tRS_sD[(None, None, None, d_buffer)],
                     )
-                    if cutlass.const_expr(self.generate_sfd):
+                    if cutlass.const_expr(self.generate_sfd_col):
                         cute.copy(
                             tiled_copy_r2s,
                             tRS_rD_col,
@@ -3223,7 +3248,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                             bSG_sD[(None, d_buffer)],
                             bSG_gD[(None, real_subtile_idx)],
                         )
-                        if cutlass.const_expr(self.generate_sfd):
+                        if cutlass.const_expr(self.generate_sfd_col):
                             cute.copy(
                                 tma_atom_d_col,
                                 bSG_sD_col[(None, d_buffer)],
@@ -3317,15 +3342,15 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
             for k_tile_base in cutlass.range(0, k_tile_cnt, 2 * group, unroll=1):
                 for half in cutlass.range_constexpr(2):
                     if k_tile_base + half * group < k_tile_cnt:
-                        for batch_first in cutlass.range_constexpr(0, group, self.SF_WARP_RELEASE_BATCH):
+                        for batch_first in cutlass.range_constexpr(0, group, self.sf_warp_release_batch):
                             arrive_state = sf_producer_state.clone()
-                            for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
+                            for j in cutlass.range_constexpr(self.sf_warp_release_batch):
                                 ab_pipeline.sync_object_empty.wait(sf_producer_state.index, sf_producer_state.phase)
                                 sf_producer_state.advance()
                             # The MMA's tcgen05.cp read these stages through the async proxy: order that before the stores.
                             cute.arch.fence_proxy("async.shared", space="cta")
                             store_state = arrive_state.clone()
-                            for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
+                            for j in cutlass.range_constexpr(self.sf_warp_release_batch):
                                 for row_group in cutlass.range_constexpr(4):
                                     lines[(lane_idx, row_group, store_state.index)] = queue[half * group + batch_first + j][row_group]
                                 store_state.advance()
@@ -3333,13 +3358,17 @@ class BlockScaledMoEGroupedGemmGluBiasKernel:
                             cute.arch.fence_proxy("async.shared", space="cta")
                             cute.arch.sync_warp()
                             with cute.arch.elect_one():
-                                # One release for the batch, then relaxed arrives; the MMA leader acquires at cluster scope.
-                                fence_release_cluster()
-                                for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
-                                    cute.arch.mbarrier_arrive(
-                                        ab_pipeline.producer_get_barrier(arrive_state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER
-                                    )
-                                    arrive_state.advance()
+                                if cutlass.const_expr(self.compact_sfa_cta_release):
+                                    # compact_sfa_cta_release: a CTA-scope release arrive (the stores stay in this CTA's smem).
+                                    cute.arch.mbarrier_arrive(ab_pipeline.producer_get_barrier(arrive_state), leader_cta)
+                                else:
+                                    # One release for the batch, then relaxed arrives; the MMA leader acquires at cluster scope.
+                                    fence_release_cluster()
+                                    for j in cutlass.range_constexpr(self.SF_WARP_RELEASE_BATCH):
+                                        cute.arch.mbarrier_arrive(
+                                            ab_pipeline.producer_get_barrier(arrive_state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER
+                                        )
+                                        arrive_state.advance()
                         # This group's slots are stored: load the group two ahead into them.
                         if k_tile_base + half * group + 2 * group < k_tile_cnt:
                             self._load_compact_sfa_group(queue[half * group : (half + 1) * group], rows, k_tile_base + half * group + 2 * group)

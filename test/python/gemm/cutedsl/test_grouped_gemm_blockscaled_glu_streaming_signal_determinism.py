@@ -92,7 +92,9 @@ def test_mxfp8_glu_signal_replays_match_dynamic(variant, routing):
 
 
 @pytest.mark.L0
-@pytest.mark.parametrize("late, compact", [("a", False), ("sfa", False), ("sfa", True)], ids=["late_a", "late_sfa", "late_compact_sfa"])
+@pytest.mark.parametrize(
+    "late, compact", [("a", False), ("sfa", False), ("sfa", True), ("sfa", "cta")], ids=["late_a", "late_sfa", "late_compact_sfa", "late_compact_sfa_cta_release"]
+)
 def test_mxfp8_glu_producer_release_order_invariance(late, compact):
     """The GEMM starts while every M tile reads not-ready and the late operand holds NaN; a producer releases the tiles
     in order, in reverse and in a seeded random order.  Every order gives the stock scheduler's bytes."""
@@ -103,7 +105,9 @@ def test_mxfp8_glu_producer_release_order_invariance(late, compact):
     problem = make_problem(tokens, N, HIDDEN, seed=7)
     capacity = problem["rows"] // ROWS_ALIGNMENT
     expected = snapshot(Launcher(make_glu_kernel(len(tokens), use_dynamic_sched=True), problem)(problem)[0])
-    kernel = make_glu_kernel(len(tokens), use_dynamic_sched=True, streaming_signal_capacity=capacity, compact_sfa_sf_warp=compact)
+    # compact "cta": compact_sfa_cta_release, the SF warp's per-K-tile CTA-scope arrive.
+    options = dict(compact_sfa_sf_warp=bool(compact), compact_sfa_cta_release=compact == "cta") if compact else {}
+    kernel = make_glu_kernel(len(tokens), use_dynamic_sched=True, streaming_signal_capacity=capacity, **options)
     launcher = Launcher(kernel, problem, max_active_clusters=4)
     launcher(problem, signal_ready(kernel))
     torch.cuda.synchronize()
