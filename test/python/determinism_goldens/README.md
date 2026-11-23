@@ -2691,8 +2691,9 @@ golden is recorded.
 Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0 (CUDA 12.9), one GPU:
 both files with `test_grouped_gemm_dglu_bf16_determinism.py` at `-m "L0 or L1"`: **72 passed**, 8 skipped (6 compact
 cases for BF16, one gate_then_up and one JAX case of the BF16 suite). compute-sanitizer memcheck 0 errors, racecheck
-0 hazards on the L0 cases without warm stress. SM103 is unverified; SM107 (the Rubin twin, stock SFA, atomic dprob over
-two N tiles; the compact cases skip there) needs a Rubin run. From `test/python`:
+0 hazards on the L0 cases without warm stress. SM103 is unverified. SM107 (the Rubin twin, stock SFA; the compact cases
+skip there): its dprob is an fp32 atomic sum in tile arrival order, not deterministic even across stock replays (Rubin job
+6803 saw last-bit differences), so the files compare D bit for bit and dprob within fp32 reassociation there. From `test/python`:
 
 ```bash
 python -m pytest gemm/cutedsl/test_grouped_gemm_dglu_streaming_signal_determinism.py -m L0 -q -rs

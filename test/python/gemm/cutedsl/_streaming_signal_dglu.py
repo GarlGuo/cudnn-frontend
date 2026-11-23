@@ -6,8 +6,9 @@ SM107, the MXFP8 Rubin twin; problems, buffers, launches and one compile cache.
 
 The backward dGLU reads the dispatched output gradient dY as A (and, for MXFP8, its scales), so the producer streams A
 and SFA exactly as for the forward GLU; C (the saved pre-activation), prob and B are ordinary inputs.  The SM100 kernels
-run with ``deterministic=True`` (one dprob slot per N tile).  The Rubin kernel has no such option: with N = 2 x 256 a
-token's dprob is the fp32 sum of two N tiles' partials, which is the same in either order.
+run with ``deterministic=True`` (one dprob slot per N tile), so dprob is compared bit for bit.  The Rubin kernel has no
+such option: it adds each tile's fp32 dprob partials with atomics in arrival order, so its dprob is not deterministic
+(not even across replays of the stock scheduler) and is compared with a tolerance there; D stays bit-exact.
 """
 
 import torch
@@ -69,6 +70,24 @@ def make_dglu_kernel(recipe, experts, **options):
     kernel.test_dprob_slots = INTERMEDIATE // 256 if options.get("deterministic") else 1
     kernel.test_compile_key = (type(kernel).__module__, frozen({**common, **options}))
     return kernel
+
+
+def dprob_is_bitwise(kernel):
+    """False for the Rubin kernel: its dprob is an fp32 atomic sum in tile arrival order."""
+    return kernel.test_kind != "rubin"
+
+
+def exact_outputs(kernel, out):
+    """The outputs the kernel promises bit for bit: D, and dprob unless its dprob is an atomic sum."""
+    return out if dprob_is_bitwise(kernel) else {name: value for name, value in out.items() if name != "dprob"}
+
+
+def assert_outputs_match(kernel, got, want, label=""):
+    """Raw-byte equal on ``exact_outputs``; an atomic dprob within fp32 reassociation of ``want``."""
+    for name in exact_outputs(kernel, want):
+        assert torch.equal(got[name].view(torch.int16), want[name].view(torch.int16)), f"{label}: {name} differs from the stock scheduler"
+    if not dprob_is_bitwise(kernel):
+        torch.testing.assert_close(got["dprob"], want["dprob"], rtol=1e-5, atol=1e-5, msg=lambda m: f"{label}: dprob: {m}")
 
 
 def make_problem(recipe, tokens_per_expert, seed=0, rows=None):

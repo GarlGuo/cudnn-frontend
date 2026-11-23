@@ -235,7 +235,7 @@ must be complete before the GEMM starts.
 |---|---|
 | options | `streaming_signal_capacity`, `device_layout`, `use_pdl`, `launch_pdl_dependents_at_all_streaming_signal_slots_ready` and `launch_pdl_dependents_at_entry`, as for the forward kernels. MXFP8 SM100 also takes `compact_sfa_sf_warp` and `compact_sfa_cta_release` (section 4, compact SFA). |
 | M tile t | dY rows `[256 t, 256 (t + 1))`; MXFP8: their SF atoms (stock) or compact scale rows, as for the GLU forward. |
-| outputs | D (dC), the row and column SFD and dprob are written per tile as without a producer. With `deterministic=True` (SM100) dprob has one slot per N tile, so it is bitwise independent of the release order. The Rubin kernel adds dprob partials with fp32 atomics: bitwise only where a token has at most two N tiles. |
+| outputs | D (dC), the row and column SFD and dprob are written per tile as without a producer. With `deterministic=True` (SM100) dprob has one slot per N tile, so it is bitwise independent of the release order. The Rubin kernel adds dprob partials with fp32 atomics in tile arrival order: its dprob is not deterministic (not even across replays without a producer); D is. |
 | other | Dense weights (MXFP8), `padded_offsets` in global memory, cluster (2, 1) with the 2-CTA MMA; on Rubin no B-reuse. |
 
 ## 5. Programmatic dependent launch (PDL) options
