@@ -60,7 +60,14 @@ from ..moe_kernel_helpers import (
     can_implement,
     amax_reduction_per_thread,
     epilog_gmem_copy_and_partition,
+    check_dynamic_sched_cluster_shape,
 )
+from ..moe_streaming_input_block_tile_scheduler import (
+    MoEInputBlockSignalSchedulerParams,
+    MoEStreamingInputBlockSignalTileScheduler,
+    streaming_signal_workspace_bytes_after_counter,
+)
+from cudnn.frost.tile_dsl.consume import release_zero
 
 
 class BlockScaledMoEGroupedGemmGluKernel:
@@ -122,6 +129,17 @@ class BlockScaledMoEGroupedGemmGluKernel:
           of expert[i] in the padded A tensor.
         - Expert i processes A[padded_offsets[i-1]:padded_offsets[i], :] (with padded_offsets[-1]=0)
 
+
+    :param streaming_signal_capacity: ``signal[]`` entries of a streaming input producer (one per M tile). Set, the kernel
+        runs ``MoEStreamingInputBlockSignalTileScheduler`` and starts each M tile once the producer marks its A rows and
+        their SFA ready. Needs ``use_dynamic_sched``, dense weights, no B-reuse and cluster (2, 1) with the 2-CTA MMA.
+    :param device_layout: With ``streaming_signal_capacity``: the producer writes ``padded_offsets`` while this kernel runs,
+        and the scheduler waits for them. ``padded_offsets`` must then be ``layout[1:E+1]`` of an ``E + 1`` int32
+        buffer that the caller sets to -1 before the producer starts (``layout[0]`` is read too).
+    :param use_pdl: Launch as the programmatic dependent of the kernel before it on the stream; every thread waits
+        for that grid before it exits.
+    :param launch_pdl_dependents_at_all_streaming_signal_slots_ready: With ``streaming_signal_capacity``: one extra warp per
+        CTA lets this kernel's programmatic dependent launch once it has seen every ``signal[]`` entry (M tile) ready.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -227,6 +245,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
         generate_c: bool = True,
         sf_fp8_dtype_override: Optional[Literal["e5m3"]] = None,
         use_single_group_runtime_offsets: bool = False,
+        streaming_signal_capacity: Optional[int] = None,
+        device_layout: bool = False,
+        use_pdl: bool = False,
+        launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -328,6 +350,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
         if enable_bias:
             all_warps.append(self.bias_load_warp_id)
             warps_wo_sched.append(self.bias_load_warp_id)
+        # launch_pdl_dependents_at_all_streaming_signal_slots_ready: one more warp, which only waits for every signal[] entry and then triggers.
+        self.trigger_warp_id = len(all_warps) if launch_pdl_dependents_at_all_streaming_signal_slots_ready else None
+        if launch_pdl_dependents_at_all_streaming_signal_slots_ready:
+            all_warps.append(self.trigger_warp_id)
         self.threads_per_cta = self.threads_per_warp * len(all_warps)
         self.threads_wo_sched = self.threads_per_warp * len(warps_wo_sched)
 
@@ -364,6 +390,22 @@ class BlockScaledMoEGroupedGemmGluKernel:
         self.act_func = act_func
         if act_func not in ["swiglu", "geglu"]:
             raise ValueError(f"Invalid activation function: {act_func}")
+
+        self.streaming_signal_capacity = streaming_signal_capacity
+        self.use_streaming_signal_sched = streaming_signal_capacity is not None
+        if self.use_streaming_signal_sched and not use_dynamic_sched:
+            raise ValueError("streaming_signal_capacity requires use_dynamic_sched=True")
+        if self.use_streaming_signal_sched and (weight_mode != MoEWeightMode.DENSE or use_single_group_runtime_offsets or self.enable_breuse):
+            raise ValueError("streaming_signal_capacity requires dense weights, padded_offsets in global memory and no B-reuse")
+        if device_layout and not self.use_streaming_signal_sched:
+            raise ValueError("device_layout requires streaming_signal_capacity")
+        if launch_pdl_dependents_at_all_streaming_signal_slots_ready and not self.use_streaming_signal_sched:
+            raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
+        if self.use_streaming_signal_sched:
+            check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
+        self.device_layout = device_layout
+        self.use_pdl = use_pdl
+        self.launch_pdl_dependents_at_all_streaming_signal_slots_ready = launch_pdl_dependents_at_all_streaming_signal_slots_ready
 
     def _get_mma_permutation_mnk(self, mma_inst_shape_mnk):
         """Return MMA permutation for the Bkeep-Breuse pattern (2CTA only).
@@ -618,7 +660,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
         """Return descriptor workspace plus optional dynamic scheduler state."""
         desc_workspace_bytes = self.get_desc_workspace_bytes()
         dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
-        return desc_workspace_bytes + dynamic_sched_bytes
+        signal_workspace_bytes = (
+            streaming_signal_workspace_bytes_after_counter(self.streaming_signal_capacity, self.expert_cnt) if self.use_streaming_signal_sched else 0
+        )
+        return desc_workspace_bytes + dynamic_sched_bytes + signal_workspace_bytes
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -710,7 +755,8 @@ class BlockScaledMoEGroupedGemmGluKernel:
             )
             store_tma_desc(tma_atom_sfb, workspace.get_ptr("sfb", expert_idx))
 
-        if cutlass.const_expr(self.use_dynamic_sched):
+        # The signal scheduler's counter is reset by the caller together with signal[].
+        if cutlass.const_expr(self.use_dynamic_sched and not self.use_streaming_signal_sched):
             if expert_idx == cutlass.Int32(0):
                 sched_counter = cute.make_tensor(
                     self._get_sched_counter_ptr(workspace_ptr),
@@ -770,6 +816,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
         The optional routing probability multiplies this result. Stored C
         retains the GEMM-plus-bias values before activation clamping.
         """
+        # signal[] and the scheduler state follow the claim counter in the workspace.
+        if cutlass.const_expr(self.use_streaming_signal_sched and scheduler_counter is not None):
+            raise ValueError("streaming_signal_capacity owns the claim counter: pass no scheduler_counter")
         if cutlass.const_expr(scheduler_counter is not None):
             workspace_ptr = scheduler_counter.iterator
         a = kernel_facing_mx(a)
@@ -1001,7 +1050,9 @@ class BlockScaledMoEGroupedGemmGluKernel:
         )
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
-        _need_helper = cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and scheduler_counter is None))
+        _need_helper = cutlass.const_expr(
+            self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_streaming_signal_sched and scheduler_counter is None)
+        )
         if cutlass.const_expr(_need_helper):
             _helper_grid_x = self.expert_cnt if cutlass.const_expr(self.weight_mode == MoEWeightMode.DISCRETE) else 1
             _helper_args = (
@@ -1033,13 +1084,20 @@ class BlockScaledMoEGroupedGemmGluKernel:
         else:
             sched_expert_shape = (self.expert_cnt, n, k)
 
-        sched_params = MoESchedulerParams(
-            scenario="2Dx3D",
-            expert_shape=sched_expert_shape,
-            cta_tile_shape_mnk=self.cta_tile_shape_mnk,
-            cluster_shape_mn=self.cluster_shape_mn,
-            use_dynamic_sched=self.use_dynamic_sched,
-        )
+        if cutlass.const_expr(self.use_streaming_signal_sched):
+            sched_params = MoEInputBlockSignalSchedulerParams(
+                expert_shape=sched_expert_shape,
+                cta_tile_shape_mnk=self.cta_tile_shape_mnk,
+                cluster_shape_mn=self.cluster_shape_mn,
+            )
+        else:
+            sched_params = MoESchedulerParams(
+                scenario="2Dx3D",
+                expert_shape=sched_expert_shape,
+                cta_tile_shape_mnk=self.cta_tile_shape_mnk,
+                cluster_shape_mn=self.cluster_shape_mn,
+                use_dynamic_sched=self.use_dynamic_sched,
+            )
         self.sched_params, grid = compute_grid(
             sched_params,
             max_active_clusters,
@@ -1159,6 +1217,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             geglu_alpha,
             glu_clamp_max,
             glu_clamp_min,
+            Int32(0) if self.use_streaming_signal_sched else None,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1167,6 +1226,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
             smem=self.shared_storage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=self.use_pdl,
         )
         return
 
@@ -1656,15 +1716,19 @@ class BlockScaledMoEGroupedGemmGluKernel:
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         bias_smem_layout_staged: cute.Layout,
         epi_tile: cute.Tile,
-        sched_params: MoESchedulerParams,
+        sched_params: Union[MoESchedulerParams, MoEInputBlockSignalSchedulerParams],
         epilogue_op: cutlass.Constexpr,
         linear_offset: cutlass.Float32 = 0.0,
         geglu_alpha: cutlass.Float32 = 1.702,
         glu_clamp_max: cutlass.Float32 = 7.0,
         glu_clamp_min: cutlass.Float32 = -7.0,
+        release_zero_arg: Optional[Int32] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
+
+        ``release_zero_arg``: with the signal scheduler, the release-zero (python/cudnn/AGENTS.md Rule 11): the host passes
+        the literal 0 and its only use is ``release_zero()``; None otherwise.
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1753,14 +1817,25 @@ class BlockScaledMoEGroupedGemmGluKernel:
             consumer_group=tile_info_pipeline_consumer_group,
         )
 
-        scheduler = MoEPersistentTileScheduler.create(
-            sched_params,
-            padded_offsets,
-            cute.arch.block_idx(),
-            cute.arch.grid_dim(),
-            counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
-            sched_storage=sched_storage,
-        )
+        if cutlass.const_expr(self.use_streaming_signal_sched):
+            scheduler = MoEStreamingInputBlockSignalTileScheduler.create(
+                sched_params,
+                padded_offsets,
+                counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
+                sched_storage=sched_storage,
+                streaming_signal_capacity=self.streaming_signal_capacity,
+                release_zero=release_zero(release_zero_arg),
+                device_layout=self.device_layout,
+            )
+        else:
+            scheduler = MoEPersistentTileScheduler.create(
+                sched_params,
+                padded_offsets,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                counter_ptr=self._get_sched_counter_ptr(workspace_ptr),
+                sched_storage=sched_storage,
+            )
         scheduler.internal_init()
 
         # Bias pipeline + SMEM
@@ -1885,8 +1960,14 @@ class BlockScaledMoEGroupedGemmGluKernel:
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
-        if total_token <= 0:
+        # device_layout: total_token may predate the producer's layout write, so no CTA exits early here.
+        if not self.device_layout and total_token <= 0:
             cute.arch.nvvm.exit()
+
+        if cutlass.const_expr(self.launch_pdl_dependents_at_all_streaming_signal_slots_ready):
+            if warp_idx == self.trigger_warp_id:
+                scheduler.wait_all_streaming_signal_slots_ready()
+                cute.arch.griddepcontrol_launch_dependents()
 
         #
         # Specialized Schedule warp (MoE Persistent Tile Scheduler)
@@ -2063,6 +2144,10 @@ class BlockScaledMoEGroupedGemmGluKernel:
                 if cutlass.const_expr(self.cta_tile_shape_mnk[1] == 64):
                     slice_n = mma_tile_coord_n // 2
                 tBgSFB_slice = tBgSFB[(None, slice_n, None, 0)]
+
+                # The producer wrote A and SFA through the generic proxy: order both before this tile's TMA loads.
+                if cutlass.const_expr(self.use_streaming_signal_sched):
+                    cute.arch.fence_proxy("async.global")
 
                 # Peek (try_wait) AB buffer empty
                 ab_producer_state.reset_count()
@@ -2384,7 +2469,7 @@ class BlockScaledMoEGroupedGemmGluKernel:
         # Specialized bias load warp — cp.async 32-bit GMEM→SMEM
         #
         if cutlass.const_expr(self.enable_bias):
-            if warp_idx == self.bias_load_warp_id and total_token > 0:
+            if warp_idx == self.bias_load_warp_id and (self.device_layout or total_token > 0):
                 bias_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, self.num_bias_stage)
                 tile_info_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_tile_stage)
 
@@ -3069,6 +3154,13 @@ class BlockScaledMoEGroupedGemmGluKernel:
             #
             c_pipeline.producer_tail()
             d_pipeline.producer_tail()
+
+        # The signal scheduler's last cluster handoff writes into a peer's shared memory: all threads wait here.
+        if cutlass.const_expr(self.use_streaming_signal_sched):
+            scheduler.internal_finalize()
+        # Work after this kernel on the stream must also follow the grid this launch overlapped.
+        if cutlass.const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
 
     kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
 

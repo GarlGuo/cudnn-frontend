@@ -10,9 +10,21 @@ memory: the readiness signals.
 | producer → GEMM | `streaming_signal_capacity` | consumer | one cluster M tile of A (256 rows) | `MoEStreamingInputBlockSignalTileScheduler` |
 | GEMM → consumer | `streaming_output_notify=StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, ...)` | producer | one N chunk of D columns | `MoEStreamingOutputChunkSignalTileScheduler` |
 
-Kernels: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`,
-input direction only), BF16 on SM100-class GPUs. Both directions need `use_dynamic_sched=True`. Every option is off by
-default; with the defaults the generated code is the same as without this feature.
+Kernels:
+- BF16 on SM100-class GPUs: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and
+  `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`, input direction only).
+- MXFP8 / NVFP4 block-scaled (section 4):
+  - output direction: `BlockScaledMoEGroupedGemmQuantKernel` in `quant/grouped_gemm_quant.py` (SM100) and its Rubin twin in
+    `quant/moe_blockscaled_grouped_gemm_quant_rubin.py` (SM107), the FC2 forward;
+  - input direction: `BlockScaledMoEGroupedGemmGluBiasKernel` in `glu/moe_blockscaled_grouped_gemm_glu_bias.py` (SM100),
+    the FC1 forward, with stock (swizzled) or compact SFA, and its Rubin twin `BlockScaledMoEGroupedGemmGluKernel` in
+    `glu/moe_blockscaled_grouped_gemm_glu_rubin.py` (SM107) with stock SFA.
+- Backward dGLU (section 4a), input direction: `MoEGroupedGemmDgluDbiasBf16Kernel` (BF16, SM100),
+  `BlockScaledMoEGroupedGemmDgluDbiasKernel` (MXFP8, SM100, stock or compact SFA) and its Rubin twin
+  `BlockScaledMoEGroupedGemmDgluKernel` (SM107, stock SFA), all in `dglu/`.
+
+Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the
+same as without this feature.
 
 ## 1. Input direction: producer → GEMM
 
@@ -86,7 +98,7 @@ producer does not need a proxy fence of its own.
 ### Liveness
 
 - The producer must be able to run while the GEMM waits. Give the GEMM fewer clusters than the device holds
-  (`max_active_clusters`), or launch it as the producer's programmatic dependent (section 4). Either way, the producer
+  (`max_active_clusters`), or launch it as the producer's programmatic dependent (section 5). Either way, the producer
   keeps the SMs it needs.
 - The producer must not wait on the GEMM.
 
@@ -164,15 +176,77 @@ routing.
 - A GEMM with no rows (`padded_offsets[E-1] == 0`) exits before publishing anything. The consumer must not wait on
   `signal[]` when it received no rows.
 
-## 4. Programmatic dependent launch (PDL) options
+## 4. Block-scaled kernels (MXFP8, NVFP4)
+
+The block-scaled quant kernels (FC2 forward) take the output direction with the same options as the BF16 plain kernel:
+`streaming_output_notify`, `use_pdl` and `launch_pdl_dependents_at_entry`. Section 3 holds unchanged, with these limits.
+
+| Item | Contract |
+|---|---|
+| D | BF16, row major. `signal[u]` counts D's bulk tensor stores only. |
+| SFD, amax | Not published per chunk. `generate_sfd` is rejected at construction; an `amax_tensor` or SFD tensor at trace time. |
+| C (Rubin) | `generate_c` is rejected: C's stores are not counted. |
+| B-reuse (Rubin) | Rejected (`mma_tiler_mn[0]` of 512 with the 2-CTA MMA, 256 with the 1-CTA MMA): N_CHUNK counts CTA tiles of `mma_tiler_mn[0] / 2` (2-CTA) or `mma_tiler_mn[0]` rows. |
+| inputs | Unchanged: E4M3 / E2M1 codes with SF atoms, read in full before any chunk is published. |
+| other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`. |
+
+### Input direction (GLU, stock SFA)
+
+The block-scaled GLU kernels (FC1 forward; SM100 and the Rubin twin) take the BF16 GLU kernel's input-direction options: `streaming_signal_capacity`,
+`device_layout`, `use_pdl` and `launch_pdl_dependents_at_all_streaming_signal_slots_ready`. Sections 1 and 2 hold
+unchanged, and `signal[t]` covers M tile t's scale factors as well as its rows of A:
+
+| Item | Contract |
+|---|---|
+| SFA | Swizzled SF atoms (the kernel's stock `sfa` layout): 128 rows x 4 scales per 512-byte atom, the K atoms of a 128-row block contiguous, block after block. |
+| M tile t | A rows `[256 t, 256 (t + 1))` and SFA atom rows 2t and 2t + 1: the contiguous bytes `[t * 256 * Kc, (t + 1) * 256 * Kc)`, `Kc = round_up(ceil(K / sf_vec_size), 4)`. |
+| producer | Writes both, padding rows and padding scale columns included, before the release store of `signal[t]` (section 1, memory ordering). |
+| GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
+| other | Dense weights, `padded_offsets` in global memory, no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA; on Rubin no B-reuse. |
+
+### Input direction with compact SFA (`compact_sfa_sf_warp=True`)
+
+An EP dispatch delivers each token's scales as a compact row, not as SF atoms. With `compact_sfa_sf_warp=True` the SM100
+GLU kernel (not yet the Rubin twin) takes `sfa` as those rows and builds the atoms itself:
+
+| Item | Contract |
+|---|---|
+| SFA | Compact E8M0 rows `[M, K / 32]` (row r = A row r's scales, K order), MXFP8 only, `K % 512 == 0`, at least 4 A/B stages. |
+| M tile t | A rows and compact SFA rows `[256 t, 256 (t + 1))`: the contiguous bytes `[t * 256 * K / 32, (t + 1) * 256 * K / 32)`. |
+| producer | Writes both, padding rows included, before the release store of `signal[t]`. |
+| GEMM | A dedicated SF warp (the last warp) reads each tile's rows with L2-only loads (`ld.global.cg`, 64-bit row index) after the tile's acquire, and stores each row's 4-scale word into the stage's atom. Per group of 4 K tiles it waits for the 4 stages, does `fence.proxy.async.shared::cta` before and after the stores, then one `fence.release.cluster` and 4 relaxed cluster arrives on the MMA leader's full barriers; the MMA warp acquires them at cluster scope. The TMA warp loads no SFA. |
+| other | As stock SFA; cluster (2, 1) with the 2-CTA MMA and the interleaved GLU layout. With every option off the generated code is unchanged. |
+
+Two opt-ins, both off by default, match an EP FC1's needs (SM100 GLU kernel):
+
+| Option | Effect |
+|---|---|
+| `compact_sfa_cta_release=True` (needs `compact_sfa_sf_warp`) | The SF warp arrives on the MMA leader's full barrier once per K tile with a CTA-scope release (`mbarrier.arrive.release.cta.shared::cluster`), and the MMA warp does no cluster-scope acquire. This is faster than the batched cluster release (GLU alone at 65536 x 4096 x 7168: about 1.50 ms against 1.83 ms; stock SF atoms 1.48 ms). It is formally outside the PTX memory model: a CTA-scope release does not order the peer CTA's stores for the leader. It relies on each SF warp storing only into its own CTA's shared memory, where the leader's `tcgen05.cp` reads the peer's atoms. |
+| `generate_sfd_col=False` (with `sfd_row` and `norm_const`) | Writes only the row-quantized E4M3 D and its row SFD. The column-quantized `d_col` and `sfd_col` are neither computed nor stored (both may be None), and their shared-memory stage is freed. |
+
+### 4a. Backward dGLU, input direction
+
+The dGLU kernels (FC1's backward activation: dY x W2 with the dGLU epilogue over the saved pre-activation C) read the
+dispatched output gradient dY as A. Its producer is the backward dispatch, so `signal[t]` covers dY's rows of M tile t
+(and, for MXFP8, their scales) exactly as A's for the forward GLU. C, prob, alpha, beta and B are ordinary inputs that
+must be complete before the GEMM starts.
+
+| Item | Contract |
+|---|---|
+| options | `streaming_signal_capacity`, `device_layout`, `use_pdl`, `launch_pdl_dependents_at_all_streaming_signal_slots_ready` and `launch_pdl_dependents_at_entry`, as for the forward kernels. MXFP8 SM100 also takes `compact_sfa_sf_warp` and `compact_sfa_cta_release` (section 4, compact SFA). |
+| M tile t | dY rows `[256 t, 256 (t + 1))`; MXFP8: their SF atoms (stock) or compact scale rows, as for the GLU forward. |
+| outputs | D (dC), the row and column SFD and dprob are written per tile as without a producer. With `deterministic=True` (SM100) dprob has one slot per N tile, so it is bitwise independent of the release order. The Rubin kernel adds dprob partials with fp32 atomics in tile arrival order: its dprob is not deterministic (not even across replays without a producer); D is. |
+| other | Dense weights (MXFP8), `padded_offsets` in global memory, cluster (2, 1) with the 2-CTA MMA; on Rubin no B-reuse. |
+
+## 5. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |
 |---|---|---|
 | `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). | The GEMM runs beside its producer on one stream. |
-| `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
+| `launch_pdl_dependents_at_entry=True` (plain, quant and dGLU kernels) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
 | `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernel, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
 
-## 5. Sketches
+## 6. Sketches
 
 Producer of `signal[]` (CUDA C++; one block per M tile):
 
@@ -220,7 +294,7 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
   `CUDA_MODULE_LOADING=EAGER` also avoids it.
 - **`N_CHUNK`:** after the GEMM, `signal[u] == u` for every `u < ceil(N / C)`, and D matches the stock run bit for bit.
 
-## 6. Constraints
+## 7. Constraints
 
 - Cluster shapes: the input direction (`streaming_signal_capacity`) supports only (2, 1) with the 2-CTA MMA; a (1, 1)
   cluster is **not supported** (the scheduler broadcasts each claim into a peer CTA's shared memory and asserts at
@@ -229,8 +303,11 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - `streaming_signal_capacity` and `N_CHUNK` cannot be combined in one kernel; both need `use_dynamic_sched=True`.
 - N must be known at build time (dense B).
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
-  exists on the GLU kernel only and requires `streaming_signal_capacity`.
-- Covered today: the BF16 plain and GLU grouped GEMM forward kernels. Other recipes are not wired up yet.
+  exists on the GLU and dGLU kernels only and requires `streaming_signal_capacity`.
+- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3), `N_CHUNK` on the block-scaled
+  quant forward kernels with BF16 D, the input direction on the block-scaled GLU kernels with stock or compact SFA
+  (section 4), and the input direction on the BF16 and MXFP8 dGLU kernels (section 4a). Other recipes are not wired up
+  yet.
 
 ## Acknowledgements
 
