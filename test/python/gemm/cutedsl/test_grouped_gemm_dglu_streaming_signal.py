@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Streaming input signal of the dSwiGLU (backward FC1 activation) kernels, BF16 and MXFP8 on SM100.
+"""Streaming input signal of the dSwiGLU (backward FC1 activation) kernels: BF16 and MXFP8 on SM100 and, on SM107, the
+MXFP8 Rubin twin (stock SF atoms).
 
 The producer (an EP dispatch of the output gradient) writes dY's rows, and for MXFP8 their scales (SF atoms, or compact
 rows with ``compact_sfa_sf_warp``), then releases ``signal[t] = t`` for the 256-row M tile t.  The signal scheduler only
-reorders tiles and waits, so D and the deterministic dprob must be raw-byte equal to the stock dynamic scheduler's.  dY
+reorders tiles and waits, so D and the deterministic dprob (SM100) must be raw-byte equal to the stock dynamic scheduler's;
+the Rubin kernel's dprob is an fp32 atomic sum in arrival order, compared with a tolerance (8 fp32 eps of max |dprob|).  dY
 and its scales are poisoned (NaN) until their tile is released: a tile loaded before its signal carries NaN into D.
 
 L0 keeps one case per behaviour; the remaining routings and release orders are L1.
@@ -60,10 +62,8 @@ SIGNAL_VARIANTS = {
 
 
 def skip_unsupported(recipe, options):
-    if recipe == "mxfp8" and is_rubin():
-        pytest.skip("the SM100 MXFP8 kernel (the Rubin twin does not take a streaming input producer)")
-    if options.get("compact_sfa_sf_warp") and recipe != "mxfp8":
-        pytest.skip("compact_sfa_sf_warp: the MXFP8 kernel only")
+    if options.get("compact_sfa_sf_warp") and (recipe != "mxfp8" or is_rubin()):
+        pytest.skip("compact_sfa_sf_warp: the SM100 MXFP8 kernel only")
 
 
 def stock(recipe, tokens):
@@ -110,7 +110,6 @@ def test_dglu_signal_matches_dynamic(recipe, variant, routing):
 @pytest.mark.parametrize("recipe, late", [("bf16", "a"), ("mxfp8", "a"), ("mxfp8", "sfa")])
 def test_dglu_poison_reaches_d(recipe, late):
     """The detector works: with dY codes or scales poisoned, the stock kernel's D holds NaN."""
-    skip_unsupported(recipe, {})
     tokens = ROUTINGS["uneven"]
     problem = make_problem(recipe, tokens, seed=1)
     poison_inputs(problem, late)
@@ -122,7 +121,7 @@ def test_dglu_poison_reaches_d(recipe, late):
 @pytest.mark.L0
 def test_dglu_compact_sfa_poison_reaches_d():
     """The detector works for the compact form: with the compact rows poisoned, D holds NaN."""
-    skip_unsupported("mxfp8", {})
+    skip_unsupported("mxfp8", dict(compact_sfa_sf_warp=True))
     tokens = ROUTINGS["uneven"]
     problem = make_problem("mxfp8", tokens, seed=1)
     poison_inputs(problem, "sfa")
@@ -162,7 +161,6 @@ def test_dglu_signal_waits_for_producer(recipe, variant, late):
 @pytest.mark.parametrize("recipe", ["bf16", "mxfp8"])
 def test_dglu_launch_pdl_dependents_at_entry_matches_dynamic(recipe):
     """``launch_pdl_dependents_at_entry`` on the stock dynamic scheduler changes no byte."""
-    skip_unsupported(recipe, {})
     tokens = ROUTINGS["uneven"]
     problem = make_problem(recipe, tokens, seed=3)
     expected, _ = Launcher(stock(recipe, tokens), problem)(problem)
@@ -177,7 +175,6 @@ def test_dglu_launch_pdl_dependents_at_entry_matches_dynamic(recipe):
 def test_dglu_signal_rejects_invalid(recipe):
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 
-    skip_unsupported(recipe, {})
     with pytest.raises(ValueError, match="use_dynamic_sched"):
         make_dglu_kernel(recipe, 4, streaming_signal_capacity=4)
     with pytest.raises(ValueError, match="cluster"):
@@ -192,6 +189,6 @@ def test_dglu_signal_rejects_invalid(recipe):
 
 @pytest.mark.L0
 def test_dglu_compact_sfa_rejects_invalid():
-    skip_unsupported("mxfp8", {})
+    skip_unsupported("mxfp8", dict(compact_sfa_sf_warp=True))
     with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
         make_dglu_kernel("mxfp8", 4, use_dynamic_sched=True, compact_sfa_sf_warp=True, use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1))

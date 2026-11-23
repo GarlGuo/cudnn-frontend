@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Streaming input signal of the MXFP8 block-scaled SwiGLU (FC1) forward kernel (SM100).
+"""Streaming input signal of the MXFP8 block-scaled SwiGLU (FC1) forward kernel: SM100 and, on SM107, the Rubin twin
+(stock SF atoms; the compact-SFA cases skip there).
 
 The producer writes A (E4M3 codes) and its scale factors as swizzled SF atoms, then releases ``signal[t] = t``; tile t
 covers A rows ``[256 t, 256 (t + 1))`` and the SFA atom rows 2t and 2t + 1, the contiguous bytes
@@ -49,8 +50,6 @@ def require_sm10x():
     reason = cutedsl_arch_requirement_error(cc)
     if reason is not None:
         pytest.skip(reason)
-    if is_rubin():
-        pytest.skip("the SM100 GLU kernel (the Rubin twin does not take a streaming input producer)")
 
 
 def levels(cases, l0, ids):
@@ -200,13 +199,20 @@ def test_mxfp8_glu_signal_rejects_invalid():
 
 # ---- compact_sfa_sf_warp: SFA is the compact E8M0 rows [rows, K / 32]; the SF warp writes the SF atoms ----
 
+
+@pytest.fixture
+def sm100_kernel_only():
+    if is_rubin():
+        pytest.skip("compact_sfa_sf_warp: the SM100 kernel only (the Rubin GLU kernel takes SF atoms)")
+
+
 COMPACT_VARIANTS = ("dynamic", "signal", "signal_layout_trigger")
 COMPACT_CASES = [(variant, routing) for variant in COMPACT_VARIANTS for routing in sorted(ROUTINGS)]
 COMPACT_L0 = {("dynamic", "big_expert"), ("signal", "many_experts_64"), ("signal_layout_trigger", "uneven")}
 
 
 @pytest.mark.parametrize("variant, routing", levels(COMPACT_CASES, COMPACT_L0, lambda variant, routing: f"{variant}-{routing}"))
-def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing):
+def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing, sm100_kernel_only):
     """The SF warp's atoms from the compact rows give the bytes of the stock kernel's TMA'd atoms."""
     tokens = ROUTINGS[routing]
     problem = make_problem(tokens, N, HIDDEN, seed=len(routing) + 1)
@@ -223,7 +229,7 @@ def test_mxfp8_glu_compact_sfa_matches_atoms(variant, routing):
 
 
 @pytest.mark.L0
-def test_mxfp8_glu_compact_sfa_poison_reaches_d():
+def test_mxfp8_glu_compact_sfa_poison_reaches_d(sm100_kernel_only):
     """The detector works for the compact form: with the compact rows poisoned, D holds NaN."""
     tokens = ROUTINGS["uneven"]
     problem = make_problem(tokens, N, HIDDEN, seed=1)
@@ -238,7 +244,7 @@ COMPACT_PRODUCER_L0 = {("sfa", "reverse"), ("both", "random")}
 
 
 @pytest.mark.parametrize("late, order", levels(COMPACT_PRODUCER_CASES, COMPACT_PRODUCER_L0, lambda late, order: f"late_{late}-{order}"))
-def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order):
+def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order, sm100_kernel_only):
     """The producer writes each M tile's compact SFA rows (and A) before releasing it; the SF warp must not load a row
     early (it reads through L2 only, after the tile's acquire)."""
     tokens = ROUTINGS["many_experts_64"]
@@ -249,7 +255,7 @@ def test_mxfp8_glu_compact_sfa_waits_for_producer(late, order):
 
 
 @pytest.mark.L0
-def test_mxfp8_glu_compact_sfa_device_layout_waits_for_producer():
+def test_mxfp8_glu_compact_sfa_device_layout_waits_for_producer(sm100_kernel_only):
     tokens = ROUTINGS["many_experts_64"]
     problem = make_problem(tokens, N, HIDDEN, seed=11)
     expected, _ = Launcher(stock(tokens), problem)(problem)
@@ -259,7 +265,7 @@ def test_mxfp8_glu_compact_sfa_device_layout_waits_for_producer():
 
 
 @pytest.mark.L0
-def test_mxfp8_glu_compact_sfa_rejects_invalid():
+def test_mxfp8_glu_compact_sfa_rejects_invalid(sm100_kernel_only):
     with pytest.raises(ValueError, match="compact_sfa_sf_warp"):
         make_glu_kernel(4, use_dynamic_sched=True, compact_sfa_sf_warp=True, sf_vec_size=16)
     with pytest.raises(ValueError, match="compact_sfa_sf_warp"):

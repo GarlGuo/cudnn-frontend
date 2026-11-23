@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Bitwise determinism of the streaming input signal on the dSwiGLU kernels: BF16 and MXFP8 on SM100 with
-``deterministic=True`` (one dprob slot per N tile).
+``deterministic=True`` (one dprob slot per N tile), and the MXFP8 Rubin twin on SM107.  The Rubin kernel adds its fp32
+dprob partials with atomics in tile arrival order, so its dprob is not deterministic, not even across replays of the stock
+scheduler: there D is compared bit for bit and dprob within 8 fp32 eps of max |dprob| (not deterministic on the Rubin
+MXFP8 dGLU).
 
 ``streaming_signal_capacity`` changes which cluster runs a tile and when, never the tile math, so D and dprob must be
 raw-byte equal across replays, producer release orders and the stock dynamic scheduler.
@@ -64,8 +67,8 @@ CASES = [
 
 
 def skip_unsupported(recipe, variant):
-    if recipe == "mxfp8" and is_rubin():
-        pytest.skip("the SM100 MXFP8 kernel (the Rubin twin does not take a streaming input producer)")
+    if variant.startswith("compact") and is_rubin():
+        pytest.skip("compact_sfa_sf_warp: the SM100 MXFP8 kernel only")
 
 
 def signal_kernel(recipe, problem, experts, variant):
@@ -83,6 +86,7 @@ def test_dglu_signal_replays_match_dynamic(recipe, variant):
     expected = snapshot(Launcher(make_dglu_kernel(recipe, len(tokens), use_dynamic_sched=True), problem)(problem)[0])
     kernel = signal_kernel(recipe, problem, len(tokens), variant)
     launcher = Launcher(kernel, problem)
+    # Rubin: exact_outputs drops the atomic dprob, checked against stock within tolerance below.
     replayed = assert_replays(lambda: exact_outputs(kernel, launcher(problem, signal_ready(kernel))[0]), repeats=REPLAYS)
     assert_bitwise(replayed, exact_outputs(kernel, expected), f"{recipe} {variant} vs stock")
     assert_outputs_match(kernel, launcher(problem, signal_ready(kernel))[0], expected, f"{recipe} {variant} vs stock")
@@ -143,6 +147,7 @@ def test_dglu_signal_slot_release_warm_stress(recipe, variant):
         launcher.launch(problem, (d, dprob, workspace))
 
     claims = (problem["rows"] // ROWS_ALIGNMENT) * (INTERMEDIATE // 256)
+    # Rubin: the atomic dprob is left out of the bitwise comparison (exact_outputs); D still covers every tile.
     assert_warm_stress(
         StressCase(
             f"{recipe} dGLU streaming signal scheduler{', compact SFA' if variant.startswith('compact') else ''}, big expert, 4 clusters",

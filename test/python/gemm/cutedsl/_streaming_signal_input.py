@@ -19,10 +19,10 @@ def is_rubin():
 
 
 def make_glu_kernel(experts, **options):
-    """The SM100 MXFP8 SwiGLU kernel (FC1) with BF16 C and D, cluster (2, 1) with the 2-CTA 256 x 256 tile."""
+    """The MXFP8 SwiGLU kernel (FC1) with BF16 C and D, cluster (2, 1) with the 2-CTA 256 x 256 tile; the Rubin twin on
+    SM107."""
     import cutlass
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
-    from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
 
     common = dict(
         sf_vec_size=SF_VEC_SIZE,
@@ -39,7 +39,17 @@ def make_glu_kernel(experts, **options):
     )
     # An option naming a construction argument overrides it (the rejection tests).
     common.update({name: options.pop(name) for name in list(options) if name in common})
-    kernel = BlockScaledMoEGroupedGemmGluBiasKernel(**common, **options)
+    # compact_sfa_sf_warp is the SM100 kernel's alone: off, it is not passed (the Rubin twin has no such argument).
+    if not options.get("compact_sfa_sf_warp"):
+        options.pop("compact_sfa_sf_warp", None)
+    if is_rubin():
+        from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_rubin import BlockScaledMoEGroupedGemmGluKernel
+
+        kernel = BlockScaledMoEGroupedGemmGluKernel(generate_c=True, **common, **options)
+    else:
+        from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel
+
+        kernel = BlockScaledMoEGroupedGemmGluBiasKernel(**common, **options)
     # compact_sfa_sf_warp: SFA is the compact E8M0 rows [rows, K / 32] (problem["a_exp"]), not the SF atoms.
     kernel.test_compact = bool(options.get("compact_sfa_sf_warp"))
     kernel.test_compile_key = (type(kernel).__module__, frozen({**common, **options}))
@@ -138,7 +148,7 @@ def kernel_args(kernel, problem, c, d, workspace):
     sfa = tensor((problem["a_exp"] if kernel.test_compact else problem["sfa"]).view(torch.float8_e8m0fnu))
     offsets = from_dlpack(problem["offsets"], assumed_align=4)
     c_cute, d_cute = tensor(c), tensor(d)
-    # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias)
+    # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias), SM100 and Rubin alike.
     return head + [c_cute, d_cute, d_cute, sfa, None, None, None, None, offsets, tensor(problem["alpha"]), tensor(problem["prob"]), None]
 
 
