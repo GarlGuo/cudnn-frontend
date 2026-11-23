@@ -10,9 +10,14 @@ memory: the readiness signals.
 | producer → GEMM | `streaming_signal_capacity` | consumer | one cluster M tile of A (256 rows) | `MoEStreamingInputBlockSignalTileScheduler` |
 | GEMM → consumer | `streaming_output_notify=StreamingOutputNotifyConfig(StreamingOutputNotifyMode.N_CHUNK, ...)` | producer | one N chunk of D columns | `MoEStreamingOutputChunkSignalTileScheduler` |
 
-Kernels: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`,
-input direction only), BF16 on SM100-class GPUs. Both directions need `use_dynamic_sched=True`. Every option is off by
-default; with the defaults the generated code is the same as without this feature.
+Kernels:
+- BF16 on SM100-class GPUs: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and
+  `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`, input direction only).
+- MXFP8 / NVFP4 block-scaled, output direction only: `BlockScaledMoEGroupedGemmQuantKernel` in `quant/grouped_gemm_quant.py`
+  (SM100), the FC2 forward. See section 4. The Rubin (SM107) quant kernel takes the same options in a later change.
+
+Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the
+same as without this feature.
 
 ## 1. Input direction: producer → GEMM
 
@@ -86,7 +91,7 @@ producer does not need a proxy fence of its own.
 ### Liveness
 
 - The producer must be able to run while the GEMM waits. Give the GEMM fewer clusters than the device holds
-  (`max_active_clusters`), or launch it as the producer's programmatic dependent (section 4). Either way, the producer
+  (`max_active_clusters`), or launch it as the producer's programmatic dependent (section 5). Either way, the producer
   keeps the SMs it needs.
 - The producer must not wait on the GEMM.
 
@@ -164,7 +169,22 @@ routing.
 - A GEMM with no rows (`padded_offsets[E-1] == 0`) exits before publishing anything. The consumer must not wait on
   `signal[]` when it received no rows.
 
-## 4. Programmatic dependent launch (PDL) options
+## 4. Block-scaled kernel (MXFP8, NVFP4)
+
+The SM100 block-scaled quant kernel (FC2 forward) takes the output direction with the same options as the BF16 plain
+kernel: `streaming_output_notify`, `use_pdl` and `launch_pdl_dependents_at_entry`. Section 3 holds unchanged, with these
+limits. SM107 (the Rubin quant kernel) is not wired yet.
+
+| Item | Contract |
+|---|---|
+| D | BF16, row major. `signal[u]` counts D's bulk tensor stores only. |
+| SFD, amax | Not published per chunk. `generate_sfd` is rejected at construction; an `amax_tensor` or SFD tensor at trace time. |
+| inputs | Unchanged: E4M3 / E2M1 codes with SF atoms, read in full before any chunk is published. |
+| other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`. |
+
+The input direction is not wired for the block-scaled kernels yet.
+
+## 5. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |
 |---|---|---|
@@ -172,7 +192,7 @@ routing.
 | `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
 | `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernel, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
 
-## 5. Sketches
+## 6. Sketches
 
 Producer of `signal[]` (CUDA C++; one block per M tile):
 
@@ -220,7 +240,7 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
   `CUDA_MODULE_LOADING=EAGER` also avoids it.
 - **`N_CHUNK`:** after the GEMM, `signal[u] == u` for every `u < ceil(N / C)`, and D matches the stock run bit for bit.
 
-## 6. Constraints
+## 7. Constraints
 
 - Cluster shapes: the input direction (`streaming_signal_capacity`) supports only (2, 1) with the 2-CTA MMA; a (1, 1)
   cluster is **not supported** (the scheduler broadcasts each claim into a peer CTA's shared memory and asserts at
@@ -230,7 +250,8 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - N must be known at build time (dense B).
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
   exists on the GLU kernel only and requires `streaming_signal_capacity`.
-- Covered today: the BF16 plain and GLU grouped GEMM forward kernels. Other recipes are not wired up yet.
+- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3), and `N_CHUNK` on the SM100
+  block-scaled quant forward kernel with BF16 D (section 4). Other recipes are not wired up yet.
 
 ## Acknowledgements
 
