@@ -73,6 +73,7 @@ arbitrary user callbacks.
 | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
 | `grouped_gemm_wgrad_wrapper_sm100`, empty-expert output contract | wgrad | NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 or FP32 dW | Unsupported | Supported for empty experts (SM100); general nonempty determinism and SM103 unverified | Unverified |
 | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | bprop | BF16, NVFP4 E2M1/E4M3, MXFP8 E4M3/E8M0; BF16 saved C | Unsupported | Supported with reduction limits below (SM100); SM103 unverified | Unsupported |
+| `grouped_gemm_dglu_wrapper_sm100` and `GroupedGemmDgluSm100`, `activation_tensor` (`dgeglu`, `dswiglu`) | bprop | BF16 C/D_row and activation | Unsupported | Supported for `activation_tensor` and `D_row` (SM100, tested configurations); atomic dprob/dbias are not guaranteed; SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 C/D | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100`, `glu_layout="gate_then_up"` | fprop | NVFP4 E2M1/E4M3; BF16 saved C; BF16 or NVFP4 rowwise RHT | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unsupported |
 | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` (Torch); colwise RHT | fprop | NVFP4 E2M1 / E4M3; standard GEMM-blocked column scales; both GLU input layouts | Unsupported | Supported (SM100, tested configurations); SM103 unverified | Unverified for interleaved input; gate/up unsupported |
@@ -167,8 +168,14 @@ arbitrary user callbacks.
 | `pygraph.sdpa_mxfp8` with `causal_exclude_own_block=32` | fprop | MXFP8 E4M3 or E5M2 Q/K/V; E8M0 scales; BF16 O, FP32 Stats | Unsupported | Supported (cc 10.0 verified; cc 10.3 unverified) | Unsupported |
 | `grouped_gemm_glu_jax_sm100`, `situglu` | fprop | MXFP8 | Unsupported | Unverified | Unsupported |
 | `grouped_gemm_dglu_jax_sm100`, `dsituglu` | bprop | MXFP8 | Unsupported | Unverified; atomic dprob is not guaranteed | Unsupported |
+| `grouped_gemm_dglu_wrapper_sm100` with `deterministic=True`, BF16 kernel (`dswiglu`, `dgeglu`; Torch; no dbias) | bprop | BF16 A/B/C/D_row; FP32 dprob | Unsupported | Supported for dprob and D_row (SM100, tested configurations); SM103 unverified | Unverified |
 | `grouped_gemm_glu_hadamard_wrapper_sm100`, `srelu` with `tanh_clamp_scale` and `rht_sign_mask` | fprop | FP4 inputs with E8M0 block scales; BF16 C/D; FP32 Amax and PostRhtAmax | Unsupported | Replay only (tested configurations) | Unverified |
 | `cutemok_forward` / `cutemok_backward` | fprop, bprop | BF16; MXFP8 routed weights | Unsupported | Unverified (SM100 MXFP8 replay checked; batch invariance and SM103 unverified) | Unsupported |
+| BF16 grouped GEMM kernels (`MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel`), `use_dynamic_sched=True` with `streaming_signal_capacity` (host or `device_layout` expert layout, optional PDL triggers), dense weights, (2, 1) cluster | fprop | BF16 A/B/C/D; FP32 accumulate | Unsupported | SM100: Supported (tested configurations; bytes equal the stock dynamic scheduler's for every producer release order); SM103: Unverified | Unverified |
+| `MoEGroupedGemmBf16Kernel`, `use_dynamic_sched=True` with `streaming_output_notify` (`N_CHUNK`), dense weights | fprop | BF16 A/B/C/D; FP32 accumulate | Unsupported | SM100: Supported (tested configurations, early-stopping and non-stopping extra clusters); SM103: Unverified | Unverified |
+| `BlockScaledMoEGroupedGemmQuantKernel` (SM100; Rubin twin on SM107), `use_dynamic_sched=True` with `streaming_output_notify` (`N_CHUNK`), dense weights, BF16 D | fprop | MXFP8 A/B (E4M3, E8M0 block scales); BF16 D; FP32 accumulate | Unsupported | SM100: Supported (tested configurations: cluster (2, 1) and (1, 1), early-stopping and non-stopping extra clusters, chunk sizes); SM103: Unverified | Unverified |
+| `BlockScaledMoEGroupedGemmGluBiasKernel` (SM100; Rubin twin `BlockScaledMoEGroupedGemmGluKernel` on SM107, stock SFA only), SwiGLU, `use_dynamic_sched=True` with `streaming_signal_capacity` (host or `device_layout` expert layout, optional PDL trigger; stock or `compact_sfa_sf_warp` SFA), dense weights, (2, 1) cluster | fprop | MXFP8 A/B (E4M3, E8M0 block scales); BF16 C/D; FP32 accumulate | Unsupported | SM100: Supported (tested configurations; bytes equal the stock dynamic scheduler's for every producer release order); SM103: Unverified | Unverified |
+| dGLU kernels `MoEGroupedGemmDgluDbiasBf16Kernel` and `BlockScaledMoEGroupedGemmDgluDbiasKernel` (SM100, `deterministic=True`; Rubin twin `BlockScaledMoEGroupedGemmDgluKernel` on SM107, stock SFA), dSwiGLU, `use_dynamic_sched=True` with `streaming_signal_capacity` (host or `device_layout` expert layout, optional PDL triggers; MXFP8 SM100: stock or `compact_sfa_sf_warp` SFA, cluster or CTA-scope SF release), dense weights, (2, 1) cluster | bprop | BF16 A/B/C/D, or MXFP8 A/B (E4M3, E8M0 block scales) with BF16 C/D; FP32 dprob | Unsupported | SM100: Supported for D and the dprob slots (tested configurations; bytes equal the stock dynamic scheduler's for every producer release order); SM103: Unverified | D: Unverified pending a Rubin run (bitwise against stock in the tests); dprob: not deterministic on the Rubin MXFP8 dGLU (fp32 atomics in tile arrival order, also without a producer), compared within fp32 reassociation |
 
 On SM89 (GeForce RTX 4090), the FP16 width-four `cudnn.ops.causal_conv1d_update`
 passed replay, batch-isolation, and golden checks for both output and state.
@@ -384,12 +391,21 @@ for replay, batch-invariance, and stress-test results.
   failing case IDs and do not establish determinism. See the
   [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#simplified-sparse-attention-ci-failures--2026-11-20).
 
+- `grouped_gemm_dglu_wrapper_sm100`, BF16 kernel: by default dprob combines its
+  N-tiles with an fp32 atomic, so it changes between runs once N spans more
+  than one tile (256 columns at the default tile). With `deterministic=True`,
+  dprob and D_row repeat byte for byte. They are also unchanged when experts
+  are reordered or duplicated, or their neighbors change. D_row does not
+  depend on the flag. dbias and JAX inputs raise under the flag. See the
+  [test report](https://github.com/NVIDIA/cudnn-frontend/blob/develop/test/python/determinism_goldens/README.md#grouped-bf16-dglu-deterministic-dprob--sm100-2026-11-23-utc).
+
 - Canonical grouped GLU: the new branch-order option is distinct from the
   APIs' natural-rank tensor support. The forward suite checks C, both D
   orientations and their scale factors; backward checks both D orientations,
   scales, dprob and optional dbias. Deterministic dprob uses the existing
-  deterministic reduction for MXFP8/NVFP4 (`deterministic=True`). BF16 dprob
-  byte qualification is limited to the tested single-N-tile F=128 case.
+  deterministic reduction for MXFP8/NVFP4 and BF16 (`deterministic=True`).
+  With the flag, BF16 dprob is byte-qualified at four N-tiles (F=1024). Without
+  it, BF16 dprob byte qualification is limited to the tested single-N-tile F=128 case.
   Atomic dbias and legacy-alias atomic dprob are separate numerical checks
   and carry no new bitwise guarantee. SM100 passed independent references,
   replay and batch invariance; SM103 is unverified.
