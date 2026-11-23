@@ -21,8 +21,17 @@ from gemm.cutedsl import _streaming_signal_blockscaled as bs
 from gemm.cutedsl import _streaming_signal_dglu as dg
 
 SHAPES = {"deepseek_v3": (64, 1024, 7168, 2048), "qwen35_397b": (128, 768, 4096, 1024)}
-VARIANTS = {"stock_dynamic": (False, {}), "signal": (True, {})}
-KNOBS = ()
+VARIANTS = {
+    "stock_dynamic": (False, {}),
+    "signal": (True, {}),
+    # DIAGNOSTIC (wip/sigsched-nanosleep-diag): every failed scheduler-warp poll sleeps (see _diag_poll_backoff).
+    "signal_sleep256": (True, {"SIGDIAG_NANOSLEEP": "256"}),
+    "signal_sleep2048": (True, {"SIGDIAG_NANOSLEEP": "2048"}),
+}
+KNOBS = ("SIGDIAG_NANOSLEEP",)
+# DIAG_ONLY=<variant,...> restricts the run.
+if os.environ.get("DIAG_ONLY"):
+    VARIANTS = {name: VARIANTS[name] for name in os.environ["DIAG_ONLY"].split(",")}
 
 
 def build(kind, shape, name, problem):
@@ -35,6 +44,7 @@ def build(kind, shape, name, problem):
     if signal:
         options["streaming_signal_capacity"] = problem["rows"] // 256
     kernel = bs.make_glu_kernel(experts, **options) if kind == "glu" else dg.make_dglu_kernel("mxfp8", experts, **options)
+    kernel.test_compile_key = (kernel.test_compile_key, name)  # the knob is not a constructor option
     launcher = bs.Launcher(kernel, problem) if kind == "glu" else dg.Launcher(kernel, problem)
     for knob in KNOBS:
         os.environ.pop(knob, None)

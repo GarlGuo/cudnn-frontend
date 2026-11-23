@@ -61,6 +61,7 @@ from cutlass.cutlass_dsl import (
 )
 from cutlass.cute.typing import AddressSpace
 from cutlass._mlir import ir
+from cutlass._mlir.dialects import nvvm
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import Agent, CooperativeGroup, PipelineUserType, make_pipeline_state
 from .moe_kernel_helpers import (
@@ -119,6 +120,16 @@ def streaming_signal_workspace_bytes_after_counter(streaming_signal_capacity: in
     return streaming_scheduler_state_offset(streaming_signal_capacity) - 4 + 4 * _state_region_offsets(streaming_signal_capacity, local_expert_count)["total"]
 
 
+def _diag_poll_backoff():
+    """DIAGNOSTIC (wip/sigsched-nanosleep-diag): with SIGDIAG_NANOSLEEP=<ns> (read at trace time) a failed poll of the
+    scheduler warp sleeps that long, so a spinning warp issues almost nothing.  Unset: nothing emitted."""
+    import os
+
+    ns = int(os.environ.get("SIGDIAG_NANOSLEEP", "0"))
+    if ns > 0:
+        nvvm.nanosleep(Int32(ns).ir_value())
+
+
 @cute.jit
 def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     """Block, without bound, until ``*ptr >= floor`` and return it, acquiring the writer's earlier stores.
@@ -129,6 +140,8 @@ def _spin_until_at_least(ptr, floor: Int32) -> Int32:
     value = Int32(floor - 1)
     while value < floor:
         value = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+        if value < floor:
+            _diag_poll_backoff()
     fence_acquire_gpu()
     return value
 
@@ -140,6 +153,8 @@ def _poll_until_at_least(ptr, floor: cutlass.Constexpr) -> None:
     value = Int32(floor - 1)
     while value < floor:
         value = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+        if value < floor:
+            _diag_poll_backoff()
 
 
 class MoEInputBlockSignalSchedulerParams:
@@ -511,6 +526,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             if lane_expert == expert:
                 ready_m_tile_count_candidate = lane_ready_m_tile_count
             m_tile_count = cute.arch.warp_redux_sync(ready_m_tile_count_candidate, "max")
+            if m_tile_count == 0:
+                _diag_poll_backoff()
         # Makes this lane's relaxed flag reads above acquire patterns: each ready flag's producer release now
         # happens before the release of ``assigned_claim_count`` below (after bar.warp.sync), so a claimer's one
         # acquire of ``assigned_claim_count`` also acquires every M tile of the batches published here.
@@ -624,6 +641,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             # covers the ``st.async`` word, and the claim's acquire is already in program order.
             while not broadcast_arrived:
                 broadcast_arrived = cute.arch.mbarrier_try_wait(consumer_full_barrier_ptr, dynamic_state.consumer_state.phase)
+                if not broadcast_arrived:
+                    _diag_poll_backoff()
         else:
             # A peer: relaxed cluster-scope polls (no L1 invalidation per poll), then ONE cluster acquire.  The
             # relaxed read of the leader's arrive (after its ``fence.release.cluster``) and this fence form an acquire
@@ -632,6 +651,8 @@ class MoEStreamingInputBlockSignalTileScheduler:
             # releases the slot, so the fence acquires this phase's arrive.
             while not broadcast_arrived:
                 broadcast_arrived = mbarrier_try_wait_parity_relaxed_cluster(consumer_full_barrier_ptr, dynamic_state.consumer_state.phase)
+                if not broadcast_arrived:
+                    _diag_poll_backoff()
             fence_acquire_cluster()
         return broadcast_tensor[0]
 
