@@ -1000,6 +1000,7 @@ pytest core/test_determinism_utils.py
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_canonical.py` | `GroupedGemmGluHadamardQuantSm100` and its wrapper, natural tensor ranks with either GLU branch order | C, D/RHT payloads and scales; legacy-rank equality, replay, batch invariance and graph replay | — |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py` | `grouped_gemm_glu_hadamard_quant_wrapper_sm100` | C, D, columnwise RHT data and GEMM-blocked scales | Unsupported (forward-only fusion) |
 | `gemm/cutedsl/test_grouped_gemm_streaming_signal_determinism.py` | `MoEGroupedGemmBf16Kernel`, `MoEGroupedGemmGluBiasBf16Kernel` with `streaming_signal_capacity` (host / device layout, PDL) or `streaming_output_notify=N_CHUNK` | BF16 C and D over the experts' rows | Unsupported (forward-only kernels) |
+| `gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py` | `BlockScaledMoEGroupedGemmQuantKernel` (SM100; the Rubin twin on SM107), MXFP8, with `streaming_output_notify=N_CHUNK` | BF16 D over the experts' rows | Unsupported (forward-only kernels) |
 | `TestKDA` | `kimi_delta_attention` | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
 | `causal_conv1d/cutedsl/test_causal_conv1d_update_determinism.py` | `cudnn.ops.causal_conv1d_update`, FP16 width-four decode | FP16 output and mutated state | Unsupported (inference only) |
 | `TestGDP` | `gated_delta_product`, 1/2/3 Householder steps | output, final state | dQ, dK, dV, dG, dBeta, dInitialState |
@@ -2628,6 +2629,38 @@ the strict 48 and the three sanitizer passes. The ordinary candidate-generator
 failure is a separate integration blocker; these explicit-plan results do
 not claim it is fixed. Existing measurements below are retained, not rerun
 as part of this addition.
+
+### Block-scaled grouped GEMM N_CHUNK output notify — SM100, 2026-11-23
+
+`gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py` adds 8 L0 forward cases for
+`streaming_output_notify=N_CHUNK` on the MXFP8 block-scaled quant (FC2) kernel: E4M3 A/B with E8M0 SF atoms (quantized
+once, reused unchanged), BF16 D, dense weights, dynamic scheduler, cluster (2, 1) with the 256 x 256 2-CTA tile and
+(1, 1) with the 128 x 256 1-CTA tile. N_CHUNK reorders tiles only, so every case compares raw D bytes:
+
+- Replay (4 cases): N=768/chunk 512 (partial last chunk) and N=1024/chunk 256 at both cluster shapes, 64 ragged
+  experts. Three launches each on fresh NaN-filled D and workspace beside concurrent work, with one cluster beside the
+  consumer (extras stop early) and 1000 (none); both equal the stock dynamic scheduler, which also matches the
+  dequantized float reference.
+- Chunk-size invariance (1 case): chunk 256, 512 and 1024 (one chunk) on a 5000-row expert give identical bytes.
+- Batch invariance (2 cases): a 700-row target expert keeps its codes, scales, B, alpha and prob alone, with
+  neighbors, behind empty experts, among 1/255/257-row experts, reordered and duplicated, at both cluster shapes; each
+  copy equals the stock scheduler's bytes for the target alone.
+- Claim-slot warm stress (1 case, Rule 11): 0 wrong of 500 warm and 0 of 500 poisoned launches (8 thread blocks, 25
+  slot refills per launch, below the control's geometry, so the zero bounds little); the unsafe control failed 200 of
+  200.
+
+`test_grouped_gemm_blockscaled_streaming_signal.py` holds the independent float reference and a concurrent consumer
+that copies each chunk on publication (a variant that counts tiles before their D stores fails it). No golden is
+recorded: the claim is byte equality with the stock scheduler on the same runtime. The kernels have no backward.
+
+Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, cuDNN backend 9.24.0, CuTe DSL 4.8.0 (CUDA 12.9), on a
+cuDNN-FE wheel overlaid with this change's sources, one GPU: both files at `-m "L0 or L1"` collected 55 cases and
+**55 passed**, 0 skipped. SM103 and SM107 (the Rubin kernel) remain unverified. From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal_determinism.py -m L0 -q -rs
+python -m pytest gemm/cutedsl/test_grouped_gemm_blockscaled_streaming_signal.py -m "L0 or L1" -q -rs
+```
 
 ### Grouped GEMM streaming signal options — SM100, 2026-11-20
 
