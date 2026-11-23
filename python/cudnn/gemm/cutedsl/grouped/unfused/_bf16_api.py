@@ -18,6 +18,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cudnn.api_base import APIBase, TensorDesc
 from cudnn._torch_stream import as_torch_stream
 from cudnn.datatypes import _convert_to_cutlass_data_type
+from cudnn.frost.workspace import Workspace
 from cudnn.tensor_adapter import (
     allocate_byte_workspace,
     canonicalize_unit_dim_strides,
@@ -170,6 +171,7 @@ class GroupedGemmBf16API(APIBase):
         self._has_bias = self.bias_desc is not None
         self._kernel = MoEGroupedGemmBf16KernelSm90 if self._is_sm90 else MoEGroupedGemmBf16Kernel
         self._workspace: Optional[torch.Tensor] = None
+        self._scratch_nbytes = 0
         self._live_b_ptrs = None
         self._compile_b_ptrs = None
         self.num_cluster_overlap_margin = int(os.getenv("CUDNNFE_CLUSTER_OVERLAP_MARGIN", "0"))
@@ -372,6 +374,8 @@ class GroupedGemmBf16API(APIBase):
             raise ValueError("max_active_clusters must be > 0 after applying " "CUDNNFE_CLUSTER_OVERLAP_MARGIN")
 
         workspace_bytes = kernel.get_workspace_bytes()
+        # Bytes the wrappers allocate per call on the launch stream: overlapping calls must not share the counter or descriptors.
+        self._scratch_nbytes = workspace_bytes
         # Internal scratch in the caller's framework allocator; kernels write through its
         # raw pointer and it is never surfaced as a framework array.
         self._workspace = allocate_byte_workspace(self._framework, workspace_bytes, self.a_desc.device)
@@ -462,6 +466,7 @@ class GroupedGemmBf16API(APIBase):
             bias_tensor: Optional[torch.Tensor],
             prob_tensor: torch.Tensor,
             stream: cuda.CUstream,
+            workspace=None,
         ) -> None:
             b_arg = b_tensor if self.weight_mode == MoEWeightMode.DENSE else int(get_data_ptr(b_ptrs))
             raw_compiled(
@@ -470,7 +475,7 @@ class GroupedGemmBf16API(APIBase):
                 cached_n,
                 cached_k,
                 cached_b_stride,
-                workspace_ptr,
+                workspace_ptr if workspace is None else workspace,
                 c_tensor,
                 d_tensor,
                 padded_offsets,
@@ -561,7 +566,11 @@ class GroupedGemmBf16API(APIBase):
         bias_tensor: Optional[torch.Tensor] = None,
         prob_tensor: Optional[torch.Tensor] = None,
         current_stream: Optional[cuda.CUstream] = None,
+        *,
+        workspace=None,
     ) -> None:
+        """``workspace``: optional per-call device buffer of at least ``_scratch_nbytes`` bytes, 128-byte aligned;
+        without it, calls share the plan's workspace and must not overlap."""
         if current_stream is None:
             # torch inputs stay ordered with the caller's current torch stream;
             # other frameworks (e.g. JAX) default to the CUDA legacy default stream.
@@ -592,6 +601,10 @@ class GroupedGemmBf16API(APIBase):
             self._validate_pointer_array_alignment(b_ptrs)
             debug_validate_pointer_values(b_ptrs, "b_ptrs", stream=current_stream)
             self._record_pointer_stream(b_ptrs, current_stream)
+        workspace_ptr = None
+        if workspace is not None and self._scratch_nbytes:
+            nbytes = self._scratch_nbytes
+            workspace_ptr = Workspace(workspace, nbytes, type(self).__name__, device=self.a_desc.device.index).take(nbytes, "uint8").data_ptr()
 
         self._compiled_kernel(
             a_tensor,
@@ -604,4 +617,5 @@ class GroupedGemmBf16API(APIBase):
             bias_tensor,
             prob_tensor,
             current_stream,
+            workspace_ptr,
         )
