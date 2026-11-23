@@ -17,6 +17,7 @@ from cudnn.datatypes import _convert_to_cutlass_data_type
 from cudnn.tensor_adapter import (
     canonicalize_unit_dim_strides,
     cuda_is_available,
+    default_stream,
     detect_framework,
     get_compute_capability,
     has_tcgen05,
@@ -27,7 +28,7 @@ from cudnn.tensor_adapter import (
 )
 
 from ._bf16_api import GroupedGemmBf16API, _validate_pointer_tensor
-from ..backend_utils import row_major_layout
+from ..backend_utils import row_major_layout, wrapper_workspace
 from ..canonical import b_nkl, check_canonical_contiguous
 from ..moe_utils import MoEWeightMode
 
@@ -134,6 +135,14 @@ def _stride_order(tensor: torch.Tensor) -> Tuple[int, ...]:
             key=lambda item: (item[1], shape[item[0]]),
         )
     )
+
+
+def _execute_with_scratch(op, framework, current_stream, **operands):
+    """Run a cached plan with its per-call scratch, allocated on the launch stream."""
+    implementation = op._implementation
+    launch_stream = current_stream if current_stream is not None or framework == "torch" else default_stream(framework)
+    with wrapper_workspace(framework, implementation._scratch_nbytes, operands["a_tensor"].device, launch_stream) as workspace:
+        implementation.execute(current_stream=launch_stream, workspace=workspace, **operands)
 
 
 def _operand_meta(tensor: Optional[torch.Tensor]) -> Optional[tuple]:
@@ -354,7 +363,10 @@ def grouped_gemm_wrapper_sm100(
         op, framework, expected_shape, expected_stride, memo_c_dtype, memo_d_dtype, is_dense = memo
         internal_c = c_tensor if c_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_c_dtype, a_tensor.device)
         d_out = d_tensor if d_tensor is not None else _allocate_output(framework, expected_shape, expected_stride, memo_d_dtype, a_tensor.device)
-        op.execute(
+        _execute_with_scratch(
+            op,
+            framework,
+            current_stream,
             a_tensor=a_tensor,
             c_tensor=internal_c,
             d_tensor=d_out,
@@ -364,7 +376,6 @@ def grouped_gemm_wrapper_sm100(
             b_ptrs=None if is_dense else b_ptrs,
             bias_tensor=bias_tensor,
             prob_tensor=prob_tensor,
-            current_stream=current_stream,
         )
         return TupleDict(d_tensor=d_out, c_tensor=internal_c if generate_c else None)
 
@@ -489,7 +500,10 @@ def grouped_gemm_wrapper_sm100(
 
     _wrapper_memo[_memo_key] = (op, framework, expected_shape, expected_stride, c_dtype, d_dtype, is_dense)
 
-    op.execute(
+    _execute_with_scratch(
+        op,
+        framework,
+        current_stream,
         a_tensor=a_tensor,
         c_tensor=internal_c,
         d_tensor=d_tensor,
@@ -499,7 +513,6 @@ def grouped_gemm_wrapper_sm100(
         b_ptrs=None if is_dense else b_ptrs,
         bias_tensor=bias_tensor,
         prob_tensor=prob_tensor,
-        current_stream=current_stream,
     )
     return TupleDict(
         d_tensor=d_tensor,
