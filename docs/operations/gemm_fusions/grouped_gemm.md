@@ -168,6 +168,10 @@ For a discrete class instance, replace `sample_b` with
   workspace. Wrapper cache keys retain dtype, layout, expert count, optional
   features, scheduler choice, output policy, tile/cluster shape, and overlap
   margin.
+- Each wrapper call allocates its scheduler counter and discrete-mode tensor
+  maps on the launch stream, so same-signature calls may overlap on different
+  streams. A class-API object keeps one internal workspace; do not overlap its
+  `execute()` calls on different streams.
 - Dense and discrete weight arguments are mutually exclusive. Invalid shapes,
   strides, dtypes, devices, alignment, offsets, pointer entries, output
   descriptors, tiles/clusters, or a target below SM100 raise `ValueError` or
