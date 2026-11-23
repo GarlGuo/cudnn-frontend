@@ -7,7 +7,8 @@ MoE BF16 Grouped GEMM + dGLU Kernel for Hopper (SM90).
 
 The SM90 counterpart of moe_grouped_gemm_dglu_dbias.py: A = dY (tokens, K) x B (N, K, experts), with
 the dSwiGLU / dGeGLU epilogue fused. C (the forward's pre-activation) and D (dgate | dup) are
-(tokens, 2 N) in interleaved 32-column gate/up blocks; dprob is an atomic per-row sum.
+(tokens, 2 N) in interleaved 32-column gate/up blocks; dprob is an atomic per-row sum, or with
+``deterministic`` one slot per (row, N tile) that the caller sums in a fixed order.
 
 Supports:
     - Dynamic persistent tile scheduling only, dense K- or N-major weights
@@ -110,6 +111,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         glu_clamp_min: float = -7.0,
         round_dgrad_to_input_dtype: bool = False,
         glu_layout: str = "interleaved_32",
+        deterministic: bool = False,
     ):
         mma_tile_m = mma_tiler_mn[0]
         if self.FIX_PAD_SIZE % (mma_tile_m * cluster_shape_mn[0]) != 0:
@@ -138,6 +140,8 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         self.glu_clamp_min = glu_clamp_min
         self.round_dgrad_to_input_dtype = round_dgrad_to_input_dtype
         self.glu_layout = glu_layout
+        # dprob is (valid_m, n_slots, 1), one slot per N-tile, which the caller reduces in a fixed order.
+        self.deterministic = deterministic
         self.weight_mode = weight_mode
         self.use_dynamic_sched = True
 
@@ -1138,10 +1142,12 @@ class MoEGroupedGemmDgluBf16KernelSm90:
 
                 # A row spans several N tiles, maybe on other CTAs, so its dprob is an atomic sum.
                 for row_slot in cutlass.range_constexpr(2):
-                    atomic_add_float32(
-                        ptr=real_dprob[(m_base + tRS_cAcc[2 * row_slot][0], None, None)].iterator.llvm_ptr,
-                        value=tRS_rDprob[row_slot],
-                    )
+                    if cutlass.const_expr(self.deterministic):
+                        # One writer per (token, tile_n) slot; the atomic is uncontended, kept for one store path.
+                        dprob_slot = real_dprob[(m_base + tRS_cAcc[2 * row_slot][0], epi_work_tile_info.tile_n_idx, None)]
+                    else:
+                        dprob_slot = real_dprob[(m_base + tRS_cAcc[2 * row_slot][0], None, None)]
+                    atomic_add_float32(ptr=dprob_slot.iterator.llvm_ptr, value=tRS_rDprob[row_slot])
 
                 tile_info_pipeline.consumer_wait(tile_info_consumer_state)
                 for idx in cutlass.range(4, unroll_full=True):
