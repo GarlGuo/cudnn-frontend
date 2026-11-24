@@ -289,6 +289,46 @@ bytes as the CLC path. The default, `False`, generates the same code as before.
   supported. The JAX MXFP8 path does not take the option: the wrapper raises
   `ValueError` there.
 
+### Streaming input signal (experimental, kernel level)
+
+A producer kernel, such as an expert-parallel dispatch, can write the token rows
+of an operand while the wgrad kernel runs. Build `MoEGroupedGemmWgradBF16Kernel`
+or `BlockScaledMoEGroupedGemmWgradKernel` (and the SM107 kernel) with
+`atomic_counter_claim=True` and `streaming_signal_capacity=C`; there is no
+wrapper option. The TMA warp then waits, before it loads each K block, until
+the producer has published every token tile the block reads.
+
+- `signal[t]` (int32) covers token rows `[256 t, 256 (t + 1))` of the
+  concatenated token axis (the K offsets of `offsets`), padding rows included,
+  for every operand the producer writes, and their scale factors when block
+  scaled. This is the forward streaming signal's M tile of A, with the same
+  values: -1 not ready, `t` ready.
+- Producer ordering: write every row of tile `t`; if TMA or bulk copies wrote
+  them, wait with `cp.async.bulk.wait_group 0`; make every writer's stores
+  happen-before the publishing thread; then store `t` to `signal[t]` with a
+  gpu-scope release. The kernel loads `signal[t]` with a gpu-scope acquire and
+  issues `fence.proxy.async.global` before its TMA loads, so the producer needs
+  no proxy fence of its own.
+- `C >= ceil(allocated token rows / 256)`; a static token extent is checked
+  when the kernel is built. No K block waits on rows at or past
+  `offsets[E - 1]`, and an empty expert waits on nothing.
+- The workspace is `[TMA descriptors][claim counter, 4 B][signal[C]]`.
+  `cudnn.gemm.cutedsl.grouped.wgrad.streaming_signal` has the byte map
+  (`streaming_signal_workspace_offsets`) and the reset
+  (`reset_streaming_signal_workspace`: `signal[]` to -1, or to `t` with
+  `all_complete=True` when there is no producer). The caller resets `signal[]`
+  before every launch, ordered before the producer and the kernel; never reset
+  it with zeros, which read as ready. The helper kernel still resets the claim
+  counter and never touches `signal[]`.
+- Liveness: the waits have no timeout, and the persistent clusters fill the
+  GPU. The producer must be able to run while the kernel waits: build the
+  kernel with fewer clusters (`max_active_clusters`) or make the producer
+  resident first. The producer must not wait on the kernel.
+- The claim order and each tile's K order do not change, so the output bytes
+  equal those of the kernel without the signal. With
+  `streaming_signal_capacity=None` (the default) the generated code is
+  unchanged.
+
 The BF16 kernel uses dynamic persistent scheduling. The token dimension is
 compiled dynamically, and the wrapper cache abstracts the token-sized axes of A
 and B while retaining static dimensions, layouts, dtypes, output descriptors,

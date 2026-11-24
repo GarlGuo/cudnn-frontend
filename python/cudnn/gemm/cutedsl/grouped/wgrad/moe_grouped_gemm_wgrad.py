@@ -56,6 +56,14 @@ from ..moe_sched_extension import (
 from ..moe_kernel_helpers import (
     compute_stages_wgrad_bf16,
 )
+from .streaming_signal import (
+    check_streaming_signal_capacity,
+    check_streaming_signal_options,
+    STREAMING_SIGNAL_TOKEN_TILE,
+    streaming_signal_ptr,
+    streaming_signal_workspace_bytes,
+    wait_token_tiles_through,
+)
 
 
 class MoEGroupedGemmWgradBF16Kernel:
@@ -77,6 +85,11 @@ class MoEGroupedGemmWgradBF16Kernel:
         tiles from a 4-byte int32 counter in the workspace, which the helper
         kernel resets before every launch, instead of a grid of every tile
         rebalanced by cluster launch control (CLC, the default).
+    :param streaming_signal_capacity: ``signal[]`` entries of a streaming input
+        producer, one per 256-row token tile (``streaming_signal.py``). Set, the
+        TMA warp acquire-waits for the token tiles of each K block before it
+        loads the block. Needs ``atomic_counter_claim``; ``signal[]`` follows the
+        tile counter in the workspace.
     """
 
     FIX_PAD_SIZE = 256
@@ -171,6 +184,7 @@ class MoEGroupedGemmWgradBF16Kernel:
         weight_mode: MoEWeightMode = MoEWeightMode.DENSE,
         input_order: WGradInputOrder = WGradInputOrder.Tensor2D,
         atomic_counter_claim: bool = False,
+        streaming_signal_capacity: Optional[int] = None,
     ):
         self.expert_cnt = expert_cnt
         self.acc_dtype = acc_dtype
@@ -181,6 +195,8 @@ class MoEGroupedGemmWgradBF16Kernel:
         self.weight_mode = weight_mode
         self.input_order = input_order
         self.atomic_counter_claim = atomic_counter_claim
+        check_streaming_signal_options(streaming_signal_capacity, atomic_counter_claim)
+        self.streaming_signal_capacity = streaming_signal_capacity
 
         self.cta_group = tcgen05.CtaGroup.TWO if use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -213,8 +229,9 @@ class MoEGroupedGemmWgradBF16Kernel:
         return WgradTensormapConstructor.get_workspace_size(self.input_order, self.weight_mode, self.expert_cnt)
 
     def get_workspace_bytes(self) -> int:
-        # atomic_counter_claim: the scheduler's int32 tile counter follows the TMA descriptors.
-        return self.get_desc_workspace_bytes() + (4 if self.atomic_counter_claim else 0)
+        # atomic_counter_claim: the scheduler's int32 tile counter follows the TMA descriptors;
+        # streaming_signal_capacity: signal[] follows the counter.
+        return self.get_desc_workspace_bytes() + (4 if self.atomic_counter_claim else 0) + streaming_signal_workspace_bytes(self.streaming_signal_capacity)
 
     @cute.jit
     def _get_sched_counter_ptr(self, workspace_ptr):
@@ -342,6 +359,7 @@ class MoEGroupedGemmWgradBF16Kernel:
 
         # mat_a: (hidden, tokens_sum) -> A: (M=hidden, K=tokens_sum, L=1)
         hidden, tokens_sum = mat_a.shape
+        check_streaming_signal_capacity(self.streaming_signal_capacity, tokens_sum)
         a_gemm = cute.make_tensor(
             mat_a.iterator,
             cute.make_layout(
@@ -795,18 +813,22 @@ class MoEGroupedGemmWgradBF16Kernel:
 
             work_tile_info = scheduler.initial_work_tile_info()
 
-            sched_pipeline.producer_acquire(sched_producer_state)
-            rmem = work_tile_info.to_rmem_tensor()
-            cute.copy(
-                sched_copy_atom,
-                rmem,
-                sched_buf_tensor[(None, sched_producer_state.index)],
-            )
-            cute.arch.fence_proxy("async.shared", space="cta")
-            sched_pipeline.producer_commit(sched_producer_state)
-            sched_producer_state.advance()
+            # atomic_counter_claim: a cluster whose first claim is already past the last tile (more clusters than
+            # tiles) publishes only the sentinel. Consumers stop at the first invalid entry they read, so an invalid
+            # first entry would leave the sentinel's stage unreleased and producer_tail waiting forever. A CLC grid's
+            # first tile is always valid.
+            if cutlass.const_expr(not self.atomic_counter_claim):
+                sched_pipeline.producer_acquire(sched_producer_state)
+                cute.copy(
+                    sched_copy_atom,
+                    work_tile_info.to_rmem_tensor(),
+                    sched_buf_tensor[(None, sched_producer_state.index)],
+                )
+                cute.arch.fence_proxy("async.shared", space="cta")
+                sched_pipeline.producer_commit(sched_producer_state)
+                sched_producer_state.advance()
 
-            work_tile_info = scheduler.advance_to_next_work()
+                work_tile_info = scheduler.advance_to_next_work()
             while work_tile_info.is_valid_tile:
                 sched_pipeline.producer_acquire(sched_producer_state)
                 rmem = work_tile_info.to_rmem_tensor()
@@ -850,6 +872,13 @@ class MoEGroupedGemmWgradBF16Kernel:
             if cutlass.const_expr(self.is_a_mcast or self.is_b_mcast or use_2cta_instrs):
                 a_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2)
                 b_full_mcast_mask = cpasync.create_tma_multicast_mask(cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1)
+
+            if cutlass.const_expr(self.streaming_signal_capacity is not None):
+                signal_ptr = streaming_signal_ptr(self._get_sched_counter_ptr(workspace_ptr))
+                # Token rows from offs[E - 1] on are never signalled: no K block waits on them.
+                signal_valid_rows = offs[self.expert_cnt - 1]
+                # The expert of this thread's previous work tile: its K loop acquired every token tile of that expert.
+                signal_last_expert = cutlass.Int32(-1)
 
             sched_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_sched_stages)
 
@@ -918,10 +947,21 @@ class MoEGroupedGemmWgradBF16Kernel:
                 tAgA_slice = tAgA[(None, mma_tile_m, None, 0)]
                 tBgB_slice = tBgB[(None, work_tile_info.tile_n_idx, None, 0)]
 
+                if cutlass.const_expr(self.streaming_signal_capacity is not None):
+                    # Last token tile known ready; each K block waits for the tiles it reads, up to the last valid row.
+                    signal_ready_through = ext.token_offset // cutlass.Int32(STREAMING_SIGNAL_TOKEN_TILE) - 1
+                    if work_tile_info.expert_idx == signal_last_expert:
+                        # Same expert, same K range: every tile it reads was acquired (and fenced) by this thread.
+                        signal_ready_through = cutlass.Int32(2**31 - 1)
+                    signal_last_expert = work_tile_info.expert_idx
+
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
 
                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                    if cutlass.const_expr(self.streaming_signal_capacity is not None):
+                        block_end = ext.token_offset + (k_tile + 1) * cutlass.Int32(self.cta_tile_shape_mnk[2])
+                        signal_ready_through = wait_token_tiles_through(signal_ptr, signal_ready_through, cutlass.min(block_end, signal_valid_rows) - 1)
                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if handle.count + 1 < k_tile_cnt:
