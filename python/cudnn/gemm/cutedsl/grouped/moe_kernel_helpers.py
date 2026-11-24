@@ -15,7 +15,7 @@ This module contains:
 
 from __future__ import annotations
 
-from typing import Dict, Type, Tuple, Union
+from typing import Dict, Optional, Type, Tuple, Union
 
 import cutlass
 import cutlass.cute as cute
@@ -936,16 +936,21 @@ def compute_stages(
     generate_sfd: bool,
     num_epilog_warps: int = 4,
     bias_dtype=None,
+    generate_sfd_col: bool = True,
+    num_c_stage: Optional[int] = None,
 ) -> Tuple[int, int, int, int, int, int]:
     """Compute the number of pipeline stages for A/B/D operands based on heuristics.
 
     :param num_epilog_warps: Number of epilogue warps (default 4, may differ for DGLU).
     :param bias_dtype: Bias element type (e.g. cutlass.BFloat16) when bias enabled, None otherwise.
+    :param generate_sfd_col: With ``generate_sfd``: a column-quantized D is staged next to D (False: D only).
+    :param num_c_stage: C stages (None: 2 with ``generate_sfd``, else 1); the smem freed goes to A/B stages.
     :return: (num_acc_stage, num_ab_stage, num_c_stage, num_d_stage, num_tile_stage, num_bias_stage)
     """
     num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
-    num_c_stage = 2 if generate_sfd else 1
+    if num_c_stage is None:
+        num_c_stage = 2 if generate_sfd else 1
     num_d_stage = 2 if generate_sfd else 1
 
     num_tile_stage = 2
@@ -1002,7 +1007,7 @@ def compute_stages(
     c_bytes_per_stage = cute.size_in_bytes(c_dtype, c_smem_layout_staged_one)
     c_bytes = c_bytes_per_stage * num_c_stage
     d_bytes_per_stage = cute.size_in_bytes(d_dtype, d_smem_layout_staged_one)
-    d_bytes = d_bytes_per_stage * num_d_stage * (2 if generate_sfd else 1)
+    d_bytes = d_bytes_per_stage * num_d_stage * (2 if generate_sfd and generate_sfd_col else 1)
     amax_bytes = get_amax_smem_size(num_epilog_warps) if d_dtype == cutlass.BFloat16 else 0
     # Bias SMEM stages
     if bias_dtype is not None:
@@ -1412,6 +1417,19 @@ def mbarrier_try_wait_parity_relaxed_cluster(mbar_ptr, phase: Int32, *, loc=None
             ip=ip,
         )
     )
+
+
+@dsl_user_op
+def fence_acquire_cluster(*, loc=None, ip=None) -> None:
+    """``fence.acquire.cluster``: with the strong reads before it, an acquire pattern.  On SM100 and SM107 it is one
+    ``CCTL.IVALL`` (the SM's whole L1 dropped, every warp's lines), so take it once after a relaxed poll, not per poll."""
+    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="cluster", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_acquire_gpu(*, loc=None, ip=None) -> None:
+    """``fence.acquire.gpu``: as ``fence_acquire_cluster`` at gpu scope (also one ``CCTL.IVALL``)."""
+    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="device", loc=loc, ip=ip)
 
 
 @dsl_user_op

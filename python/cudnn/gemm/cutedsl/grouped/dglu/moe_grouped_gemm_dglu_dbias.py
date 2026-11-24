@@ -148,6 +148,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel(StreamingInputSignalMixin):
         streaming_signal_capacity: Optional[int] = None,
         use_pdl: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
+        streaming_signal_multi_batch_opening: bool = True,
+        streaming_signal_acquire_once: bool = False,
     ):
         # Validate FIX_PAD_SIZE compatibility with tile size
         mma_tile_m = mma_tiler_mn[0]
@@ -169,6 +171,8 @@ class MoEGroupedGemmDgluDbiasBf16Kernel(StreamingInputSignalMixin):
             unmet_requirement=None if weight_mode == MoEWeightMode.DENSE else "dense weights",
             use_pdl=use_pdl,
             launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
+            streaming_signal_multi_batch_opening=streaming_signal_multi_batch_opening,
+            streaming_signal_acquire_once=streaming_signal_acquire_once,
         )
 
         self.glu_layout = validate_glu_layout(glu_layout)
