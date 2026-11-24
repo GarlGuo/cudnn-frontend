@@ -1417,6 +1417,19 @@ def mbarrier_try_wait_parity_relaxed_cluster(mbar_ptr, phase: Int32, *, loc=None
 
 
 @dsl_user_op
+def fence_acquire_cluster(*, loc=None, ip=None) -> None:
+    """``fence.acquire.cluster``: with the strong reads before it, an acquire pattern.  On SM100 and SM107 it is one
+    ``CCTL.IVALL`` (the SM's whole L1 dropped, every warp's lines), so take it once after a relaxed poll, not per poll."""
+    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="cluster", loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_acquire_gpu(*, loc=None, ip=None) -> None:
+    """``fence.acquire.gpu``: as ``fence_acquire_cluster`` at gpu scope (also one ``CCTL.IVALL``)."""
+    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="device", loc=loc, ip=ip)
+
+
+@dsl_user_op
 def fence_release_sync_restrict_shared_cta_cluster(*, loc=None, ip=None) -> None:
     """``fence.release.sync_restrict::shared::cta.cluster``: a cluster-scope release of this thread's (and, through a
     barrier, its warp's) earlier operations on ``.shared::cta`` objects only, for a relaxed ``.cluster`` mbarrier arrive

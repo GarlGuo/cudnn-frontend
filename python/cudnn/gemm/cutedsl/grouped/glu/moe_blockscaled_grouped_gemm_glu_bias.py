@@ -328,6 +328,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         compact_sfa_sf_warp: bool = False,
         generate_sfd_col: bool = True,
         streaming_signal_multi_batch_opening: bool = False,
+        streaming_signal_acquire_once: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -386,6 +387,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
             use_pdl=use_pdl,
             launch_pdl_dependents_at_all_streaming_signal_slots_ready=launch_pdl_dependents_at_all_streaming_signal_slots_ready,
             streaming_signal_multi_batch_opening=streaming_signal_multi_batch_opening,
+            streaming_signal_acquire_once=streaming_signal_acquire_once,
         )
         check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
