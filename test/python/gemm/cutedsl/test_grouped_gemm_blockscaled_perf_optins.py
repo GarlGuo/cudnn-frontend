@@ -8,6 +8,7 @@ the streaming signal suite (BF16 D) does not cover.
 
 - generate_sfd_col=False (GLU): the row-quantized D and row SFD only; the column pair is not written.
 - single_c_stage=True (GLU): one C stage (the smem goes to one more A/B stage).
+- tight_sf_tmem_cols=True (GLU): SF TMEM columns sized to the SF layouts (the freed columns go to the accumulator).
 """
 
 import pytest
@@ -136,3 +137,12 @@ def test_glu_single_c_stage_matches(variant, routing, require_sm100):
     want = run_sfd("glu", problem, **options)
     got = run_sfd("glu", problem, single_c_stage=True, **options)
     assert_equal_bytes(got, want, f"single_c_stage {variant} {routing}")
+
+
+@pytest.mark.parametrize("variant, routing", bs.levels(CASES, L0, lambda variant, routing: f"{variant}-{routing}"))
+def test_glu_tight_sf_tmem_cols_matches(variant, routing, require_sm100):
+    problem = bs.make_problem("glu", bs.ROUTINGS[routing], seed=5)
+    options = options_of("glu", problem, variant)
+    want = run_sfd("glu", problem, **options)
+    got = run_sfd("glu", problem, tight_sf_tmem_cols=True, single_c_stage=True, **options)
+    assert_equal_bytes(got, want, f"tight_sf_tmem_cols + single_c_stage {variant} {routing}")

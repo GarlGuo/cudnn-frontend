@@ -261,6 +261,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         ``sfd_col``. False writes only the row-quantized D and SFD (``d_col`` and ``sfd_col`` may then be None).
     :param single_c_stage: With ``generate_sfd``: one C (pre-activation) smem stage instead of two, so the A/B pipeline
         gets the smem (one more stage at 256x256 MXFP8). Opt-in.
+    :param tight_sf_tmem_cols: SF TMEM columns sized to the SFA / SFB TMEM layouts' footprints (16 for MXFP8 at
+        256 x 256, not 48), as EPCompOverlap's kernel; the columns freed go to the accumulator overlap. Opt-in.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -332,6 +334,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         streaming_signal_multi_batch_opening: bool = False,
         streaming_signal_acquire_once: bool = False,
         single_c_stage: bool = False,
+        tight_sf_tmem_cols: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -475,6 +478,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         self.generate_sfd_col = generate_sfd_col
         # single_c_stage (opt-in): one C stage instead of two with generate_sfd; the smem goes to the A/B pipeline.
         self.single_c_stage = single_c_stage
+        # tight_sf_tmem_cols (opt-in): SF TMEM columns = the SF TMEM layouts' footprints.
+        self.tight_sf_tmem_cols = tight_sf_tmem_cols
         self.discrete_col_sfd = discrete_col_sfd
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
@@ -685,7 +690,19 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            )
+            sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+            )
+            self.num_sfa_tmem_cols = utils.compute_tmem_cols_from_layout(sfa_tmem_layout, self.sf_dtype)
+            self.num_sfb_tmem_cols = utils.compute_tmem_cols_from_layout(sfb_tmem_layout, self.sf_dtype)
+            assert self.num_sfa_tmem_cols % 4 == 0, f"SFA's {self.num_sfa_tmem_cols} TMEM columns misalign SFB's tcgen05.cp"
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            self.num_sf_tmem_cols = -(-self.num_sf_tmem_cols // 16) * 16
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         )
