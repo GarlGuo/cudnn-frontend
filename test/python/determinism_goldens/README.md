@@ -993,6 +993,7 @@ pytest core/test_determinism_utils.py
 | --- | --- | --- | --- |
 | `conv/cutedsl/test_conv3d_postops_determinism.py` | Conv3D raw, norm/SiLU, prepared norm/SiLU, residual/spatial pad, C12 causal input, standalone norm/SiLU preparation | Output, cache, residual, padding and exposed workspace bytes | Unsupported (inference only) |
 | `gemm/cutedsl/test_grouped_gemm_wgrad_empty.py` | `grouped_gemm_wgrad_wrapper_sm100`, cold-empty compilation | — | exact-zero overwrite and unchanged accumulated dW bytes; nonempty reuse, mixed empty experts and CUDA Graph replay |
+| `gemm/cutedsl/test_grouped_gemm_wgrad_streaming_signal_determinism.py` | wgrad kernels with `atomic_counter_claim` and `streaming_signal_capacity` (BF16, MXFP8 E4M3/E8M0) | — | dW bytes: replay under concurrent work, replay under a delayed out-of-order producer, one expert alone, packed, moved, duplicated and beside changed neighbors (ready and delayed producer); independent reference |
 | `gemm/cutedsl/test_grouped_gemm_glu_branch_layout.py` | `grouped_gemm_glu_wrapper_sm100`, `glu_layout="gate_then_up"` | saved C, D in both directions, both scale planes | — |
 | `gemm/cutedsl/test_grouped_gemm_dglu_gate_then_up.py` | `grouped_gemm_dglu_wrapper_sm100`, `glu_layout="gate_then_up"` | — | D in both directions, both scale planes, dprob; dbias numerical reference |
 | `gemm/cutedsl/test_grouped_gemm_glu_hadamard_layout.py` | `grouped_gemm_glu_hadamard_wrapper_sm100`, `glu_layout="gate_then_up"` | C, D, pre/post-RHT amax | — |
@@ -2676,6 +2677,25 @@ on the import path:
 python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant.py -m L0 -q -rs
 python -m pytest gemm/cutedsl/test_grouped_gemm_glu_hadamard_quant_determinism.py -m L0 -q -rs -s
 python -m pytest gemm/jax/test_grouped_gemm_canonical_jax.py -k glu_hadamard_quant -m L0 -q -rs
+```
+
+### Grouped wgrad streaming input signal - validation, 2026-11-24
+
+`gemm/cutedsl/test_grouped_gemm_wgrad_streaming_signal_determinism.py` covers the wgrad kernels with
+`atomic_counter_claim=True` and `streaming_signal_capacity`, BF16 and MXFP8 E4M3/E8M0, tiles 256x256 cluster (2, 1) and
+128x256 / 128x128 cluster (1, 1). Every case compares dW as raw bytes:
+- eight replays of fixed inputs under concurrent work, every token tile ready;
+- three replays under a producer that lands token tiles late and out of order (NaN operands until each tile lands);
+- one expert alone, packed with neighbors, moved to another position (another split of its rows across 256-row
+  signal tiles), duplicated and beside changed neighbor data, ready and with the delayed producer.
+An independent reference is checked separately. No runtime-specific golden is recorded: the cases compare runs of
+the same process. Measured on GB200 SM100 (Torch 2.14.1+cu130, cuDNN 92400, CuTe DSL 4.8.0): **16 passed** on
+the trays and locally, beside the 46 cases of `test_grouped_gemm_wgrad_streaming_signal.py` (L0 and L1). With the
+wait disabled, all 14 delayed-producer cases of the two files fail. SM103 and SM107 are unverified.
+From `test/python`:
+
+```bash
+python -m pytest gemm/cutedsl/test_grouped_gemm_wgrad_streaming_signal_determinism.py -m L0 -q -rs
 ```
 
 ### Grouped wgrad empty inputs — validation, 2026-11-11
