@@ -46,6 +46,7 @@ from ..moe_persistent_scheduler import (
 from ..moe_utils import (
     MoEWeightMode,
     TensormapWorkspace,
+    compute_expert_token_range,
     store_tma_desc,
 )
 from ..moe_sched_extension import (
@@ -217,6 +218,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         dispatched output gradient) and SFA; see docs/operations/moe/streaming_signal_contract.md (section 4a).
     :param compact_sfa_sf_warp: ``sfa`` is compact E8M0 rows ``[M, K / 32]``, not SF atoms; a dedicated SF warp builds the
         atoms (MXFP8, ``K % 512 == 0``, cluster (2, 1); contract section 4a).
+    :param compact_sfa_tma_warp: with ``compact_sfa_sf_warp`` (opt-in): the TMA warp builds the atoms instead, a batch of K
+        tiles at a time behind its loads, and the kernel has no SF warp (8 warps, not 9: a 9th warp puts 3 warps on one SM
+        sub-partition and caps every thread at 168 registers). Same atoms, so the same outputs.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -285,6 +289,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         streaming_signal_acquire_once: bool = False,
         tight_sf_tmem_cols: bool = False,
         sfd_col_lane_scales: bool = False,
+        compact_sfa_tma_warp: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -346,6 +351,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         )
         check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
+        if compact_sfa_tma_warp and not compact_sfa_sf_warp:
+            raise ValueError("compact_sfa_tma_warp requires compact_sfa_sf_warp")
+        self.compact_sfa_tma_warp = compact_sfa_tma_warp
 
         self.glu_layout = validate_glu_layout(glu_layout)
         self.sf_vec_size = sf_vec_size
@@ -366,9 +374,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         self.tma_warp_id = 5
         self.epilog_load_tma_id = 6
         self.sched_warp_id = 7
-        # compact_sfa_sf_warp: the SF warp goes last; it consumes tile_info like the TMA warp.
-        self.sf_warp_id = 8 if compact_sfa_sf_warp else None
-        sf_warps = (self.sf_warp_id,) if compact_sfa_sf_warp else ()
+        # compact_sfa_sf_warp: the SF warp goes last; it consumes tile_info like the TMA warp.  compact_sfa_tma_warp: none.
+        has_sf_warp = compact_sfa_sf_warp and not compact_sfa_tma_warp
+        self.sf_warp_id = 8 if has_sf_warp else None
+        sf_warps = (self.sf_warp_id,) if has_sf_warp else ()
         self.threads_per_warp = 32
         self.threads_per_cta = self.threads_per_warp * len(
             (
@@ -865,6 +874,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
         self.check_compact_sfa_attributes(a)
+        self.check_compact_sfa_tma_warp()
 
         # ---- B / SFB setup (mode-dependent) ----
         b_from_call_arg = b
@@ -2710,63 +2720,149 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                 #
                 # Tma load loop
                 #
-                for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
-                    tAgA_k = tAgA_slice[(None, k_tile)]
-                    tBgB_k = tBgB_slice[(None, k_tile)]
-                    tAgSFA_k = tAgSFA_slice[(None, k_tile)]
-                    tBgSFB_k = tBgSFB_slice[(None, k_tile)]
-                    tAsA_pipe = tAsA[(None, ab_producer_state.index)]
-                    tBsB_pipe = tBsB[(None, ab_producer_state.index)]
-                    tAsSFA_pipe = tAsSFA[(None, ab_producer_state.index)]
-                    tBsSFB_pipe = tBsSFB[(None, ab_producer_state.index)]
+                if cutlass.const_expr(self.compact_sfa_tma_warp):
+                    # The compact SFA rows of this CTA's 128 rows (lane l: rows l + 32 r): K tiles in groups of 4, two
+                    # groups in flight (one 16-byte L2-only load per row and group); a batch's atoms are stored and
+                    # released once the TMA warp holds the batch's stages.
+                    sf_group = self.SF_WARP_K_TILES_PER_LOAD
+                    sf_batch = self.COMPACT_SFA_TMA_WARP_BATCH
+                    sf_lane = cute.arch.lane_idx()
+                    sf_words, sf_lines = self.compact_sfa_views(compact_sfa_words, sSFA, mA_mkl)
+                    sf_token_offset, _ = compute_expert_token_range(padded_offsets, work_tile_info.expert_idx)
+                    # A 64-bit row: row x words per row passes 2^31 at large M.
+                    sf_row = cutlass.Int64(sf_token_offset) + cutlass.Int64(work_tile_info.tile_m_idx) * self.cta_tile_shape_mnk[0] + cutlass.Int64(sf_lane)
+                    sf_rows = sf_words[(sf_row, None, None)]
+                    sf_now = [cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32) for _ in range(sf_group)]
+                    sf_next = [cute.make_rmem_tensor(cute.make_layout(4), cutlass.Int32) for _ in range(sf_group)]
+                    self._load_compact_sfa_group(sf_now, sf_rows, 0)
+                    if sf_group < k_tile_cnt:
+                        self._load_compact_sfa_group(sf_next, sf_rows, sf_group)
+                    # k_tile_cnt % 4 == 0 (K % 512 == 0): whole groups.
+                    for k_base in cutlass.range(0, k_tile_cnt, sf_group, unroll=1):
+                        sf_stages = []
+                        sf_barriers = []
+                        for j in cutlass.range_constexpr(sf_group):
+                            k_tile = k_base + j
+                            tAgA_k = tAgA_slice[(None, k_tile)]
+                            tBgB_k = tBgB_slice[(None, k_tile)]
+                            tBgSFB_k = tBgSFB_slice[(None, k_tile)]
+                            tAsA_pipe = tAsA[(None, ab_producer_state.index)]
+                            tBsB_pipe = tBsB[(None, ab_producer_state.index)]
+                            tBsSFB_pipe = tBsSFB[(None, ab_producer_state.index)]
 
-                    tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
+                            tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
+                            sf_stages.append(ab_producer_state.index)
+                            sf_barriers.append(tma_bar)
 
-                    # Conditionally wait for AB buffer empty
-                    ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
-                    ab_producer_state_next = ab_producer_state.clone()
-                    ab_producer_state_next.advance()
-                    if k_tile < k_tile_cnt - 1:
-                        peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state_next)
+                            # Conditionally wait for AB buffer empty
+                            ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                            ab_producer_state_next = ab_producer_state.clone()
+                            ab_producer_state_next.advance()
+                            if k_tile < k_tile_cnt - 1:
+                                peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state_next)
 
-                    # TMA load A (contiguous, global desc)
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_k,
-                        tAsA_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=a_full_mcast_mask,
-                    )
-                    # TMA load B (discrete, per-expert desc from workspace)
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_k,
-                        tBsB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=b_full_mcast_mask,
-                        tma_desc_ptr=desc_ptr_b,
-                    )
-                    # TMA load SFA (contiguous, global desc); the SF warp's when compact
-                    if cutlass.const_expr(not self.compact_sfa_sf_warp):
+                            # TMA load A (contiguous, global desc)
+                            cute.copy(
+                                tma_atom_a,
+                                tAgA_k,
+                                tAsA_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=a_full_mcast_mask,
+                            )
+                            # TMA load B (discrete, per-expert desc from workspace)
+                            cute.copy(
+                                tma_atom_b,
+                                tBgB_k,
+                                tBsB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=b_full_mcast_mask,
+                                tma_desc_ptr=desc_ptr_b,
+                            )
+                            # TMA load SFB (discrete, per-expert desc from workspace)
+                            cute.copy(
+                                tma_atom_sfb,
+                                tBgSFB_k,
+                                tBsSFB_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=sfb_full_mcast_mask,
+                                tma_desc_ptr=desc_ptr_sfb,
+                            )
+                            ab_producer_state = ab_producer_state_next
+
+                            # This batch's stages are all acquired: their atoms, then one release.
+                            if cutlass.const_expr(j % sf_batch == sf_batch - 1):
+                                first = j + 1 - sf_batch
+                                self._store_compact_sfa_batch(
+                                    sf_lines,
+                                    sf_now[first : j + 1],
+                                    sf_stages[first : j + 1],
+                                    sf_barriers[first : j + 1],
+                                    cta_rank_in_cluster - mma_tile_coord_v,
+                                    sf_lane,
+                                )
+                        # The next group moves up; the one after it loads.
+                        for j in cutlass.range_constexpr(sf_group):
+                            sf_now[j].store(sf_next[j].load())
+                        if k_base + 2 * sf_group < k_tile_cnt:
+                            self._load_compact_sfa_group(sf_next, sf_rows, k_base + 2 * sf_group)
+                else:
+                    for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                        tAgA_k = tAgA_slice[(None, k_tile)]
+                        tBgB_k = tBgB_slice[(None, k_tile)]
+                        tAgSFA_k = tAgSFA_slice[(None, k_tile)]
+                        tBgSFB_k = tBgSFB_slice[(None, k_tile)]
+                        tAsA_pipe = tAsA[(None, ab_producer_state.index)]
+                        tBsB_pipe = tBsB[(None, ab_producer_state.index)]
+                        tAsSFA_pipe = tAsSFA[(None, ab_producer_state.index)]
+                        tBsSFB_pipe = tBsSFB[(None, ab_producer_state.index)]
+
+                        tma_bar = ab_pipeline.producer_get_barrier(ab_producer_state)
+
+                        # Conditionally wait for AB buffer empty
+                        ab_pipeline.producer_acquire(ab_producer_state, peek_ab_empty_status)
+                        ab_producer_state_next = ab_producer_state.clone()
+                        ab_producer_state_next.advance()
+                        if k_tile < k_tile_cnt - 1:
+                            peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state_next)
+
+                        # TMA load A (contiguous, global desc)
                         cute.copy(
-                            tma_atom_sfa,
-                            tAgSFA_k,
-                            tAsSFA_pipe,
+                            tma_atom_a,
+                            tAgA_k,
+                            tAsA_pipe,
                             tma_bar_ptr=tma_bar,
-                            mcast_mask=sfa_full_mcast_mask,
+                            mcast_mask=a_full_mcast_mask,
                         )
-                    # TMA load SFB (discrete, per-expert desc from workspace)
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_k,
-                        tBsSFB_pipe,
-                        tma_bar_ptr=tma_bar,
-                        mcast_mask=sfb_full_mcast_mask,
-                        tma_desc_ptr=desc_ptr_sfb,
-                    )
+                        # TMA load B (discrete, per-expert desc from workspace)
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB_k,
+                            tBsB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=b_full_mcast_mask,
+                            tma_desc_ptr=desc_ptr_b,
+                        )
+                        # TMA load SFA (contiguous, global desc); the SF warp's when compact
+                        if cutlass.const_expr(not self.compact_sfa_sf_warp):
+                            cute.copy(
+                                tma_atom_sfa,
+                                tAgSFA_k,
+                                tAsSFA_pipe,
+                                tma_bar_ptr=tma_bar,
+                                mcast_mask=sfa_full_mcast_mask,
+                            )
+                        # TMA load SFB (discrete, per-expert desc from workspace)
+                        cute.copy(
+                            tma_atom_sfb,
+                            tBgSFB_k,
+                            tBsSFB_pipe,
+                            tma_bar_ptr=tma_bar,
+                            mcast_mask=sfb_full_mcast_mask,
+                            tma_desc_ptr=desc_ptr_sfb,
+                        )
 
-                    # Peek (try_wait) AB buffer empty for next k_tile
-                    ab_producer_state = ab_producer_state_next
+                        # Peek (try_wait) AB buffer empty for next k_tile
+                        ab_producer_state = ab_producer_state_next
 
                 #
                 # Advance to next tile

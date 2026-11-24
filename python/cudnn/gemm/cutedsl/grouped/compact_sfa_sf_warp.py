@@ -142,6 +142,44 @@ class CompactSfaSfWarpMixin:
             for j in cutlass.range_constexpr(self.SF_WARP_K_TILES_PER_LOAD):
                 queue[j][row_group] = cutlass.Int32(vector.extract(vec, [], [j]))
 
+    # ---- compact_sfa_tma_warp (opt-in): the TMA warp builds the atoms itself, no SF warp ----
+
+    #: K tiles the TMA warp stores (and releases with one fence) at once under ``compact_sfa_tma_warp``.
+    COMPACT_SFA_TMA_WARP_BATCH = 2
+
+    def check_compact_sfa_tma_warp(self) -> None:
+        """In ``__call__`` after ``_setup_attributes``: with ``compact_sfa_tma_warp`` the TMA warp stores a batch of K tiles'
+        atoms once it holds all their stages, so the pipeline must hold a whole batch (no stage waits on a later one)."""
+        if self.compact_sfa_tma_warp and self.num_ab_stage < self.COMPACT_SFA_TMA_WARP_BATCH:
+            raise ValueError(f"compact_sfa_tma_warp needs >= {self.COMPACT_SFA_TMA_WARP_BATCH} A/B stages, got {self.num_ab_stage}")
+
+    def compact_sfa_views(self, compact_sfa_words, sSFA, mA_mkl):
+        """(row, row_group, K tile) words of the compact rows and (lane, row_group, stage) words of the SF atoms in sSFA,
+        as the SF warp loop makes them."""
+        rows_total, k = mA_mkl.shape[0], mA_mkl.shape[1]
+        words_per_row = k // (4 * self.sf_vec_size)
+        words = cute.make_tensor(compact_sfa_words, cute.make_layout((rows_total, 4, words_per_row), stride=(words_per_row, 32 * words_per_row, 1)))
+        lines = cute.make_tensor(cute.recast_ptr(sSFA.iterator, dtype=cutlass.Int32), cute.make_layout((32, 4, self.num_ab_stage), stride=(4, 1, 128)))
+        return words, lines
+
+    @cute.jit
+    def _store_compact_sfa_batch(self, lines, slots, stage_indices, full_barriers, leader_cta, lane_idx):
+        """TMA warp, ``compact_sfa_tma_warp``: this lane's words of ``len(slots)`` K tiles into their stages (each stage's
+        empty wait was the TMA warp's producer acquire), then the module docstring's release, one arrive per stage on the
+        leader's full barrier."""
+        # The MMA's tcgen05.cp read these stages through the async proxy: order that before the stores.
+        cute.arch.fence_proxy("async.shared", space="cta")
+        for j in cutlass.range_constexpr(len(slots)):
+            for row_group in cutlass.range_constexpr(4):
+                lines[(lane_idx, row_group, stage_indices[j])] = slots[j][row_group]
+        # tcgen05.cp reads the atoms through the async proxy (the peer's from the leader's MMA).
+        cute.arch.fence_proxy("async.shared", space="cta")
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            fence_release_sync_restrict_shared_cta_cluster()
+            for j in cutlass.range_constexpr(len(slots)):
+                cute.arch.mbarrier_arrive(full_barriers[j], leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER)
+
     @cute.jit
     def _sf_warp_next_tile(self, sInfo, tile_info, tile_info_pipeline, tile_info_consumer_state, zero):
         """Read the next tile_info slot and release it with an arrive that depends on the values read (Rule 11)."""
