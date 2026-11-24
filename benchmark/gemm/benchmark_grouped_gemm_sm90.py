@@ -8,6 +8,13 @@ This is a synthetic balanced-routing benchmark. Ops: fc1_fwd (N=2I, K=H), fc2_fw
 (N=H, K=I), fc1_dgrad (N=H, K=2I) and fc2_dgrad (N=I, K=H); dgrad reads the forward
 weights N-major (b_major="n"). TFLOPs count the padded rows.
 
+GLU and dGLU: fc1_glu is fc1_fwd with the SwiGLU fused (GroupedGemmGluSm90; D is
+N/2 wide) and fc2_dglu is fc2_dgrad with the dSwiGLU fused (GroupedGemmDgluSm90,
+reading the saved 2N-wide C and accumulating dprob, whose reset its timing
+includes). Their torch arm is torch._grouped_mm plus the activation in eager torch,
+and their TFLOPs count the GEMM only. fc2_dglu has one schedule, so it takes only
+the "default" and "torch" arms.
+
 python benchmark/gemm/benchmark_grouped_gemm_sm90.py --model deepseek_v3 --ep 8 --arms default cooperative pingpong torch
 
 Wgrad (GroupedGemmWgradSm90): fc1_wgrad (dW1 = dH1^T X; M=2I, N=H) and fc2_wgrad
@@ -52,7 +59,7 @@ MODEL_SHAPES = {
     "qwen38_2p4t": dict(hidden=8192, experts=512, top_k=10, intermediate=2048),
     "glm53_flash": dict(hidden=4096, experts=288, top_k=8, intermediate=2048),
 }
-OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad", "fc1_wgrad", "fc2_wgrad")
+OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad", "fc1_wgrad", "fc2_wgrad", "fc1_glu", "fc2_dglu")
 ARMS = ("default", "cooperative", "pingpong", "torch")
 
 
@@ -61,11 +68,18 @@ def problem(args, model, op):
         return problem_wgrad(args, model, op)
     shape = MODEL_SHAPES[model]
     hidden, inter = shape["hidden"], shape["intermediate"]
-    n, k = dict(fc1_fwd=(2 * inter, hidden), fc2_fwd=(hidden, inter), fc1_dgrad=(hidden, 2 * inter), fc2_dgrad=(inter, hidden))[op]
+    n, k = dict(
+        fc1_fwd=(2 * inter, hidden),
+        fc2_fwd=(hidden, inter),
+        fc1_dgrad=(hidden, 2 * inter),
+        fc2_dgrad=(inter, hidden),
+        fc1_glu=(2 * inter, hidden),
+        fc2_dglu=(inter, hidden),
+    )[op]
     groups = shape["experts"] // args.ep
     valid_m = -(-args.tokens * shape["top_k"] // groups)
     m = -(-valid_m // 256) * 256
-    b_major = "n" if op.endswith("dgrad") else "k"
+    b_major = "n" if op in ("fc1_dgrad", "fc2_dgrad", "fc2_dglu") else "k"
     torch.manual_seed(args.seed)
     tensors = dict(
         a=torch.randn(groups * m, k, device="cuda", dtype=torch.bfloat16) * 0.125,
@@ -76,6 +90,9 @@ def problem(args, model, op):
         prob=torch.ones(groups * m, device="cuda"),
         c=torch.empty(groups * m, n, device="cuda", dtype=torch.bfloat16),  # unused without generate_c
     )
+    if op == "fc2_dglu":
+        # The forward's saved pre-activation C (gate | up, 2N wide) and the accumulated dprob.
+        tensors.update(c=torch.randn(groups * m, 2 * n, device="cuda", dtype=torch.bfloat16), dprob=torch.zeros(groups * m, device="cuda"))
     metadata = dict(model=model, op=op, b_major=b_major, groups=groups, M=m, valid_M=valid_m, N=n, K=k, total_rows=groups * m)
     if valid_m != m:
         for expert in range(groups):
@@ -144,6 +161,96 @@ def grouped_mm(t, b_major):
     return functools.partial(torch._grouped_mm, t["a"], b_kn, offs=t["padded_offsets"], out_dtype=torch.bfloat16)
 
 
+BLOCK = 32  # interleaved_32 gate/up column blocks
+
+
+def split_gate_up(x):
+    m, two_n = x.shape
+    blocks = x.view(m, two_n // (2 * BLOCK), 2, BLOCK)
+    return blocks[:, :, 0].reshape(m, -1), blocks[:, :, 1].reshape(m, -1)
+
+
+def torch_swiglu(acc, prob):
+    gate, up = split_gate_up(acc.float())
+    return (up * torch.nn.functional.silu(gate) * prob[:, None]).to(torch.bfloat16)
+
+
+def torch_dswiglu(g, c, prob):
+    """D (dgate | dup, interleaved) of SwiGLU from g = dY @ W^T and the saved C; alpha = beta = 1."""
+    g = g.float()
+    x1, x2 = (half.float() for half in split_gate_up(c))
+    s = torch.sigmoid(x1)
+    d1 = g * prob[:, None] * x2 * s * (1 + x1 * (1 - s))
+    d2 = g * prob[:, None] * x1 * s
+    m, n = d1.shape
+    return torch.stack((d1.view(m, n // BLOCK, BLOCK), d2.view(m, n // BLOCK, BLOCK)), dim=2).reshape(m, 2 * n).to(torch.bfloat16)
+
+
+def torch_arm(t, op, b_major):
+    """The torch arm and the check reference: torch._grouped_mm, plus the activation in eager torch for fc1_glu / fc2_dglu."""
+    mm = grouped_mm(t, b_major)
+    if op == "fc1_glu":
+        return lambda: torch_swiglu(mm(), t["prob"])
+    if op == "fc2_dglu":
+        return lambda: torch_dswiglu(mm(), t["c"], t["prob"])
+    return mm
+
+
+def prepare_glu(t, op, b_major, arm):
+    """fc1_glu / fc2_dglu through the GLU / dGLU class API; the timed call is the backend plan's execute."""
+    m, n = t["a"].shape[0], t["b"].shape[1] if b_major == "k" else t["b"].shape[2]
+    if op == "fc1_glu":
+        d = torch.empty(m, n // 2, device="cuda", dtype=torch.bfloat16)
+        common = dict(sample_c=t["c"], sample_d=d, sample_sfa=None, sample_d_col=None, act_func="swiglu")
+        operands = dict(c_tensor=t["c"], d_tensor=d)
+        cls = cudnn.GroupedGemmGluSm90
+    else:
+        d = torch.empty(m, 2 * n, device="cuda", dtype=torch.bfloat16)
+        common = dict(sample_c=t["c"], sample_d_row=d, sample_d_col=None, sample_sfa=None, sample_beta=t["alpha"], sample_dprob=t["dprob"])
+        common.update(act_func="dswiglu")
+        operands = dict(c_tensor=t["c"], d_row_tensor=d, beta_tensor=t["alpha"], dprob_tensor=t["dprob"])
+        cls = cudnn.GroupedGemmDgluSm90
+    with forced_schedule(None if arm == "default" else arm):
+        api = cls(
+            sample_a=t["a"],
+            sample_padded_offsets=t["padded_offsets"],
+            sample_alpha=t["alpha"],
+            sample_b=t["b"],
+            sample_prob=t["prob"],
+            b_major=b_major,
+            use_dynamic_sched=True,
+            **common,
+        )
+        if not api.check_support():
+            raise RuntimeError(f"Unsupported configuration for the {arm} arm")
+        api.compile()
+    implementation = api._implementation
+    run_plan = functools.partial(
+        implementation.execute,
+        a_tensor=t["a"],
+        padded_offsets=t["padded_offsets"],
+        alpha_tensor=t["alpha"],
+        b_tensor=t["b"],
+        prob_tensor=t["prob"],
+        **operands,
+    )
+    if op == "fc1_glu":
+        nbytes = implementation._scratch_nbytes
+        run = functools.partial(run_plan, _workspace=torch.empty(nbytes, device="cuda", dtype=torch.uint8) if nbytes else None)
+    else:
+        workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+
+        def run():
+            # dprob accumulates, so each call starts from zero, as a training step's would.
+            t["dprob"].zero_()
+            run_plan(workspace=workspace)
+
+    run()
+    torch.cuda.synchronize()
+    schedule = "pingpong" if getattr(implementation, "_pingpong", False) else "cooperative"
+    return run, d, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
+
+
 @contextlib.contextmanager
 def forced_schedule(schedule):
     """The SM90 schedule test hook: plans built inside run ``schedule`` (None: the shape rule's pick)."""
@@ -161,7 +268,9 @@ def prepare(t, op, b_major, arm):
     if op in ("fc1_wgrad", "fc2_wgrad") and arm != "torch":
         return prepare_wgrad(t, arm)
     if arm == "torch":
-        return grouped_mm(t, b_major), None, {}
+        return torch_arm(t, op, b_major), None, {}
+    if op in ("fc1_glu", "fc2_dglu"):
+        return prepare_glu(t, op, b_major, arm)
     d = torch.empty_like(t["c"])
     with forced_schedule(None if arm == "default" else arm):
         api = cudnn.GroupedGemmSm90(
@@ -273,6 +382,8 @@ def main():
         parser.error("EP must divide every selected model's expert count")
     if min(args.tokens, args.warmup, args.bundle, args.repeats) < 1:
         parser.error("tokens and timing counts must be positive")
+    if "fc2_dglu" in args.op and {"cooperative", "pingpong"} & set(args.arms):
+        parser.error("fc2_dglu has one schedule (the dGLU kernel ignores the schedule override): use --arms default torch")
     capability = torch.cuda.get_device_capability()
     if not has_wgmma(capability[0]):
         raise SystemExit(f"This benchmark requires an SM90 (Hopper) GPU, found compute capability {capability}")
@@ -290,7 +401,7 @@ def main():
     for model in args.model:
         for op in args.op:
             tensors, shape = problem(args, model, op)
-            reference = grouped_mm(tensors, shape["b_major"])().float()
+            reference = torch_arm(tensors, op, shape["b_major"])().float()
             runs, cases = {}, {}
             for arm in args.arms:
                 run, d, plan = prepare(tensors, op, shape["b_major"], arm)
