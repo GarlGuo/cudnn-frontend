@@ -13,6 +13,11 @@ the cooperative case; the pingpong case skips there and compares under `CUDNN_DE
 The removed `grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` held the cooperative hashes.
 dgrad has no golden record; replay, batch invariance and warm stress cover it.
 
+Wgrad record: `grouped_gemm_wgrad_sm90_bf16` (`test_sm90_wgrad_golden`), recorded and checked
+the same way. Warm stress at the same setup: 0 wrong of 3000 warm + 3000 poisoned wgrad launches.
+The tile-info case `test_sm90_wgrad_warm_stress` (K = 64, 256 tokens per expert) covers wgrad's
+Rule 11 release sites.
+
 Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch 2.14.0+cu130,
 CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0, tvm-ffi 0.1.16,
 compute-sanitizer 2026.1.1.0; source built from the commit under test.
