@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Time the SM90 (Hopper) BF16 grouped GEMM forward and dgrad against torch._grouped_mm.
+"""Time the SM90 (Hopper) BF16 grouped GEMMs against torch._grouped_mm.
 
 One row is (model, op, arm) at one EP rank's sizes: --tokens per GPU times top_k
 routed rows, spread evenly over the rank's experts, each expert padded to 256 rows.
@@ -10,20 +10,30 @@ weights N-major (b_major="n"). TFLOPs count the padded rows.
 
 python benchmark/gemm/benchmark_grouped_gemm_sm90.py --model deepseek_v3 --ep 8 --arms default cooperative pingpong torch
 
+Wgrad (GroupedGemmWgradSm90): fc1_wgrad (dW1 = dH1^T X; M=2I, N=H) and fc2_wgrad
+(dW2 = dY^T h; M=H, N=I), each expert's M x N weight gradient reducing over its K
+padded token rows, from row-major (tokens, features) gradients and activations;
+the padding token rows are zero. Its torch arm is torch._grouped_mm on the 2D
+operands, and its shape rule picks pingpong for N >= 2048.
+
 Arms: "default" is the library's own schedule (its shape rule); "cooperative" and
 "pingpong" force one through the test hook moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE
 (pingpong runs only its 128x192 tile on a (2, 1) cluster); "torch" is
 torch._grouped_mm, which allocates its output per call. Each cudnn arm is built
-through GroupedGemmSm90 (check_support, compile) outside timing and times the
-compiled plan's execute with fixed outputs and a preallocated workspace, so no
-wrapper allocation or dispatch. Graph timing is device time for an actual captured
-bundle, while eager timing includes host dispatch and synchronization. Every cudnn
-arm's output is checked against torch._grouped_mm outside timing.
+through its class API (fwd and dgrad: GroupedGemmSm90) with check_support and
+compile, and times the compiled plan's execute with fixed outputs and a
+preallocated workspace, so no wrapper allocation or dispatch. Input generation and
+JIT are outside timing; graph timing is device time for an actual captured bundle,
+while eager timing includes host dispatch and synchronization. Routing and token
+permutation are excluded; padding rows are zero, with a zero prob. Every cudnn
+arm's output is checked against the torch arm outside timing, and its hash is a
+cross-process control.
 """
 
 import argparse
 import contextlib
 import functools
+import hashlib
 import importlib.metadata
 import json
 import statistics
@@ -42,11 +52,13 @@ MODEL_SHAPES = {
     "qwen38_2p4t": dict(hidden=8192, experts=512, top_k=10, intermediate=2048),
     "glm53_flash": dict(hidden=4096, experts=288, top_k=8, intermediate=2048),
 }
-OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad")
+OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad", "fc1_wgrad", "fc2_wgrad")
 ARMS = ("default", "cooperative", "pingpong", "torch")
 
 
 def problem(args, model, op):
+    if op in ("fc1_wgrad", "fc2_wgrad"):
+        return problem_wgrad(args, model, op)
     shape = MODEL_SHAPES[model]
     hidden, inter = shape["hidden"], shape["intermediate"]
     n, k = dict(fc1_fwd=(2 * inter, hidden), fc2_fwd=(hidden, inter), fc1_dgrad=(hidden, 2 * inter), fc2_dgrad=(inter, hidden))[op]
@@ -65,7 +77,66 @@ def problem(args, model, op):
         c=torch.empty(groups * m, n, device="cuda", dtype=torch.bfloat16),  # unused without generate_c
     )
     metadata = dict(model=model, op=op, b_major=b_major, groups=groups, M=m, valid_M=valid_m, N=n, K=k, total_rows=groups * m)
+    if valid_m != m:
+        for expert in range(groups):
+            tensors["a"][expert * m + valid_m : (expert + 1) * m].zero_()
+            tensors["prob"][expert * m + valid_m : (expert + 1) * m].zero_()
     return tensors, metadata
+
+
+def problem_wgrad(args, model, op):
+    """fc1_wgrad / fc2_wgrad: per expert, the M x N weight gradient of a K-token slice (M, N and K as the wgrad API names them)."""
+    shape = MODEL_SHAPES[model]
+    hidden, inter = shape["hidden"], shape["intermediate"]
+    m, n = dict(fc1_wgrad=(2 * inter, hidden), fc2_wgrad=(hidden, inter))[op]
+    groups = shape["experts"] // args.ep
+    valid_k = -(-args.tokens * shape["top_k"] // groups)
+    k = -(-valid_k // 256) * 256
+    torch.manual_seed(args.seed)
+    grad = torch.randn(groups * k, m, device="cuda", dtype=torch.bfloat16) * 0.125
+    act = torch.randn(groups * k, n, device="cuda", dtype=torch.bfloat16) * 0.125
+    if valid_k != k:
+        for expert in range(groups):
+            grad[expert * k + valid_k : (expert + 1) * k].zero_()
+            act[expert * k + valid_k : (expert + 1) * k].zero_()
+    # A = grad^T (M, tokens), M-major; B = act (tokens, N), N-major; the offsets split the tokens per expert.
+    tensors = dict(a=grad.t(), b=act, padded_offsets=torch.arange(1, groups + 1, device="cuda", dtype=torch.int32) * k)
+    metadata = dict(model=model, op=op, b_major="n", groups=groups, M=m, N=n, K=k, valid_K=valid_k, total_rows=groups * k)
+    return tensors, metadata
+
+
+def prepare_wgrad(t, arm):
+    """fc1_wgrad / fc2_wgrad through GroupedGemmWgradSm90; the timed call is the backend plan's execute."""
+    wgrad = torch.empty(t["padded_offsets"].numel(), t["a"].shape[0], t["b"].shape[1], device="cuda", dtype=torch.bfloat16)
+    with forced_schedule(None if arm == "default" else arm):
+        api = cudnn.GroupedGemmWgradSm90(
+            sample_a=t["a"],
+            sample_b=t["b"],
+            sample_sfa=None,
+            sample_sfb=None,
+            sample_offsets=t["padded_offsets"],
+            sample_wgrad=wgrad,
+            acc_dtype=torch.float32,
+        )
+        if not api.check_support():
+            raise RuntimeError(f"Unsupported configuration for the {arm} arm")
+        api.compile()
+    implementation = api._implementation
+    nbytes = implementation._scratch_nbytes
+    run = functools.partial(
+        implementation.execute,
+        a_tensor=t["a"],
+        b_tensor=t["b"],
+        sfa_tensor=None,
+        sfb_tensor=None,
+        offsets_tensor=t["padded_offsets"],
+        wgrad_tensor=wgrad,
+        _workspace=torch.empty(nbytes, device="cuda", dtype=torch.uint8) if nbytes else None,
+    )
+    run()
+    torch.cuda.synchronize()
+    schedule = "pingpong" if implementation.pingpong else "cooperative"
+    return run, wgrad, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
 
 
 def grouped_mm(t, b_major):
@@ -85,8 +156,10 @@ def forced_schedule(schedule):
         sm90._SCHEDULE_OVERRIDE = saved
 
 
-def prepare(t, b_major, arm):
+def prepare(t, op, b_major, arm):
     """One arm's timed call, its output buffer (None for torch) and its plan's configuration."""
+    if op in ("fc1_wgrad", "fc2_wgrad") and arm != "torch":
+        return prepare_wgrad(t, arm)
     if arm == "torch":
         return grouped_mm(t, b_major), None, {}
     d = torch.empty_like(t["c"])
@@ -124,6 +197,11 @@ def prepare(t, b_major, arm):
     torch.cuda.synchronize()
     schedule = "pingpong" if implementation._pingpong else "cooperative"
     return run, d, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
+
+
+def output_sha256(value):
+    """Cross-process control; copying/hashing is outside timing."""
+    return hashlib.sha256(value.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
 
 
 def distribution(samples):
@@ -169,11 +247,17 @@ def measure(runs, args):
     for arm, metrics in samples.items():
         measurements[arm] = {name: statistics.median(values) for name, values in metrics.items()}
         measurements[arm]["distributions"] = {name: distribution(values) for name, values in metrics.items()}
+    if "torch" in runs:
+        for arm in runs:
+            if arm != "torch":
+                measurements[arm]["paired_ratio_to_torch"] = {
+                    name: distribution([a / t for a, t in zip(samples[arm][name], values)]) for name, values in samples["torch"].items()
+                }
     return measurements
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", nargs="+", choices=tuple(MODEL_SHAPES), default=["deepseek_v3"], metavar="MODEL", help=", ".join(MODEL_SHAPES))
     parser.add_argument("--op", nargs="+", choices=OPS, default=list(OPS), metavar="OP", help=", ".join(OPS))
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=["default", "torch"], metavar="ARM", help=", ".join(ARMS))
@@ -209,14 +293,15 @@ def main():
             reference = grouped_mm(tensors, shape["b_major"])().float()
             runs, cases = {}, {}
             for arm in args.arms:
-                run, d, plan = prepare(tensors, shape["b_major"], arm)
+                run, d, plan = prepare(tensors, op, shape["b_major"], arm)
                 cases[arm] = dict(**shape, arm=arm, **plan)
                 if d is not None:
                     cases[arm]["max_abs_diff_vs_torch"] = (d.float() - reference).abs().max().item()
+                    cases[arm]["output_sha256"] = output_sha256(d)
                     torch.testing.assert_close(d.float(), reference, rtol=2e-2, atol=2e-2)
                 runs[arm] = run
             measurements = measure(runs, args)
-            flops = 2.0 * shape["total_rows"] * shape["N"] * shape["K"]
+            flops = 2.0 * shape["groups"] * shape["M"] * shape["N"] * shape["K"]
             for arm, case in cases.items():
                 row = {**case, **measurements[arm], "tflops": flops / measurements[arm]["graph_device_us"] / 1e6}
                 rows.append(row)
