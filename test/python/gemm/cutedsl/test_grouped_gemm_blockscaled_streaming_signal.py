@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Streaming signal options of the SM100 block-scaled grouped GEMM kernels: N_CHUNK output notify on the MXFP8 quant
-kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1), with stock SF atoms or ``compact_sfa_sf_warp``.
+kernel (FC2); the input signal on the MXFP8 SwiGLU kernel (FC1), with stock SF atoms or ``compact_sfa_sf_warp``, and on
+the BF16 and MXFP8 dSwiGLU kernels.
 
 The options reorder tiles, wait and count; they never change the tile math, so every output must be raw-byte equal to
-the stock dynamic scheduler's.  Input direction: the producer writes A and its scales, then releases ``signal[t] = t``
-for the 256-row M tile t (SFA atom rows 2t and 2t + 1, or the compact rows); until then they hold NaN, so a tile read
+the stock dynamic scheduler's.  Input direction: the producer writes A (dY) and its scales, then releases ``signal[t] =
+t`` for the 256-row M tile t (SFA atom rows 2t and 2t + 1, or the compact rows); until then they hold NaN, so a tile read
 early carries NaN into D.  Output direction: a concurrent consumer copies each N chunk the moment ``signal[u] == u``; a
 chunk published before its rows are in global memory carries the NaN prefill into that copy.
 
@@ -165,10 +166,10 @@ def test_with_no_rows_exits(kind, variant):
         assert bs.chunk_signal(kernel, workspace).tolist() == [-1] * 4
 
 
-# ---- The input signal (FC1 GLU) ----
+# ---- The input signal (FC1 GLU, dGLU) ----
 
 # (kind, variant, routing) beside the replay determinism cases (64 experts, a 5000-row expert): the uneven routing (an
-# empty and a one-row expert) and the compact SF warp on the stock dynamic scheduler.
+# empty and a one-row expert), the compact SF warp on the stock dynamic scheduler, and the dGLU's entry trigger alone.
 MATCH_CASES = [
     ("glu", "signal", "uneven"),
     ("glu", "trigger", "uneven"),
@@ -177,8 +178,22 @@ MATCH_CASES = [
     ("glu", "compact", "uneven"),
     ("glu", "compact_signal", "uneven"),
     ("glu", "compact_trigger", "uneven"),
+    ("dglu_bf16", "entry", "uneven"),
+    ("dglu", "entry", "uneven"),
+    ("dglu_bf16", "signal", "big_expert"),
+    ("dglu_bf16", "trigger", "uneven"),
+    ("dglu", "signal", "uneven"),
+    ("dglu", "trigger", "big_expert"),
+    ("dglu", "compact_signal", "big_expert"),
+    ("dglu", "compact_trigger", "uneven"),
 ]
-MATCH_L0 = [("glu", "trigger", "uneven"), ("glu", "compact", "big_expert")]
+MATCH_L0 = [
+    ("glu", "trigger", "uneven"),
+    ("glu", "compact", "big_expert"),
+    ("dglu_bf16", "entry", "uneven"),
+    ("dglu", "entry", "uneven"),
+    ("dglu", "compact_trigger", "uneven"),
+]
 
 
 @pytest.mark.parametrize("kind, variant, routing", bs.levels(MATCH_CASES, MATCH_L0, lambda kind, variant, routing: f"{bs.KIND_IDS[kind]}-{variant}-{routing}"))
@@ -198,13 +213,17 @@ POISON_CASES = [
     ("glu", "a", False),
     ("glu", "sfa", False),
     ("glu", "sfa", True),
+    ("dglu_bf16", "a", False),
+    ("dglu", "a", False),
+    ("dglu", "sfa", False),
+    ("dglu", "sfa", True),
 ]
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("kind, late, compact", POISON_CASES, ids=[f"{bs.KIND_IDS[k]}-late_{late}{'-compact' * c}" for k, late, c in POISON_CASES])
 def test_poison_reaches_d(kind, late, compact):
-    """The detector works: with A codes, SFA atoms or compact SFA rows poisoned, the stock scheduler's D holds NaN,
+    """The detector works: with A (dY) codes, SFA atoms or compact SFA rows poisoned, the stock scheduler's D holds NaN,
     so the producer tests see an early read of any of them."""
     tokens = bs.ROUTINGS["uneven"]
     problem = bs.make_problem(kind, tokens, seed=1)
@@ -215,7 +234,7 @@ def test_poison_reaches_d(kind, late, compact):
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("kind", ["glu"], ids=bs.KIND_IDS.get)
+@pytest.mark.parametrize("kind", ["glu", "dglu"], ids=bs.KIND_IDS.get)
 def test_signal_waits_for_producer_big_expert(kind):
     """The determinism file's producer cases on an expert of several batches (5000 rows): every release order gives the
     stock bytes."""
@@ -230,7 +249,7 @@ def rejected(kind, compact):
 
     if compact:
         one_cta = dict(use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1))
-        options = [one_cta, dict(sf_vec_size=16), dict(glu_layout="gate_then_up")]
+        options = [one_cta] + ([dict(sf_vec_size=16), dict(glu_layout="gate_then_up")] if kind == "glu" else [])
         return [(dict(use_dynamic_sched=True, compact_sfa_sf_warp=True, **extra), ValueError, "compact_sfa_sf_warp") for extra in options]
     signal = dict(use_dynamic_sched=True, streaming_signal_capacity=4)
     cases = [
@@ -239,10 +258,13 @@ def rejected(kind, compact):
         (dict(signal, cluster_shape_mn=(4, 1)), ValueError, "cluster"),
     ]
     slots_ready = "launch_pdl_dependents_at_all_streaming_signal_slots_ready"
-    return cases + [(dict(use_dynamic_sched=True, **{name: True}), ValueError, name) for name in ("device_layout", slots_ready)]
+    if kind == "glu":
+        return cases + [(dict(use_dynamic_sched=True, **{name: True}), ValueError, name) for name in ("device_layout", slots_ready)]
+    # The forward GLU's device layout and slots-ready trigger are not dGLU options.
+    return cases + [(dict(signal, **{name: True}), TypeError, name) for name in ("device_layout", slots_ready)]
 
 
-REJECT_CASES = [("glu", False), ("glu", True)]
+REJECT_CASES = [("glu", False), ("glu", True), ("dglu_bf16", False), ("dglu", False), ("dglu", True)]
 
 
 @pytest.mark.L0

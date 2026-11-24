@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Bitwise determinism of the streaming signal options on the SM100 block-scaled grouped GEMM kernels: N_CHUNK output
-notify on the MXFP8 quant kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1; stock SF atoms or
-``compact_sfa_sf_warp``).
+notify on the MXFP8 quant kernel (FC2), and the input signal on the MXFP8 SwiGLU kernel (FC1; stock SF atoms or
+``compact_sfa_sf_warp``) and on the BF16 and MXFP8 dSwiGLU kernels (``deterministic=True``).
 
 The options change which cluster runs a tile and when, never the tile math, so the outputs (FC2: BF16 D; FC1: BF16 C
-and D) must be raw-byte equal across replays, extra clusters that stop early or never stop, chunk sizes, producer
-release orders, neighboring experts and the stock dynamic scheduler.
+and D; dGLU: BF16 D and the FP32 dprob slots) must be raw-byte equal across replays, extra clusters that stop early or
+never stop, chunk sizes, producer release orders, neighboring experts and the stock dynamic scheduler.
 
-Directions: forward only.  These are forward kernels; backward is unsupported by contract, not untested.  Inputs are
-quantized once (E4M3 codes, E8M0 scales) and reused unchanged across every replay, packing and release order.
+Directions: FC2 and FC1 are forward kernels, whose backward is unsupported by contract, not untested; the dGLU is FC1's
+backward.  Inputs are quantized once and reused unchanged across every replay, packing and release order.
 """
 
 import pytest
@@ -58,11 +58,15 @@ def test_mxfp8_output_notify_chunk_size_invariance():
     assert_bitwise(results[1024], results[256], "C = 1024 vs 256")
 
 
-# ---- The input signal (FC1 GLU) ----
+# ---- The input signal (FC1 GLU, dGLU) ----
 
-# Variants (``variant_options``): the signal, with its trigger (the device layout and all-slots-ready trigger), and with
-# the compact SF warp.
+# Variants (``variant_options``): the signal, with its trigger (the GLU's device layout and all-slots-ready trigger, the
+# dGLU's entry trigger), and with the compact SF warp.
 REPLAY_CASES = [("glu", v, r) for v in ("signal", "trigger", "compact_signal", "compact_trigger") for r in ("many_experts_64", "big_expert")]
+REPLAY_CASES += [
+    (k, v, "many_experts_64")
+    for k, v in [("dglu_bf16", "signal"), ("dglu_bf16", "trigger"), ("dglu", "signal"), ("dglu", "trigger"), ("dglu", "compact_signal")]
+]
 
 
 @pytest.mark.L0
@@ -78,14 +82,15 @@ def test_signal_replays_match_dynamic(kind, variant, routing):
 
 
 RELEASE_CASES = [("glu", "signal"), ("glu", "trigger"), ("glu", "compact_signal"), ("glu", "compact_trigger")]
+RELEASE_CASES += [("dglu_bf16", "signal"), ("dglu", "signal"), ("dglu", "compact_signal")]
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("kind, variant", RELEASE_CASES, ids=case_ids(RELEASE_CASES))
 def test_signal_producer_release_order_invariance(kind, variant):
-    """The GEMM starts while every M tile reads not-ready and A and its scales (SF atoms or compact rows) hold NaN, with
-    ``device_layout`` also the expert layout; a producer stream writes each M tile and releases it, in order, in reverse
-    and in a seeded random order, over 64 experts.  Every order gives the stock scheduler's bytes."""
+    """The GEMM starts while every M tile reads not-ready and A (dY) and its scales (SF atoms or compact rows) hold NaN,
+    with ``device_layout`` also the expert layout; a producer stream writes each M tile and releases it, in order, in
+    reverse and in a seeded random order, over 64 experts.  Every order gives the stock scheduler's bytes."""
     _, expected, results = bs.producer_case(kind, variant, "many_experts_64")
     expected = snapshot(expected)
     for order, got in results.items():
@@ -94,7 +99,7 @@ def test_signal_producer_release_order_invariance(kind, variant):
 
 # ---- Batch invariance and claim-slot warm stress, every kernel ----
 
-BATCH_CASES = [("quant", "cluster21"), ("quant", "cluster11"), ("glu", "signal"), ("glu", "trigger")]
+BATCH_CASES = [("quant", "cluster21"), ("quant", "cluster11"), ("glu", "signal"), ("glu", "trigger"), ("dglu_bf16", "signal"), ("dglu", "signal")]
 
 
 @pytest.mark.L0
@@ -119,7 +124,7 @@ def test_target_expert_batch_invariance(kind, variant):
             assert_bitwise(snapshot({key: value[rows] for key, value in out.items()}), expected, f"target in {name} (copy {copy})")
 
 
-WARM_CASES = [("quant", "n_chunk"), ("glu", "signal"), ("glu", "compact_signal")]
+WARM_CASES = [("quant", "n_chunk"), ("glu", "signal"), ("glu", "compact_signal"), ("dglu_bf16", "signal"), ("dglu", "signal"), ("dglu", "compact_signal")]
 
 
 @pytest.mark.L0
@@ -143,6 +148,8 @@ def test_claim_slot_release_warm_stress(kind, variant):
     ready = bs.signal_ready(kernel)
 
     def launch():
+        if kind.startswith("dglu"):
+            buffers[1].zero_()  # the dprob slots: every launch starts from the same zeros
         launcher.launch(problem, buffers)
 
     assert_warm_stress(

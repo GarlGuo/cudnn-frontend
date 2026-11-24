@@ -8,6 +8,8 @@ Kernel kinds (K = 512, cluster (2, 1) with the 2-CTA 256 x 256 tile unless ``one
 
 - "quant": the MXFP8 MoE quant kernel (FC2), A [rows, K] x B [E, N, K] -> BF16 D [rows, N]; N_CHUNK output notify.
 - "glu": the MXFP8 SwiGLU kernel (FC1), N = gate and up -> BF16 C [rows, N] and D [rows, N / 2]; the input signal.
+- "dglu_bf16", "dglu": the BF16 and MXFP8 dSwiGLU kernels, dY [rows, K] x W2 [E, N, K] with the saved C [rows, 2N] ->
+  BF16 D [rows, 2N] and dprob (``deterministic=True``: one FP32 slot per 256-wide N tile); the input signal.
 
 MXFP8 operands are E4M3 codes with E8M0 exponents, kept row-major (``a_exp``, ``b_exp``) and as the swizzled SF atoms
 the kernels read (``sfa``, ``sfb``); with ``compact_sfa_sf_warp`` the kernel reads ``a_exp`` and builds the atoms.
@@ -27,10 +29,10 @@ SF_ATOM_COLS = 4
 #: NaN as an E4M3 code, in both bytes of a BF16 and as an E8M0 scale: a tile read before its producer wrote it carries
 #: NaN into the outputs.
 POISON = 0xFF
-#: The default N of each kind: the GLU's gate and up.
-N = {"quant": 1024, "glu": 1024}
+#: The default N of each kind: the GLU's gate and up, the dGLU's W2 rows.
+N = {"quant": 1024, "glu": 1024, "dglu_bf16": 512, "dglu": 512}
 #: Parameter ids: direction, recipe, kernel.
-KIND_IDS = {"quant": "fprop-mxfp8-fc2", "glu": "fprop-mxfp8-glu"}
+KIND_IDS = {"quant": "fprop-mxfp8-fc2", "glu": "fprop-mxfp8-glu", "dglu_bf16": "bprop-bf16-dglu", "dglu": "bprop-mxfp8-dglu"}
 # More than 32 experts take the batch opener several lane rounds; an expert of more than 16 M tiles needs several batches.
 ROUTINGS = {"uneven": [700, 0, 256, 1], "many_experts_64": bf16.MANY_EXPERTS_64, "big_expert": bf16.BIG_EXPERT}
 
@@ -45,7 +47,8 @@ def require_kernel(kind):
         return
     if kind == "quant":
         pytest.skip("N_CHUNK on the SM107 (Rubin) quant kernel is not wired yet")
-    pytest.skip("the SM100 kernel (the Rubin twin does not take a streaming input producer)")
+    if kind != "dglu_bf16":
+        pytest.skip("the SM100 kernel (the Rubin twin does not take a streaming input producer)")
 
 
 def kernel_class(kind):
@@ -53,6 +56,10 @@ def kernel_class(kind):
         from cudnn.gemm.cutedsl.grouped.quant.grouped_gemm_quant import BlockScaledMoEGroupedGemmQuantKernel as cls
     elif kind == "glu":
         from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel as cls
+    elif kind == "dglu_bf16":
+        from cudnn.gemm.cutedsl.grouped.dglu.moe_grouped_gemm_dglu_dbias import MoEGroupedGemmDgluDbiasBf16Kernel as cls
+    else:
+        from cudnn.gemm.cutedsl.grouped.dglu.moe_blockscaled_grouped_gemm_dglu_dbias import BlockScaledMoEGroupedGemmDgluDbiasKernel as cls
     return cls
 
 
@@ -71,37 +78,48 @@ def make_kernel(kind, experts, one_cta=False, **options):
         expert_cnt=experts,
         weight_mode=MoEWeightMode.DENSE,
     )
-    common.update(sf_vec_size=SF_VEC_SIZE, discrete_col_sfd=False)
-    common["generate_sfd"] = False
+    if kind != "dglu_bf16":
+        common.update(sf_vec_size=SF_VEC_SIZE, discrete_col_sfd=False)
+    if kind in ("quant", "glu"):
+        common["generate_sfd"] = False
     if kind == "quant":
         common["enable_bias"] = False
     if kind == "glu":
         common["act_func"] = "swiglu"
+    if kind.startswith("dglu"):
+        common["act_func"] = "dswiglu"
+        options.setdefault("deterministic", True)
+    # compact_sfa_sf_warp is passed only when on: the BF16 kernel has no such argument.
+    if not options.get("compact_sfa_sf_warp"):
+        options.pop("compact_sfa_sf_warp", None)
     common.update({name: options.pop(name) for name in list(options) if name in common})
     kernel = kernel_class(kind)(**common, **options)
     kernel.test_kind, kernel.test_cluster_size = kind, 1 if one_cta else 2
     kernel.test_compact = bool(options.get("compact_sfa_sf_warp"))
     kernel.test_signal = bool(options.get("streaming_signal_capacity"))
     kernel.test_device_layout = bool(options.get("device_layout"))
+    kernel.test_deterministic = bool(options.get("deterministic"))
     kernel.test_compile_key = (type(kernel).__qualname__, frozen({**common, **options}))
     return kernel
 
 
 def trigger_options(kind):
-    """The GLU's device layout with the all-slots-ready PDL trigger."""
-    return dict(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+    """The GLU's device layout with the all-slots-ready PDL trigger; the dGLU's trigger at entry."""
+    if kind == "glu":
+        return dict(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+    return dict(use_pdl=True, launch_pdl_dependents_at_entry=True)
 
 
 def variant_options(kind, problem, variant):
-    """Options of an input-signal ``variant``: "signal" (one flag per M tile) or "trigger" (the signal and
-    ``trigger_options``); a "compact" prefix adds ``compact_sfa_sf_warp`` ("compact" alone: on the stock dynamic
-    scheduler)."""
+    """Options of an input-signal ``variant``: "signal" (one flag per M tile), "trigger" (the signal and
+    ``trigger_options``), "entry" (the dGLU's entry trigger alone); a "compact" prefix adds ``compact_sfa_sf_warp``
+    ("compact" alone: on the stock dynamic scheduler)."""
     options = dict(use_dynamic_sched=True)
     if variant.startswith("compact"):
         options["compact_sfa_sf_warp"] = True
     if variant.endswith(("signal", "trigger")):
         options["streaming_signal_capacity"] = problem["rows"] // ROWS_ALIGNMENT
-    if variant.endswith("trigger"):
+    if variant.endswith(("trigger", "entry")):
         options.update(trigger_options(kind))
     return options
 
@@ -137,26 +155,34 @@ def complete(problem):
     """The derived fields: offsets (``layout[1:]``, inclusive row ends), sizes and the swizzled SF atoms."""
     experts, n, k = problem["b"].shape
     problem.update(offsets=problem["layout"][1:], rows=problem["a"].shape[0], n=n, k=k)
-    problem["sfa"] = swizzle_sf(problem["a_exp"])
-    problem["sfb"] = torch.cat([swizzle_sf(problem["b_exp"][e]) for e in range(experts)])
+    if "a_exp" in problem:
+        problem["sfa"] = swizzle_sf(problem["a_exp"])
+        problem["sfb"] = torch.cat([swizzle_sf(problem["b_exp"][e]) for e in range(experts)])
     return problem
 
 
 def make_problem(kind, tokens_per_expert, n=None, k=HIDDEN, seed=0):
-    """Expert-major rows padded to ROWS_ALIGNMENT (padding rows hold data too): A [rows, k] and B [experts, n, k] as E4M3
-    codes with E8M0 exponents ``a_exp`` [rows, sf_cols(k)] and ``b_exp`` [experts, n, sf_cols(k)], alpha [experts], prob
-    [rows, 1, 1]."""
+    """Expert-major rows padded to ROWS_ALIGNMENT (padding rows hold data too): A [rows, k], B [experts, n, k], alpha,
+    prob [rows, 1, 1]; MXFP8 exponents ``a_exp`` [rows, sf_cols(k)] and ``b_exp`` [experts, n, sf_cols(k)]; the dGLU's C
+    [rows, 2n] and beta [experts]."""
     n = n or N[kind]
     experts = len(tokens_per_expert)
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    rows = max(sum(padded(tokens) for tokens in tokens_per_expert), ROWS_ALIGNMENT)
-    a, a_exp = mxfp8_codes(rows, k, generator)
-    b, b_exp = mxfp8_codes(experts * n, k, generator)
-    layout = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
-    layout[1:] = torch.tensor([padded(tokens) for tokens in tokens_per_expert], device="cuda", dtype=torch.int64).cumsum(0).to(torch.int32)
-    alpha = torch.rand(experts, generator=generator, device="cuda") + 0.5
-    prob = torch.rand(rows, 1, 1, generator=generator, device="cuda")
-    problem = dict(a=a, a_exp=a_exp, b=b.view(experts, n, k), b_exp=b_exp.view(experts, n, -1), layout=layout, alpha=alpha, prob=prob)
+    if kind == "dglu_bf16":
+        problem = bf16.make_problem(tokens_per_expert, n, k, seed=seed)
+    else:
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        rows = max(sum(padded(tokens) for tokens in tokens_per_expert), ROWS_ALIGNMENT)
+        a, a_exp = mxfp8_codes(rows, k, generator)
+        b, b_exp = mxfp8_codes(experts * n, k, generator)
+        layout = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
+        layout[1:] = torch.tensor([padded(tokens) for tokens in tokens_per_expert], device="cuda", dtype=torch.int64).cumsum(0).to(torch.int32)
+        alpha = torch.rand(experts, generator=generator, device="cuda") + 0.5
+        prob = torch.rand(rows, 1, 1, generator=generator, device="cuda")
+        problem = dict(a=a, a_exp=a_exp, b=b.view(experts, n, k), b_exp=b_exp.view(experts, n, -1), layout=layout, alpha=alpha, prob=prob)
+    if kind.startswith("dglu"):
+        generator = torch.Generator(device="cuda").manual_seed(seed + 1000)
+        problem["c"] = (torch.randn(problem["a"].shape[0], 2 * n, generator=generator, device="cuda") * 2).to(torch.bfloat16)
+        problem["beta"] = torch.rand(experts, generator=generator, device="cuda") + 0.5
     return complete(problem)
 
 
@@ -168,7 +194,7 @@ def valid_rows(problem):
 
 
 def new_buffers(kernel, problem):
-    """NaN-filled BF16 outputs and a zeroed workspace."""
+    """NaN-filled BF16 outputs, a zeroed dprob and a zeroed workspace."""
     rows, n, kind = problem["rows"], problem["n"], kernel.test_kind
     workspace = torch.zeros(max(kernel.get_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
 
@@ -177,10 +203,13 @@ def new_buffers(kernel, problem):
 
     if kind == "quant":
         return nan(n), workspace
-    return nan(n), nan(n // 2), workspace
+    if kind == "glu":
+        return nan(n), nan(n // 2), workspace
+    dprob = torch.zeros(rows, n // 256 if kernel.test_deterministic else 1, device="cuda", dtype=torch.float32)
+    return nan(2 * n), dprob, workspace
 
 
-OUTPUTS = {"quant": ("d",), "glu": ("c", "d")}
+OUTPUTS = {"quant": ("d",), "glu": ("c", "d"), "dglu_bf16": ("d", "dprob"), "dglu": ("d", "dprob")}
 
 
 def outputs(kernel, problem, buffers):
@@ -212,20 +241,28 @@ def kernel_args(kernel, problem, *buffers):
         return tensor(x.view(torch.float8_e8m0fnu))
 
     kind, n, k = kernel.test_kind, problem["n"], problem["k"]
-    head = [tensor(problem["a"]), tensor(problem["b"]), e8m0(problem["sfb"])]
+    head = [tensor(problem["a"]), tensor(problem["b"].permute(1, 2, 0) if kind.startswith("dglu") else problem["b"])]
+    head += [] if kind == "dglu_bf16" else [e8m0(problem["sfb"])]
     head += [cutlass.Int32(n), cutlass.Int32(k), cutlass.Int64(k), OperandMajorMode.K, from_dlpack(buffers[-1], assumed_align=128).iterator]
     offsets, alpha, prob = from_dlpack(problem["offsets"], assumed_align=4), tensor(problem["alpha"]), tensor(problem["prob"])
     d = tensor(buffers[1] if kind == "glu" else buffers[0])
+    if kind == "dglu_bf16":
+        # (c, d, padded_offsets, alpha, beta, prob, dprob, linear_offset, dbias)
+        return head + [tensor(problem["c"]), d, offsets, alpha, tensor(problem["beta"]), prob, tensor(buffers[1].unsqueeze(-1)), cutlass.Float32(0.0), None]
     sfa = e8m0(problem["a_exp"] if kernel.test_compact else problem["sfa"])
     if kind == "quant":
         # (d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, row_scale, bias, prob)
         return head + [d, d, sfa, None, None, None, None, offsets, alpha, None, None, prob]
-    # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias)
-    return head + [tensor(buffers[0]), d, d, sfa, None, None, None, None, offsets, alpha, prob, None]
+    if kind == "glu":
+        # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias)
+        return head + [tensor(buffers[0]), d, d, sfa, None, None, None, None, offsets, alpha, prob, None]
+    # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, padded_offsets, alpha, beta, prob, dprob, dbias)
+    tail = [tensor(problem["c"]), d, d, sfa, None, None, None, None, offsets, alpha, tensor(problem["beta"]), prob, tensor(buffers[1].unsqueeze(-1))]
+    return head + tail + [None]
 
 
 def b_major_arg(kernel):
-    return 6
+    return 5 if kernel.test_kind == "dglu_bf16" else 6
 
 
 def cu_stream(stream=None):
@@ -275,7 +312,7 @@ class Launcher:
 
 # ---- Batch invariance (the determinism suite) ----
 
-# One target expert keeps its rows, codes, scales, B, alpha and prob while its neighbors change.
+# One target expert keeps its rows, codes, scales, B, alpha, prob (and the dGLU's C and beta) while its neighbors change.
 # Four expert slots each (empty slots pad the count), so one compiled kernel serves every packing.
 BANK_TOKENS = {"target": 700, "n300": 300, "n513": 513, "r1": 1, "r255": 255, "r257": 257}
 PACKINGS = {
@@ -288,7 +325,7 @@ PACKINGS = {
 }
 SLOTS = 4
 BATCH_ROWS = max(sum(padded(BANK_TOKENS[key]) for key in packing if key) for packing in PACKINGS.values())
-ROW_KEYS = ("a", "a_exp", "prob")
+ROW_KEYS = ("a", "a_exp", "prob", "c")
 
 
 def pack(bank, packing):
@@ -296,9 +333,10 @@ def pack(bank, packing):
     BANK_TOKENS; empty slots: zero codes, unit scales); returns it and the target's row ranges."""
     ends = [0] + bank["offsets"].tolist()
     packed = {}
-    for name in ROW_KEYS + ("b", "b_exp", "alpha"):
-        value = torch.zeros((BATCH_ROWS if name in ROW_KEYS else SLOTS, *bank[name].shape[1:]), device="cuda", dtype=bank[name].dtype)
-        packed[name] = value.fill_(127) if name.endswith("_exp") else value.fill_(1) if value.dtype == torch.float32 else value
+    for name in ROW_KEYS + ("b", "b_exp", "alpha", "beta"):
+        if name in bank:
+            value = torch.zeros((BATCH_ROWS if name in ROW_KEYS else SLOTS, *bank[name].shape[1:]), device="cuda", dtype=bank[name].dtype)
+            packed[name] = value.fill_(127) if name.endswith("_exp") else value.fill_(1) if value.dtype == torch.float32 else value
     layout = torch.zeros(SLOTS + 1, device="cuda", dtype=torch.int32)
     begin, target_rows = 0, []
     for slot, key in enumerate(packing):
@@ -482,7 +520,7 @@ def produce_tiles(problem, final, late, signal, order):
 
 
 def producer_case(kind, variant, routing):
-    """The signal GEMM launched last on its stream with every M tile not ready, A and SFA poisoned and, with
+    """The signal GEMM launched last on its stream with every M tile not ready, A (dY) and its scales poisoned and, with
     ``device_layout``, the layout -1; a producer stream writes them tile by tile in order, in reverse and in a seeded
     random order.  Returns (kernel, the stock scheduler's outputs, {order: outputs})."""
     from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
@@ -491,7 +529,7 @@ def producer_case(kind, variant, routing):
     problem = make_problem(kind, tokens, seed=7)
     expected, _ = Launcher(stock_kernel(kind, len(tokens)), problem)(problem)
     kernel = make_kernel(kind, len(tokens), **variant_options(kind, problem, variant))
-    capacity, late = problem["rows"] // ROWS_ALIGNMENT, "both"
+    capacity, late = problem["rows"] // ROWS_ALIGNMENT, "a" if kind == "dglu_bf16" else "both"
     # A few clusters only, so the producer finds free SMs while the GEMM waits.
     launcher = Launcher(kernel, problem, max_active_clusters=4)
     launcher(problem)  # loads the module: under lazy loading a first launch waits for running work
