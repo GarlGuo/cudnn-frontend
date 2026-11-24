@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -17,6 +19,7 @@ from gemm.cutedsl.test_grouped_gemm_sm90 import check, make_problem, run
 pytestmark = pytest.mark.L0
 
 DIRECTIONS = ["fwd", "dgrad"]
+SCHEDULES = ["cooperative", "pingpong"]
 
 
 @pytest.fixture(autouse=True)
@@ -108,16 +111,61 @@ def test_sm90_warm_stress(direction):
         graph.reset()
 
 
+# The tile-info slots (2 stages) turn over once per tile. K = 64 makes each tile one k-block, so 64 experts x 256 rows at
+# N = 3072 give 1536 (cooperative 128x256) or 2048 (pingpong 128x192) tiles, about 12 or 16 per CTA on H100, and the
+# scheduler warp waits on an empty slot at nearly every release (python/cudnn/AGENTS.md Rule 11).
+TILE_INFO_STRESS = {
+    "cooperative": dict(mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1)),
+    "pingpong": dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1)),
+}
+
+
+@pytest.mark.parametrize("schedule", list(TILE_INFO_STRESS))
 @pytest.mark.parametrize("direction", DIRECTIONS)
-def test_sm90_golden(direction):
+def test_sm90_tile_info_warm_stress(direction, schedule):
+    import cutlass
+    from warm_stress import StressCase, assert_warm_stress
+
+    kwargs = dict(TILE_INFO_STRESS[schedule], schedule=schedule)
+    problem = make_problem((256,) * 64, n=3072, k=64, direction=direction, seed=17)
+    check(problem, run(problem, **kwargs))
+    torch.cuda.synchronize()
+    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+    tile_m, tile_n = kwargs["mma_tiler_mn"]
+    tiles = (sum(problem["counts"]) // tile_m) * (problem["n"] // tile_n)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = run(problem, **kwargs)
+        report = assert_warm_stress(
+            StressCase(
+                f"SM90 grouped GEMM {direction} {schedule} tile-info M=64x256 N=3072 K=64 ({tiles} tiles)",
+                launch=graph.replay,
+                outputs={"c": captured["c_tensor"], "d": captured["d_tensor"]},
+                thread_blocks=2 * clusters,
+                refills_per_launch=-(-tiles // (2 * clusters)),  # tile-info fills per CTA
+            )
+        )
+        print(report.text())
+    finally:
+        graph.reset()
+
+
+@pytest.mark.parametrize("schedule", SCHEDULES)
+@pytest.mark.parametrize("direction", DIRECTIONS)
+def test_sm90_golden(direction, schedule):
+    # One record per direction for both schedules: pingpong's bytes are the cooperative bytes (each output element sums
+    # the same WGMMA K steps in the same order). The cooperative case records; pingpong only compares.
+    if schedule == "pingpong" and os.environ.get("CUDNN_DETERMINISM_RECORD"):
+        pytest.skip("pingpong compares against the cooperative record: record the cooperative case, then check")
     problem = make_problem((256, 0, 512), n=384, k=320, direction=direction, seed=21)
-    result = assert_replays(lambda: outputs(problem), repeats=2)
+    result = assert_replays(lambda: outputs(problem, schedule=schedule), repeats=2)
     check(problem, {"c_tensor": result["c"], "d_tensor": result["d"]})
     inputs = {"a": problem["a"], "weights": problem["weights"], "offsets": problem["offsets"], "alpha": problem["alpha"], "prob": problem["prob"]}
     assert_golden(f"grouped_gemm_sm90_bf16_{direction}", inputs, result)
 
 
-# ---- pingpong schedule (goldens are recorded on H100 like the cooperative ones) ----
+# ---- pingpong schedule (its golden is the cooperative record, test_sm90_golden) ----
 
 
 @pytest.mark.parametrize("direction", DIRECTIONS)
@@ -141,12 +189,3 @@ def test_sm90_pingpong_batch_invariance(direction):
         for index, segment in enumerate(segments):
             if segment == target:
                 assert_bitwise(rows_of(result, segments, index), expected, f"{name} segment {index}")
-
-
-@pytest.mark.parametrize("direction", DIRECTIONS)
-def test_sm90_pingpong_golden(direction):
-    problem = make_problem((256, 0, 512), n=384, k=320, direction=direction, seed=21)
-    result = assert_replays(lambda: outputs(problem, schedule="pingpong"), repeats=2)
-    check(problem, {"c_tensor": result["c"], "d_tensor": result["d"]})
-    inputs = {"a": problem["a"], "weights": problem["weights"], "offsets": problem["offsets"], "alpha": problem["alpha"], "prob": problem["prob"]}
-    assert_golden(f"grouped_gemm_sm90_bf16_{direction}_pingpong", inputs, result)
