@@ -302,6 +302,23 @@ def cluster_id(one_cta):
     return "cluster11" if one_cta else "cluster21"
 
 
+def dequantize(codes, exponents):
+    k = codes.shape[-1]
+    # A lookup of exact powers of two (E8M0 exponent e is 2^(e - 127)).
+    powers = torch.tensor([2.0**e for e in range(-127, 129)], device="cuda")
+    return codes.float() * powers[exponents[..., : k // SF_VEC_SIZE].long()].repeat_interleave(SF_VEC_SIZE, dim=-1)
+
+
+def quant_reference(problem):
+    """float32 D = alpha[e] * prob * (SFA * A) @ (SFB * B[e])^T over the experts' rows, from the unswizzled codes and scales."""
+    a = dequantize(problem["a"], problem["a_exp"])
+    out, begin = torch.zeros(problem["rows"], problem["n"], device="cuda"), 0
+    for expert, end in enumerate(problem["offsets"].tolist()):
+        out[begin:end] = problem["alpha"][expert] * (a[begin:end] @ dequantize(problem["b"][expert], problem["b_exp"][expert]).T)
+        begin = end
+    return out * problem["prob"][:, 0, :]
+
+
 def chunk_signal(kernel, workspace):
     """The kernel's ``signal[]``, one int32 per N chunk, as a view of ``workspace``."""
     from cudnn.gemm.cutedsl.grouped.moe_streaming_output_chunk_tile_scheduler import streaming_output_notify_offsets

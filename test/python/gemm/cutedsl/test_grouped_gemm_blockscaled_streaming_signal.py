@@ -53,6 +53,16 @@ def test_mxfp8_output_notify_publishes_every_chunk(clusters_beside_consumer, one
     assert bs.chunk_signal(kernel, workspace).tolist() == list(range(len(range(0, n, chunk))))
 
 
+@pytest.mark.L0
+def test_mxfp8_output_notify_matches_float_reference():
+    """An independent check of the bytes compared above: D is within 2e-2 of a float32 reference computed from the
+    dequantized E4M3 codes and E8M0 scales (partial last chunk, an empty expert, a one-row expert)."""
+    tokens = bs.ROUTINGS["uneven"]
+    problem = bs.make_problem("quant", tokens, 768, seed=3)
+    out, _ = bs.Launcher(bs.notify_kernel(len(tokens), 768, 512), problem)(problem)
+    torch.testing.assert_close(out["d"].float(), bs.quant_reference(problem)[: bs.valid_rows(problem)], atol=2e-2, rtol=2e-2)
+
+
 # The consumer is the GEMM's PDL dependent on its stream (the contract's topology: a consumer on another stream could take
 # an SM a not-yet-resident GEMM cluster needs).  full_grid: the GEMM takes every cluster, so the consumer overlaps only
 # once extras stop early; spare_sms: the GEMM leaves SMs free, so the consumer overlaps either way.  The GEMM is the PDL

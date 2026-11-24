@@ -2650,11 +2650,12 @@ scheduler:
 
 `test_grouped_gemm_blockscaled_streaming_signal.py` checks that every chunk is published with stock bytes (chunk shapes,
 routings, both cluster shapes), runs a concurrent consumer that copies each chunk on publication and must see the final
-D (a notifier that counts tiles before their D stores fails it), and checks the rejected options. No golden is recorded:
-the claim is byte equality with the stock scheduler on the same runtime. The kernel has no backward.
+D (a notifier that counts tiles before their D stores fails it), holds an independent float reference (D within 2e-2 of
+float32 math on the dequantized codes and scales, L0) and checks the rejected options. No golden is recorded: the claim
+is byte equality with the stock scheduler on the same runtime. The kernel has no backward.
 
 Measured on NVIDIA GB200 (cc 10.0), PyTorch 2.14.1+cu130, CuTe DSL 4.8.0, with this change's `python/` tree: both files
-at `-m "L0 or L1"` collected 25 and **25 passed** (17 + 8), 0 skipped. SM103 is unverified; the SM107 (Rubin) kernels
+at `-m "L0 or L1"` collected 26 and **26 passed** (18 + 8), 0 skipped. SM103 is unverified; the SM107 (Rubin) kernels
 are not wired. From `test/python`:
 
 ```bash
