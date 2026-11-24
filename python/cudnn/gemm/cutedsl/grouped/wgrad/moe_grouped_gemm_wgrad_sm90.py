@@ -45,6 +45,7 @@ from ..moe_persistent_scheduler import (
 from ..moe_utils import MoEWeightMode, TensormapWorkspace, WGradInputOrder
 from ..moe_sched_extension import WgradGemmSchedExtension
 from ..unfused.moe_grouped_gemm_sm90 import apply_schedule_override, pingpong_config_error
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 
 def use_pingpong_wgrad(n: int, mma_tiler_mn: Optional[Tuple[int, int]], cluster_shape_mn: Optional[Tuple[int, int]]) -> bool:
@@ -348,6 +349,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
             self.b_smem_layout_staged,
             self.c_smem_layout_staged,
             self.epi_tile,
+            cutlass.Int32(0),
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -387,8 +389,11 @@ class MoEGroupedGemmWgradBF16KernelSm90:
         b_smem_layout_staged: cute.ComposedLayout,
         c_smem_layout_staged: cute.ComposedLayout,
         epi_tile: cute.Tile,
+        rz_arg: cutlass.Int32,
     ):
         """GPU device kernel for MoE BF16 wgrad on SM90."""
+        # The release-zero (python/cudnn/AGENTS.md Rule 11): the host passes 0; its only use is this call.
+        rz = release_zero(rz_arg)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         tidx, _, _ = cute.arch.thread_idx()
         if warp_idx == self.tma_warp_id:
@@ -510,7 +515,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                 tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
             work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
             cute.arch.fence_proxy("async.shared", space="cta")
-            sched_pipeline.consumer_release(sched_consumer_state)
+            consume_then_arrive(sched_pipeline.consumer_get_barrier(sched_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
             sched_consumer_state.advance()
             while work_tile_info.is_valid_tile:
                 k_tile_cnt = work_tile_info.k_tile_cnt
@@ -567,7 +572,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                     tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                 work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                sched_pipeline.consumer_release(sched_consumer_state)
+                consume_then_arrive(sched_pipeline.consumer_get_barrier(sched_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
                 sched_consumer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
 
@@ -604,7 +609,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                 tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
             work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
             cute.arch.fence_proxy("async.shared", space="cta")
-            sched_pipeline.consumer_release(sched_consumer_state)
+            consume_then_arrive(sched_pipeline.consumer_get_barrier(sched_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
             sched_consumer_state.advance()
             num_prev_subtiles = cutlass.Int32(0)
             if cutlass.const_expr(not self.pingpong):
@@ -643,7 +648,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                         tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                     work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    sched_pipeline.consumer_release(sched_consumer_state)
+                    consume_then_arrive(sched_pipeline.consumer_get_barrier(sched_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
                     sched_consumer_state.advance()
             else:
                 # Pingpong: group w owns tiles w, w + 2, ... of the sequence; both read (and release) every entry.
@@ -682,7 +687,7 @@ class MoEGroupedGemmWgradBF16KernelSm90:
                         tile_info[idx] = sInfo[(idx, sched_consumer_state.index)]
                     work_tile_info = MoEWorkTileInfo.from_rmem_tensor(tile_info)
                     cute.arch.fence_proxy("async.shared", space="cta")
-                    sched_pipeline.consumer_release(sched_consumer_state)
+                    consume_then_arrive(sched_pipeline.consumer_get_barrier(sched_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
                     sched_consumer_state.advance()
                 # The group the sentinel's turn falls to takes the peer's last arrive on both order barriers.
                 if tile_parity == group:

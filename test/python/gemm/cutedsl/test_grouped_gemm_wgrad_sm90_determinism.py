@@ -141,3 +141,59 @@ def test_sm90_wgrad_pingpong_expert_batch_invariance():
     reordered = run(slices, order, **PINGPONG)["wgrad"]
     for position, expert in enumerate(order):
         assert_bitwise({"wgrad": reordered[position]}, {"wgrad": full[expert]}, f"expert {expert} reordered")
+
+
+# The tile-info slots (2 stages) turn over once per tile. 64 experts of 256 tokens (K = 256, four k-blocks) and a
+# 512 x 1536 dW per expert give 1536 (cooperative 128x256) or 2048 (pingpong 128x192) tiles, about 12 or 16 per CTA on
+# H100, so the scheduler warp waits on an empty slot at nearly every release (python/cudnn/AGENTS.md Rule 11).
+WARM_STRESS = {
+    "cooperative": dict(mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1)),
+    "pingpong": dict(mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1)),
+}
+
+
+@pytest.mark.parametrize("schedule", list(WARM_STRESS))
+def test_sm90_wgrad_warm_stress(schedule):
+    from warm_stress import StressCase, assert_warm_stress
+
+    experts, tokens, m, n = 64, 256, 512, 1536
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    dy = torch.randn((experts * tokens, m), generator=generator, device="cuda", dtype=torch.bfloat16) * 0.125
+    x = torch.randn((experts * tokens, n), generator=generator, device="cuda", dtype=torch.bfloat16) * 0.125
+    offsets = torch.full((experts,), tokens, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32)
+
+    def launch():
+        with override_schedule(schedule):
+            return cudnn.grouped_gemm_wgrad_wrapper_sm90(
+                a_tensor=dy.t(),
+                b_tensor=x,
+                sfa_tensor=None,
+                sfb_tensor=None,
+                offsets_tensor=offsets,
+                acc_dtype=torch.float32,
+                wgrad_dtype=torch.bfloat16,
+                **WARM_STRESS[schedule],
+            )["wgrad_tensor"]
+
+    expected = dy.view(experts, tokens, m).transpose(1, 2).float() @ x.view(experts, tokens, n).float()
+    torch.testing.assert_close(launch().float(), expected, rtol=2e-2, atol=2e-2)
+    torch.cuda.synchronize()
+    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+    tile_m, tile_n = WARM_STRESS[schedule]["mma_tiler_mn"]
+    tiles = experts * (m // tile_m) * (n // tile_n)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = launch()
+        report = assert_warm_stress(
+            StressCase(
+                f"SM90 grouped GEMM wgrad {schedule} tile-info E=64 K=256 dW 512x1536 ({tiles} tiles)",
+                launch=graph.replay,
+                outputs={"wgrad": captured},
+                thread_blocks=2 * clusters,
+                refills_per_launch=-(-tiles // (2 * clusters)),  # tile-info fills per CTA
+            )
+        )
+        print(report.text())
+    finally:
+        graph.reset()
