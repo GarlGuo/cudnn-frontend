@@ -4,60 +4,44 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
-### H100 SM90 BF16 grouped GEMM pingpong and epilogue scaling (2026-11-23)
+### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22, records deduplicated 2026-11-24)
 
-Pingpong runs only a 128x192 tile on a (2, 1) cluster, and a GLU only without C.
-Forced-pingpong cases (test-only schedule hook) in `gemm/cutedsl/test_grouped_gemm_wgrad_sm90_determinism.py`:
-replay, bytes equal to the cooperative 128x192 schedule, claim-order invariance
-down to one persistent cluster, and expert batch invariance. No wgrad golden is
-recorded: the cooperative records below cover the bytes.
+Records in `d7223a07b419e232/`, five: `grouped_gemm_sm90_bf16_{fwd,dgrad}`,
+`grouped_gemm_wgrad_sm90_bf16`, `grouped_gemm_{glu,dglu}_sm90_bf16`. Where an op has
+both warp-group schedules, its golden case runs both against the one record
+(`test_sm90_golden[{fwd,dgrad}-{cooperative,pingpong}]`, `test_sm90_glu_golden[glu-{cooperative,pingpong}]`):
+pingpong (128x192 tile, (2, 1) cluster) must give the cooperative bytes. Recording writes
+the cooperative case; the pingpong cases skip there and compare under `CUDNN_DETERMINISM_GOLDENS`.
+The removed `grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` held the cooperative hashes;
+the removed `grouped_gemm_glu_sm90_bf16_pingpong_noc` (GLU without C, N = 576) is replaced by
+the GLU-with-C pingpong case on the cooperative record.
 
-Recorded on H100 at 3a99fdb4 (run s9, strict check 8/8 under `CUDNN_DETERMINISM_GOLDENS`):
-new `grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` and `grouped_gemm_glu_sm90_bf16_pingpong_noc`
-(the GLU record replaces a 128x128 record with C, a tile pingpong no longer runs), and
-re-recorded `grouped_gemm_sm90_bf16_{fwd,dgrad}`. Numerical reason for the re-record: the
-epilogue now scales D once per row by `alpha * prob` instead of `(acc * alpha) * prob`; with
-these problems' non-unit alpha (0.5..1.5) the reassociation can move a D element by at most one
-bf16 ulp. C, the GLU, dGLU and wgrad records are unchanged, and unit alpha/prob is bitwise
-unchanged. The re-recorded D still matches the FP32 reference within the suites' tolerance.
-
-### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22)
-
-New SM90 (Hopper) kernels behind `grouped_gemm_wrapper_sm90` (forward, dgrad),
-`grouped_gemm_wgrad_wrapper_sm90`, `grouped_gemm_glu_wrapper_sm90` and
-`grouped_gemm_dglu_wrapper_sm90` (recorded through the SM90 paths of the `*_sm100`
-names, before the SM90 names existed). The five goldens are in `d7223a07b419e232/`.
-
-Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch
-2.14.0+cu130, CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0,
-tvm-ffi 0.1.16, compute-sanitizer 2026.1.1.0. Source built from the commit
-under test.
+Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch 2.14.0+cu130,
+CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0, tvm-ffi 0.1.16,
+compute-sanitizer 2026.1.1.0; source built from the commit under test.
 
 ```
 G=gemm/cutedsl
 F="$G/test_grouped_gemm_sm90.py $G/test_grouped_gemm_sm90_determinism.py $G/test_grouped_gemm_wgrad_sm90.py \
    $G/test_grouped_gemm_wgrad_sm90_determinism.py $G/test_grouped_gemm_glu_sm90.py $G/test_grouped_gemm_glu_sm90_determinism.py"
 CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=<new directory> pytest -m L0 $F   # sharded over 5 GPUs
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS=determinism_goldens pytest -m L0 $F -k golden
 ```
 
-- `5f3bbb1e` (forward, dgrad, wgrad): 61 passed, 0 skipped. `b42265a3`: 61
-  passed. `c36a50af` (adds GLU and dGLU): 113 passed, 0 skipped, plus 3
-  wgrad scheduler tests.
-- The forward, dgrad and wgrad records are byte-identical across all three
-  commits; GLU and dGLU are recorded once, at `c36a50af`.
-- Each `test_sm90*_golden` case checks the FP32 reference and replays bitwise
-  before recording. The replay cases run 8 fresh-buffer launches against
-  concurrent second-stream work. Batch invariance covers a segment alone,
-  packed, reordered, duplicated and with changed neighbors.
-- Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000
-  warm and 3000 poisoned launches for forward, dgrad, wgrad, GLU and dGLU;
-  the unsafe control failed 200 of 200.
-- dGLU's `dprob` is an atomic per-row sum across N tiles and is excluded
-  from the byte checks (max replay difference 4.6e-5); its D is checked.
-- compute-sanitizer at `c36a50af`: racecheck and synccheck report 0 errors
-  for all four ops. memcheck reports 0 device errors, but exits 99 on 28
-  host API messages (cuda-python's requested CUDA 13030 exceeds the 13020
-  driver; a `cuMemCreate` refusal).
+- Recorded at `c36a50af` (113 passed, 0 skipped); forward and dgrad re-recorded at
+  `3a99fdb4` (run s9, strict check 8/8 then): D is scaled once per row by `alpha * prob`,
+  at most one bf16 ulp from `(acc * alpha) * prob`.
+- Replay: 8 fresh-buffer launches against concurrent second-stream work. Batch invariance:
+  alone, packed, reordered, duplicated, changed neighbors. Pingpong also: bytes equal to
+  cooperative 128x192, claim-order invariance down to one persistent cluster.
+- Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000 warm + 3000
+  poisoned launches for forward, dgrad, wgrad, GLU, dGLU; the unsafe control failed 200 of 200.
+  The tile-info cases (`test_sm90_tile_info_warm_stress`, `test_sm90_wgrad_warm_stress`,
+  `test_sm90_glu_tile_info_warm_stress`: K = 64, wgrad 256 tokens per expert; about 12
+  (cooperative) or 16 (pingpong) tiles per CTA) cover the Rule 11 release sites.
+- dGLU's atomic `dprob` is excluded from the byte checks; D is checked.
+- compute-sanitizer at `c36a50af`: racecheck and synccheck 0 errors; memcheck 0 device
+  errors (exit 99 on 28 host API messages: cuda-python requests CUDA 13030 > driver 13020).
 
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 

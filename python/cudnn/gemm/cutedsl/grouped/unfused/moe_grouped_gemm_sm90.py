@@ -38,6 +38,7 @@ from ..moe_persistent_scheduler import (
 from ..moe_utils import MoEWeightMode, rewrite_tensor_shape
 from ..moe_sched_extension import ContiguousGroupedGemmSchedExtension
 from ..moe_kernel_helpers import compute_grid, fmax, fmin, is_valid_tensor_alignment, silu_f32, silu_f32_geglu_scaled
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 
 def _widen_for_cluster(tma_tensor, mode, tile, cluster_count):
@@ -620,6 +621,7 @@ class MoEGroupedGemmBf16KernelSm90:
             self.d_smem_layout_staged,
             self.epi_tile,
             self.sched_params,
+            cutlass.Int32(0),
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -706,7 +708,10 @@ class MoEGroupedGemmBf16KernelSm90:
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cutlass.Constexpr,
         sched_params: MoESchedulerParams,
+        rz_arg: cutlass.Int32,
     ):
+        # The release-zero (python/cudnn/AGENTS.md Rule 11): the host passes 0; its only use is this call.
+        rz = release_zero(rz_arg)
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -845,7 +850,7 @@ class MoEGroupedGemmBf16KernelSm90:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[0] >= cutlass.Int32(0)
             cute.arch.fence_proxy("async.shared", space="cta")
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            consume_then_arrive(tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
@@ -908,7 +913,9 @@ class MoEGroupedGemmBf16KernelSm90:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                consume_then_arrive(
+                    tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz
+                )
                 tile_info_consumer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
 
@@ -977,7 +984,7 @@ class MoEGroupedGemmBf16KernelSm90:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[0] >= cutlass.Int32(0)
             cute.arch.fence_proxy("async.shared", space="cta")
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            consume_then_arrive(tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
             tile_info_consumer_state.advance()
 
             if cutlass.const_expr(self.pingpong):
@@ -995,7 +1002,9 @@ class MoEGroupedGemmBf16KernelSm90:
                             tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                         is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                        consume_then_arrive(
+                            tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz
+                        )
                         tile_info_consumer_state.advance()
 
             num_prev_subtiles = cutlass.Int32(0)
@@ -1214,7 +1223,9 @@ class MoEGroupedGemmBf16KernelSm90:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                consume_then_arrive(
+                    tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz
+                )
                 tile_info_consumer_state.advance()
                 if cutlass.const_expr(self.pingpong):
                     # Skip the other warp group's next tile.
@@ -1226,7 +1237,9 @@ class MoEGroupedGemmBf16KernelSm90:
                             tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                         is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                         cute.arch.fence_proxy("async.shared", space="cta")
-                        tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                        consume_then_arrive(
+                            tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz
+                        )
                         tile_info_consumer_state.advance()
 
             if cutlass.const_expr(self.generate_c):
