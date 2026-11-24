@@ -1,35 +1,40 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Time the SM90 (Hopper) BF16 grouped GEMM forward, dgrad, GLU and dGLU against torch._grouped_mm.
+"""Time the SM90 (Hopper) BF16 grouped GEMMs against torch._grouped_mm.
 
 One row is (model, op, arm) at one EP rank's sizes: --tokens per GPU times top_k
 routed rows, spread evenly over the rank's experts, each expert padded to 256 rows.
 This is a synthetic balanced-routing benchmark. Ops: fc1_fwd (N=2I, K=H), fc2_fwd
 (N=H, K=I), fc1_dgrad (N=H, K=2I) and fc2_dgrad (N=I, K=H); dgrad reads the forward
-weights N-major (b_major="n"). fc1_glu is fc1_fwd with the SwiGLU fused
-(GroupedGemmGluSm90; D is N/2 wide) and fc2_dglu is fc2_dgrad with the dSwiGLU fused
-(GroupedGemmDgluSm90, reading the saved 2N-wide C and accumulating dprob); their torch
-arm is torch._grouped_mm plus the activation in eager torch. TFLOPs count the padded
-rows and the GEMM only.
+weights N-major (b_major="n"). TFLOPs count the padded rows.
+
+GLU and dGLU: fc1_glu is fc1_fwd with the SwiGLU fused (GroupedGemmGluSm90; D is
+N/2 wide) and fc2_dglu is fc2_dgrad with the dSwiGLU fused (GroupedGemmDgluSm90,
+reading the saved 2N-wide C and accumulating dprob, whose reset its timing
+includes). Their torch arm is torch._grouped_mm plus the activation in eager torch,
+and their TFLOPs count the GEMM only. fc2_dglu has one schedule, so it takes only
+the "default" and "torch" arms.
 
 python benchmark/gemm/benchmark_grouped_gemm_sm90.py --model deepseek_v3 --ep 8 --arms default cooperative pingpong torch
 
 Arms: "default" is the library's own schedule (its shape rule); "cooperative" and
 "pingpong" force one through the test hook moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE
-(pingpong runs only its 128x192 tile on a (2, 1) cluster; fc2_dglu has one schedule,
-so it takes only "default" and "torch"); "torch" is
+(pingpong runs only its 128x192 tile on a (2, 1) cluster); "torch" is
 torch._grouped_mm, which allocates its output per call. Each cudnn arm is built
-through GroupedGemmSm90 / GroupedGemmGluSm90 / GroupedGemmDgluSm90 (check_support,
-compile) outside timing and times the
-compiled plan's execute with fixed outputs and a preallocated workspace, so no
-wrapper allocation or dispatch. Graph timing is device time for an actual captured
-bundle, while eager timing includes host dispatch and synchronization. Every cudnn
-arm's output is checked against torch._grouped_mm outside timing.
+through its class API (fwd and dgrad: GroupedGemmSm90) with check_support and
+compile, and times the compiled plan's execute with fixed outputs and a
+preallocated workspace, so no wrapper allocation or dispatch. Input generation and
+JIT are outside timing; graph timing is device time for an actual captured bundle,
+while eager timing includes host dispatch and synchronization. Routing and token
+permutation are excluded; padding rows are zero, with a zero prob. Every cudnn
+arm's output is checked against the torch arm outside timing, and its hash is a
+cross-process control.
 """
 
 import argparse
 import contextlib
 import functools
+import hashlib
 import importlib.metadata
 import json
 import statistics
@@ -49,7 +54,6 @@ MODEL_SHAPES = {
     "glm53_flash": dict(hidden=4096, experts=288, top_k=8, intermediate=2048),
 }
 OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad", "fc1_glu", "fc2_dglu")
-BLOCK = 32  # interleaved_32 gate/up column blocks
 ARMS = ("default", "cooperative", "pingpong", "torch")
 
 
@@ -82,12 +86,19 @@ def problem(args, model, op):
         # The forward's saved pre-activation C (gate | up, 2N wide) and the accumulated dprob.
         tensors.update(c=torch.randn(groups * m, 2 * n, device="cuda", dtype=torch.bfloat16), dprob=torch.zeros(groups * m, device="cuda"))
     metadata = dict(model=model, op=op, b_major=b_major, groups=groups, M=m, valid_M=valid_m, N=n, K=k, total_rows=groups * m)
+    if valid_m != m:
+        for expert in range(groups):
+            tensors["a"][expert * m + valid_m : (expert + 1) * m].zero_()
+            tensors["prob"][expert * m + valid_m : (expert + 1) * m].zero_()
     return tensors, metadata
 
 
 def grouped_mm(t, b_major):
     b_kn = t["b"].transpose(1, 2) if b_major == "k" else t["b"]  # torch._grouped_mm takes (G, K, N)
     return functools.partial(torch._grouped_mm, t["a"], b_kn, offs=t["padded_offsets"], out_dtype=torch.bfloat16)
+
+
+BLOCK = 32  # interleaved_32 gate/up column blocks
 
 
 def split_gate_up(x):
@@ -120,18 +131,6 @@ def torch_arm(t, op, b_major):
     if op == "fc2_dglu":
         return lambda: torch_dswiglu(mm(), t["c"], t["prob"])
     return mm
-
-
-@contextlib.contextmanager
-def forced_schedule(schedule):
-    """The SM90 schedule test hook: plans built inside run ``schedule`` (None: the shape rule's pick)."""
-    import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
-
-    saved, sm90._SCHEDULE_OVERRIDE = sm90._SCHEDULE_OVERRIDE, schedule
-    try:
-        yield
-    finally:
-        sm90._SCHEDULE_OVERRIDE = saved
 
 
 def prepare_glu(t, op, b_major, arm):
@@ -189,6 +188,18 @@ def prepare_glu(t, op, b_major, arm):
     return run, d, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
 
 
+@contextlib.contextmanager
+def forced_schedule(schedule):
+    """The SM90 schedule test hook: plans built inside run ``schedule`` (None: the shape rule's pick)."""
+    import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
+
+    saved, sm90._SCHEDULE_OVERRIDE = sm90._SCHEDULE_OVERRIDE, schedule
+    try:
+        yield
+    finally:
+        sm90._SCHEDULE_OVERRIDE = saved
+
+
 def prepare(t, op, b_major, arm):
     """One arm's timed call, its output buffer (None for torch) and its plan's configuration."""
     if arm == "torch":
@@ -230,6 +241,11 @@ def prepare(t, op, b_major, arm):
     torch.cuda.synchronize()
     schedule = "pingpong" if implementation._pingpong else "cooperative"
     return run, d, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
+
+
+def output_sha256(value):
+    """Cross-process control; copying/hashing is outside timing."""
+    return hashlib.sha256(value.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
 
 
 def distribution(samples):
@@ -275,11 +291,17 @@ def measure(runs, args):
     for arm, metrics in samples.items():
         measurements[arm] = {name: statistics.median(values) for name, values in metrics.items()}
         measurements[arm]["distributions"] = {name: distribution(values) for name, values in metrics.items()}
+    if "torch" in runs:
+        for arm in runs:
+            if arm != "torch":
+                measurements[arm]["paired_ratio_to_torch"] = {
+                    name: distribution([a / t for a, t in zip(samples[arm][name], values)]) for name, values in samples["torch"].items()
+                }
     return measurements
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", nargs="+", choices=tuple(MODEL_SHAPES), default=["deepseek_v3"], metavar="MODEL", help=", ".join(MODEL_SHAPES))
     parser.add_argument("--op", nargs="+", choices=OPS, default=list(OPS), metavar="OP", help=", ".join(OPS))
     parser.add_argument("--arms", nargs="+", choices=ARMS, default=["default", "torch"], metavar="ARM", help=", ".join(ARMS))
@@ -321,6 +343,7 @@ def main():
                 cases[arm] = dict(**shape, arm=arm, **plan)
                 if d is not None:
                     cases[arm]["max_abs_diff_vs_torch"] = (d.float() - reference).abs().max().item()
+                    cases[arm]["output_sha256"] = output_sha256(d)
                     torch.testing.assert_close(d.float(), reference, rtol=2e-2, atol=2e-2)
                 runs[arm] = run
             measurements = measure(runs, args)
