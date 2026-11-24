@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bitwise determinism of N_CHUNK output notify on the SM100 MXFP8 block-scaled MoE quant (FC2) forward kernel.
+"""Bitwise determinism of the streaming signal options on the SM100 block-scaled grouped GEMM kernels: N_CHUNK output
+notify on the MXFP8 quant kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1).
 
-N_CHUNK changes which cluster runs a tile and when, never the tile math, so the BF16 D must be raw-byte equal across
-replays, extra clusters that stop early or never stop, chunk sizes, neighboring experts and the stock dynamic scheduler.
+The options change which cluster runs a tile and when, never the tile math, so the outputs (FC2: BF16 D; FC1: BF16 C
+and D) must be raw-byte equal across replays, extra clusters that stop early or never stop, chunk sizes, producer
+release orders, neighboring experts and the stock dynamic scheduler.
 
-Directions: forward only.  This is a forward kernel; backward is unsupported by contract, not untested.  Inputs are
-quantized once (E4M3 codes, E8M0 SF atoms) and reused unchanged across every replay and packing.
+Directions: forward only.  These are forward kernels; backward is unsupported by contract, not untested.  Inputs are
+quantized once (E4M3 codes, E8M0 scales) and reused unchanged across every replay, packing and release order.
 """
 
 import pytest
@@ -55,9 +57,42 @@ def test_mxfp8_output_notify_chunk_size_invariance():
     assert_bitwise(results[1024], results[256], "C = 1024 vs 256")
 
 
-# ---- Batch invariance and claim-slot warm stress ----
+# ---- The input signal (FC1 GLU) ----
 
-BATCH_CASES = [("quant", "cluster21"), ("quant", "cluster11")]
+# Variants (``variant_options``): the signal, and with its trigger (the device layout and all-slots-ready trigger).
+REPLAY_CASES = [("glu", v, r) for v in ("signal", "trigger") for r in ("many_experts_64", "big_expert")]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind, variant, routing", REPLAY_CASES, ids=case_ids(REPLAY_CASES))
+def test_signal_replays_match_dynamic(kind, variant, routing):
+    """Every M tile ready: replays on fresh buffers beside concurrent work give the same bytes, which equal the stock
+    scheduler's."""
+    tokens = bs.ROUTINGS[routing]
+    problem = bs.make_problem(kind, tokens, seed=len(routing))
+    expected = snapshot(run(bs.Launcher(bs.stock_kernel(kind, len(tokens)), problem), problem))
+    launcher = bs.Launcher(bs.make_kernel(kind, len(tokens), **bs.variant_options(kind, problem, variant)), problem)
+    assert_bitwise(assert_replays(lambda: run(launcher, problem), repeats=REPLAYS), expected, f"{variant} vs stock")
+
+
+RELEASE_CASES = [("glu", "signal"), ("glu", "trigger")]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind, variant", RELEASE_CASES, ids=case_ids(RELEASE_CASES))
+def test_signal_producer_release_order_invariance(kind, variant):
+    """The GEMM starts while every M tile reads not-ready and A and its SF atoms hold NaN, with ``device_layout`` also
+    the expert layout; a producer stream writes each M tile and releases it, in order, in reverse and in a seeded random
+    order, over 64 experts.  Every order gives the stock scheduler's bytes."""
+    _, expected, results = bs.producer_case(kind, variant, "many_experts_64")
+    expected = snapshot(expected)
+    for order, got in results.items():
+        assert_bitwise(snapshot(got), expected, f"{order} release vs stock")
+
+
+# ---- Batch invariance and claim-slot warm stress, every kernel ----
+
+BATCH_CASES = [("quant", "cluster21"), ("quant", "cluster11"), ("glu", "signal"), ("glu", "trigger")]
 
 
 @pytest.mark.L0
@@ -66,10 +101,13 @@ def test_target_expert_batch_invariance(kind, variant):
     """The target expert's bytes do not depend on what is packed around it: alone, with neighbors, behind empty
     experts, among ragged ones (1, 255, 257 rows), reordered, or duplicated (N_CHUNK: N = 768, chunk 512)."""
     one_cta = variant == "cluster11"
-    bank = bs.make_problem(kind, list(bs.BANK_TOKENS.values()), 768, seed=1234)
+    bank = bs.make_problem(kind, list(bs.BANK_TOKENS.values()), 768 if kind == "quant" else None, seed=1234)
     problems = {name: bs.pack(bank, packing) for name, packing in bs.PACKINGS.items()}
     alone, alone_rows = problems["alone"]
-    kernel = bs.notify_kernel(bs.SLOTS, 768, 512, one_cta)
+    if kind == "quant":
+        kernel = bs.notify_kernel(bs.SLOTS, 768, 512, one_cta)
+    else:
+        kernel = bs.make_kernel(kind, bs.SLOTS, **bs.variant_options(kind, alone, variant))
     stock = bs.Launcher(bs.stock_kernel(kind, bs.SLOTS, one_cta), alone)(alone)[0]
     expected = snapshot({name: value[alone_rows[0]] for name, value in stock.items()})
     launcher = bs.Launcher(kernel, alone)
@@ -79,7 +117,7 @@ def test_target_expert_batch_invariance(kind, variant):
             assert_bitwise(snapshot({key: value[rows] for key, value in out.items()}), expected, f"target in {name} (copy {copy})")
 
 
-WARM_CASES = [("quant", "n_chunk")]
+WARM_CASES = [("quant", "n_chunk"), ("glu", "signal")]
 
 
 @pytest.mark.L0
@@ -94,9 +132,13 @@ def test_claim_slot_release_warm_stress(kind, variant):
     problem = bs.make_problem(kind, tokens, seed=13)
     assert problem["rows"] == sum(bs.padded(t) for t in tokens), "every output row is written, so the sentinel fill is overwritten"
     stock, _ = bs.Launcher(bs.stock_kernel(kind, len(tokens)), problem)(problem)
-    kernel = bs.notify_kernel(len(tokens), problem["n"], 256)
+    if kind == "quant":
+        kernel = bs.notify_kernel(len(tokens), problem["n"], 256)
+    else:
+        kernel = bs.make_kernel(kind, len(tokens), **bs.variant_options(kind, problem, variant))
     launcher = bs.Launcher(kernel, problem, max_active_clusters=clusters)
     buffers = launcher.buffers(problem)
+    ready = bs.signal_ready(kernel)
 
     def launch():
         launcher.launch(problem, buffers)
@@ -109,6 +151,7 @@ def test_claim_slot_release_warm_stress(kind, variant):
             thread_blocks=2 * clusters,
             refills_per_launch=(problem["rows"] // bs.ROWS_ALIGNMENT) * (problem["n"] // 256) // clusters,
             reference=stock,
+            reset=(lambda: ready(buffers[-1])) if kernel.test_signal else None,
         ),
         warm=500,
         poisoned=500,

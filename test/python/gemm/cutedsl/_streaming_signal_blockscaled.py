@@ -2,11 +2,12 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Shared by the streaming signal tests of the SM100 block-scaled grouped GEMM kernels, on top of #2810's BF16 helper:
-problems, kernels, one compile cache per process and the N_CHUNK consumer.
+problems, kernels, one compile cache per process, the N_CHUNK consumer and the fake input producer.
 
 Kernel kinds (K = 512, cluster (2, 1) with the 2-CTA 256 x 256 tile unless ``one_cta``, dense weights):
 
 - "quant": the MXFP8 MoE quant kernel (FC2), A [rows, K] x B [E, N, K] -> BF16 D [rows, N]; N_CHUNK output notify.
+- "glu": the MXFP8 SwiGLU kernel (FC1), N = gate and up -> BF16 C [rows, N] and D [rows, N / 2]; the input signal.
 
 MXFP8 operands are E4M3 codes with E8M0 exponents, kept row-major (``a_exp``, ``b_exp``) and as the swizzled SF atoms
 the kernels read (``sfa``, ``sfb``).
@@ -16,17 +17,20 @@ import pytest
 import torch
 
 from gemm.cutedsl import _streaming_signal as bf16
-from gemm.cutedsl._streaming_signal import ROWS_ALIGNMENT, frozen, padded
-from gemm.cutedsl.test_grouped_gemm_streaming_signal import levels, require_sm10x  # noqa: F401  (re-exported)
+from gemm.cutedsl._streaming_signal import ROWS_ALIGNMENT, frozen, padded, signal_ready
+from gemm.cutedsl.test_grouped_gemm_streaming_signal import levels, release_order, require_sm10x  # noqa: F401  (re-exported)
 
 HIDDEN = 512
 SF_VEC_SIZE = 32
 #: Scale-factor atom: 128 rows x 4 scales, 512 bytes (tcgen05 block-scaled MMA layout).
 SF_ATOM_COLS = 4
-#: The default N of each kind.
-N = {"quant": 1024}
+#: NaN as an E4M3 code, in both bytes of a BF16 and as an E8M0 scale: a tile read before its producer wrote it carries
+#: NaN into the outputs.
+POISON = 0xFF
+#: The default N of each kind: the GLU's gate and up.
+N = {"quant": 1024, "glu": 1024}
 #: Parameter ids: direction, recipe, kernel.
-KIND_IDS = {"quant": "fprop-mxfp8-fc2"}
+KIND_IDS = {"quant": "fprop-mxfp8-fc2", "glu": "fprop-mxfp8-glu"}
 # More than 32 experts take the batch opener several lane rounds; an expert of more than 16 M tiles needs several batches.
 ROUTINGS = {"uneven": [700, 0, 256, 1], "many_experts_64": bf16.MANY_EXPERTS_64, "big_expert": bf16.BIG_EXPERT}
 
@@ -41,11 +45,14 @@ def require_kernel(kind):
         return
     if kind == "quant":
         pytest.skip("N_CHUNK on the SM107 (Rubin) quant kernel is not wired yet")
+    pytest.skip("the SM100 kernel (the Rubin twin does not take a streaming input producer)")
 
 
 def kernel_class(kind):
     if kind == "quant":
         from cudnn.gemm.cutedsl.grouped.quant.grouped_gemm_quant import BlockScaledMoEGroupedGemmQuantKernel as cls
+    elif kind == "glu":
+        from cudnn.gemm.cutedsl.grouped.glu.moe_blockscaled_grouped_gemm_glu_bias import BlockScaledMoEGroupedGemmGluBiasKernel as cls
     return cls
 
 
@@ -68,11 +75,31 @@ def make_kernel(kind, experts, one_cta=False, **options):
     common["generate_sfd"] = False
     if kind == "quant":
         common["enable_bias"] = False
+    if kind == "glu":
+        common["act_func"] = "swiglu"
     common.update({name: options.pop(name) for name in list(options) if name in common})
     kernel = kernel_class(kind)(**common, **options)
     kernel.test_kind, kernel.test_cluster_size = kind, 1 if one_cta else 2
+    kernel.test_signal = bool(options.get("streaming_signal_capacity"))
+    kernel.test_device_layout = bool(options.get("device_layout"))
     kernel.test_compile_key = (type(kernel).__qualname__, frozen({**common, **options}))
     return kernel
+
+
+def trigger_options(kind):
+    """The GLU's device layout with the all-slots-ready PDL trigger."""
+    return dict(device_layout=True, use_pdl=True, launch_pdl_dependents_at_all_streaming_signal_slots_ready=True)
+
+
+def variant_options(kind, problem, variant):
+    """Options of an input-signal ``variant``: "signal" (one flag per M tile) or "trigger" (the signal and
+    ``trigger_options``)."""
+    options = dict(use_dynamic_sched=True)
+    if variant.endswith(("signal", "trigger")):
+        options["streaming_signal_capacity"] = problem["rows"] // ROWS_ALIGNMENT
+    if variant.endswith("trigger"):
+        options.update(trigger_options(kind))
+    return options
 
 
 def stock_kernel(kind, experts, one_cta=False):
@@ -138,16 +165,18 @@ def valid_rows(problem):
 
 def new_buffers(kernel, problem):
     """NaN-filled BF16 outputs and a zeroed workspace."""
-    rows, n = problem["rows"], problem["n"]
+    rows, n, kind = problem["rows"], problem["n"], kernel.test_kind
     workspace = torch.zeros(max(kernel.get_workspace_bytes(), 1), device="cuda", dtype=torch.uint8)
 
     def nan(cols):
         return torch.full((rows, cols), float("nan"), device="cuda", dtype=torch.bfloat16)
 
-    return nan(n), workspace
+    if kind == "quant":
+        return nan(n), workspace
+    return nan(n), nan(n // 2), workspace
 
 
-OUTPUTS = {"quant": ("d",)}
+OUTPUTS = {"quant": ("d",), "glu": ("c", "d")}
 
 
 def outputs(kernel, problem, buffers):
@@ -178,14 +207,17 @@ def kernel_args(kernel, problem, *buffers):
     def e8m0(x):
         return tensor(x.view(torch.float8_e8m0fnu))
 
-    n, k = problem["n"], problem["k"]
+    kind, n, k = kernel.test_kind, problem["n"], problem["k"]
     head = [tensor(problem["a"]), tensor(problem["b"]), e8m0(problem["sfb"])]
     head += [cutlass.Int32(n), cutlass.Int32(k), cutlass.Int64(k), OperandMajorMode.K, from_dlpack(buffers[-1], assumed_align=128).iterator]
     offsets, alpha, prob = from_dlpack(problem["offsets"], assumed_align=4), tensor(problem["alpha"]), tensor(problem["prob"])
-    d = tensor(buffers[0])
+    d = tensor(buffers[1] if kind == "glu" else buffers[0])
     sfa = e8m0(problem["sfa"])
-    # (d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, row_scale, bias, prob)
-    return head + [d, d, sfa, None, None, None, None, offsets, alpha, None, None, prob]
+    if kind == "quant":
+        # (d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, row_scale, bias, prob)
+        return head + [d, d, sfa, None, None, None, None, offsets, alpha, None, None, prob]
+    # (c, d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, prob, bias)
+    return head + [tensor(buffers[0]), d, d, sfa, None, None, None, None, offsets, alpha, prob, None]
 
 
 def b_major_arg(kernel):
@@ -226,9 +258,13 @@ class Launcher:
         skip = b_major_arg(self.kernel)
         self._compiled(*[x for i, x in enumerate(kernel_args(self.kernel, problem, *buffers)) if i != skip], cu_stream(stream))
 
-    def __call__(self, problem):
-        """Fresh buffers and one launch; returns (outputs over the experts' rows, workspace)."""
+    def __call__(self, problem, prepare_workspace=None):
+        """Fresh buffers, ``prepare_workspace(workspace)`` (for a signal kernel by default: every M tile ready), one
+        launch; returns (outputs over the experts' rows, workspace)."""
         buffers = self.buffers(problem)
+        prepare_workspace = prepare_workspace or (signal_ready(self.kernel) if self.kernel.test_signal else None)
+        if prepare_workspace is not None:
+            prepare_workspace(buffers[-1])
         self.launch(problem, buffers)
         return outputs(self.kernel, problem, buffers), buffers[-1]
 
@@ -401,3 +437,79 @@ def chunk_consumer(signal, d, words, begins, use_pdl=False):
         _CONSUMERS[key](*args, cu_stream(stream))
 
     return launch, snapshot
+
+
+# ---- The fake input producer: signal[] -> the GEMM ----
+
+
+def signal_view(kernel, workspace):
+    from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import streaming_signal_workspace_offsets
+
+    offsets = streaming_signal_workspace_offsets(kernel)
+    word = offsets["signal"] // 4
+    return workspace.view(torch.int32)[word : word + offsets["streaming_signal_capacity"]]
+
+
+def poison_inputs(problem, late):
+    """NaN in the operands ``late`` names ("a", "sfa" or "both"); returns their final bytes."""
+    final = {name: problem[name].view(torch.uint8).clone() for name in ("a", "sfa")}
+    if late in ("a", "both"):
+        problem["a"].view(torch.uint8).fill_(POISON)
+    if late in ("sfa", "both"):
+        problem["sfa"].fill_(POISON)
+    return final
+
+
+def produce_tiles(problem, final, late, signal, order):
+    """The fake producer, enqueued on the current stream: per M tile in ``order``, write the late operands' rows and SFA
+    bytes (``[t * 256 * Kc, (t + 1) * 256 * Kc)`` of the atoms), then ``signal[t] = t``."""
+    sf_bytes = ROWS_ALIGNMENT * sf_cols(problem["k"])
+    for tile in order:
+        rows = slice(tile * ROWS_ALIGNMENT, (tile + 1) * ROWS_ALIGNMENT)
+        if late in ("a", "both"):
+            problem["a"].view(torch.uint8)[rows].copy_(final["a"][rows])
+        if late in ("sfa", "both"):
+            sf = slice(tile * sf_bytes, (tile + 1) * sf_bytes)
+            problem["sfa"][sf].copy_(final["sfa"][sf])
+        signal[tile].fill_(tile)
+
+
+def producer_case(kind, variant, routing):
+    """The signal GEMM launched last on its stream with every M tile not ready, A and SFA poisoned and, with
+    ``device_layout``, the layout -1; a producer stream writes them tile by tile in order, in reverse and in a seeded
+    random order.  Returns (kernel, the stock scheduler's outputs, {order: outputs})."""
+    from cudnn.gemm.cutedsl.grouped.moe_kernel_helpers import reset_streaming_signal_workspace
+
+    tokens = ROUTINGS[routing]
+    problem = make_problem(kind, tokens, seed=7)
+    expected, _ = Launcher(stock_kernel(kind, len(tokens)), problem)(problem)
+    kernel = make_kernel(kind, len(tokens), **variant_options(kind, problem, variant))
+    capacity, late = problem["rows"] // ROWS_ALIGNMENT, "both"
+    # A few clusters only, so the producer finds free SMs while the GEMM waits.
+    launcher = Launcher(kernel, problem, max_active_clusters=4)
+    launcher(problem)  # loads the module: under lazy loading a first launch waits for running work
+    torch.cuda.synchronize()
+    final_layout = problem["layout"].clone()
+    gemm_stream, producer_stream = torch.cuda.Stream(), torch.cuda.Stream()
+    results = {}
+    for order in ("in_order", "reverse", "random"):
+        buffers = launcher.buffers(problem)
+        final = poison_inputs(problem, late)
+        if kernel.test_device_layout:
+            problem["layout"].fill_(-1)
+        signal = signal_view(kernel, buffers[-1])
+        gemm_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(gemm_stream):
+            reset_streaming_signal_workspace(buffers[-1], kernel)
+        producer_stream.wait_stream(gemm_stream)
+        # Producer work goes before the GEMM's launch, so no host launch waits for the spinning GEMM; the sleep makes the
+        # GEMM wait first.
+        with torch.cuda.stream(producer_stream):
+            torch.cuda._sleep(20_000_000)
+            if kernel.test_device_layout:
+                problem["layout"].copy_(final_layout)
+            produce_tiles(problem, final, late, signal, release_order(order, capacity))
+        launcher.launch(problem, buffers, gemm_stream)
+        torch.cuda.synchronize()
+        results[order] = {name: value.clone() for name, value in outputs(kernel, problem, buffers).items()}
+    return kernel, expected, results

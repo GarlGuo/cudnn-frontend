@@ -13,8 +13,10 @@ memory: the readiness signals.
 Kernels:
 - BF16 on SM100-class GPUs: `MoEGroupedGemmBf16Kernel` (`unfused/`, both directions) and
   `MoEGroupedGemmGluBiasBf16Kernel` (`glu/`, input direction only).
-- MXFP8 / NVFP4 block-scaled, output direction only: `BlockScaledMoEGroupedGemmQuantKernel` in `quant/grouped_gemm_quant.py`
-  (SM100), the FC2 forward. See section 4. The Rubin (SM107) quant kernel takes the same options in a later change.
+- MXFP8 / NVFP4 block-scaled on SM100 (section 4): the GLU kernel `BlockScaledMoEGroupedGemmGluBiasKernel` (`glu/`, FC1
+  forward) in the input direction (section 4a), and the quant kernel `BlockScaledMoEGroupedGemmQuantKernel`
+  (`quant/grouped_gemm_quant.py`, FC2 forward) in the output direction (section 4b). Their Rubin (SM107) twins take the
+  same options in a later change.
 
 Both directions need `use_dynamic_sched=True`. Every option is off by default; with the defaults the generated code is the
 same as without this feature.
@@ -169,11 +171,31 @@ routing.
 - A GEMM with no rows (`padded_offsets[E-1] == 0`) exits before publishing anything. The consumer must not wait on
   `signal[]` when it received no rows.
 
-## 4. Block-scaled kernel (MXFP8, NVFP4)
+## 4. Block-scaled kernels (MXFP8, NVFP4)
 
-The SM100 block-scaled quant kernel (FC2 forward) takes the output direction with the same options as the BF16 plain
-kernel: `streaming_output_notify`, `use_pdl` and `launch_pdl_dependents_at_entry`. Section 3 holds unchanged, with these
-limits. SM107 (the Rubin quant kernel) is not wired yet.
+On SM100 the block-scaled GLU kernel (FC1 forward) takes the input direction (4a) and the block-scaled quant kernel (FC2
+forward) the output direction (4b). The Rubin (SM107) twins are not wired yet.
+
+### 4a. Input direction: GLU kernel (FC1 forward)
+
+The MXFP8 / NVFP4 block-scaled GLU kernel `BlockScaledMoEGroupedGemmGluBiasKernel` (`glu/`, FC1 forward, SM100) takes
+the BF16 GLU kernel's input-direction options: `streaming_signal_capacity`, `device_layout`, `use_pdl` and
+`launch_pdl_dependents_at_all_streaming_signal_slots_ready`. Sections 1 and 2 hold unchanged, and `signal[t]` also covers
+M tile t's scale factors:
+
+| Item | Contract |
+|---|---|
+| SFA | Swizzled SF atoms (the kernel's stock `sfa` layout): 128 rows x 4 scales per 512-byte atom, the K atoms of a 128-row block contiguous, block after block. |
+| M tile t | A rows `[256 t, 256 (t + 1))` and SFA atom rows 2t and 2t + 1: the contiguous bytes `[t * 256 * Kc, (t + 1) * 256 * Kc)`, `Kc = round_up(ceil(K / sf_vec_size), 4)`. |
+| producer | Writes both, padding rows and padding scale columns included, before the release store of `signal[t]` (section 1, memory ordering). |
+| GEMM | The per-tile `fence.proxy.async.global` after the acquire orders the SFA TMA loads as well as A's. |
+| other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`; cluster (2, 1) with the 2-CTA MMA. |
+
+### 4b. Output direction: quant kernel (FC2 forward)
+
+The SM100 block-scaled quant kernel `BlockScaledMoEGroupedGemmQuantKernel` takes the output direction with the same
+options as the BF16 plain kernel: `streaming_output_notify`, `use_pdl` and `launch_pdl_dependents_at_entry`. Section 3
+holds unchanged, with these limits:
 
 | Item | Contract |
 |---|---|
@@ -182,15 +204,13 @@ limits. SM107 (the Rubin quant kernel) is not wired yet.
 | inputs | Unchanged: E4M3 / E2M1 codes with SF atoms, read in full before any chunk is published. |
 | other | Dense weights, `padded_offsets` in global memory (no `use_single_group_runtime_offsets`), no `scheduler_counter`. |
 
-The input direction is not wired for the block-scaled kernels yet.
-
 ## 5. Programmatic dependent launch (PDL) options
 
 | Option | Effect | Use |
 |---|---|---|
 | `use_pdl=True` | The GEMM launches as the programmatic dependent of the kernel before it on the stream, so it can start before that kernel ends; at exit every thread waits for that grid (`griddepcontrol.wait`). With `N_CHUNK` and its own reset, that kernel is the reset, and the wait moves to entry (see §3, Reset). | The GEMM runs beside its producer on one stream. |
-| `launch_pdl_dependents_at_entry=True` (plain kernel) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
-| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernel, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
+| `launch_pdl_dependents_at_entry=True` (plain and block-scaled quant kernels) | The GEMM lets its own dependent launch at entry. | A second GEMM on the same counter or an `N_CHUNK` consumer takes the SMs this grid leaves. |
+| `launch_pdl_dependents_at_all_streaming_signal_slots_ready=True` (GLU kernels, needs `streaming_signal_capacity`) | One extra warp per CTA polls until every `signal[]` entry (M tile) is ready (with `device_layout`, after the layout), then lets the dependent launch. | The dependent lands on the SMs the producer frees as it ends, not the first ones it frees. |
 
 ## 6. Sketches
 
@@ -249,9 +269,10 @@ Pattern from `test/python/gemm/cutedsl/test_grouped_gemm_streaming_signal.py`:
 - `streaming_signal_capacity` and `N_CHUNK` cannot be combined in one kernel; both need `use_dynamic_sched=True`.
 - N must be known at build time (dense B).
 - `device_layout` requires `streaming_signal_capacity`. `launch_pdl_dependents_at_all_streaming_signal_slots_ready`
-  exists on the GLU kernel only and requires `streaming_signal_capacity`.
-- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3), and `N_CHUNK` on the SM100
-  block-scaled quant forward kernel with BF16 D (section 4). Other recipes are not wired up yet.
+  exists on the GLU kernels only and requires `streaming_signal_capacity`.
+- Covered today: the BF16 plain and GLU grouped GEMM forward kernels (sections 1-3); on SM100 the input direction on the
+  block-scaled GLU forward kernel (section 4a) and `N_CHUNK` on the block-scaled quant forward kernel with BF16 D
+  (section 4b). The Rubin (SM107) kernels and other recipes are not wired up yet.
 
 ## Acknowledgements
 

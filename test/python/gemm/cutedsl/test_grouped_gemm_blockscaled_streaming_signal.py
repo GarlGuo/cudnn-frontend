@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Streaming signal options of the SM100 block-scaled grouped GEMM kernels: N_CHUNK output notify on the MXFP8 quant
-kernel (FC2).
+kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1).
 
-The notifier reorders tiles and counts them; it never changes the tile math, so D must be raw-byte equal to the stock
-dynamic scheduler's.  A concurrent consumer copies each N chunk the moment ``signal[u] == u``; a chunk published before
+The options reorder tiles, wait and count; they never change the tile math, so every output must be raw-byte equal to
+the stock dynamic scheduler's.  Input direction: the producer writes A and its scales, then releases ``signal[t] = t``
+for the 256-row M tile t (SFA atom rows 2t and 2t + 1); until then they hold NaN, so a tile read early carries NaN into
+D.  Output direction: a concurrent consumer copies each N chunk the moment ``signal[u] == u``; a chunk published before
 its rows are in global memory carries the NaN prefill into that copy.
 
-Replays, chunk sizes, batch invariance and claim-slot warm stress are in the determinism file.  L0 keeps one case per
-behaviour; the remaining shapes, routings and cluster shapes are L1.
+Replays, producer release orders, batch invariance and claim-slot warm stress are in the determinism file.  L0 keeps
+one case per behaviour; the remaining shapes, routings and cluster shapes are L1.
 """
 
 import pytest
@@ -146,11 +148,93 @@ def test_mxfp8_output_notify_rejects_invalid():
         cute.compile(kernel, *bs.kernel_args(kernel, problem, d_fp8, workspace), 4, bs.cu_stream())
 
 
-@pytest.mark.parametrize("one_cta", bs.levels([(False,), (True,)], [(False,)], bs.cluster_id))
-def test_mxfp8_output_notify_with_no_rows_exits(one_cta):
-    """A GEMM with no rows exits before publishing anything; signal[] keeps its reset value."""
-    problem = bs.make_problem("quant", [0, 0, 0, 0])
-    kernel = bs.notify_kernel(4, 1024, 256, one_cta)
+NO_ROWS_CASES = [("quant", "cluster21"), ("glu", "trigger"), ("quant", "cluster11"), ("glu", "signal")]
+
+
+@pytest.mark.parametrize("kind, variant", bs.levels(NO_ROWS_CASES, NO_ROWS_CASES[:2], lambda kind, variant: f"{bs.KIND_IDS[kind]}-{variant}"))
+def test_with_no_rows_exits(kind, variant):
+    """A GEMM with no rows exits; N_CHUNK publishes nothing (signal[] keeps its reset value)."""
+    problem = bs.make_problem(kind, [0, 0, 0, 0])
+    if kind == "quant":
+        kernel = bs.notify_kernel(4, 1024, 256, variant == "cluster11")
+    else:
+        kernel = bs.make_kernel(kind, 4, **bs.variant_options(kind, problem, variant))
     _, workspace = bs.Launcher(kernel, problem)(problem)
     torch.cuda.synchronize()
-    assert bs.chunk_signal(kernel, workspace).tolist() == [-1] * 4
+    if kind == "quant":
+        assert bs.chunk_signal(kernel, workspace).tolist() == [-1] * 4
+
+
+# ---- The input signal (FC1 GLU) ----
+
+# (kind, variant, routing) beside the replay determinism cases (64 experts, a 5000-row expert): the uneven routing (an
+# empty and a one-row expert).
+MATCH_CASES = [
+    ("glu", "signal", "uneven"),
+    ("glu", "trigger", "uneven"),
+]
+MATCH_L0 = [("glu", "trigger", "uneven")]
+
+
+@pytest.mark.parametrize("kind, variant, routing", bs.levels(MATCH_CASES, MATCH_L0, lambda kind, variant, routing: f"{bs.KIND_IDS[kind]}-{variant}-{routing}"))
+def test_signal_matches_dynamic(kind, variant, routing):
+    """Every M tile ready at launch: the outputs equal the stock dynamic scheduler's bytes."""
+    tokens = bs.ROUTINGS[routing]
+    problem = bs.make_problem(kind, tokens, seed=len(routing))
+    expected, _ = bs.Launcher(bs.stock_kernel(kind, len(tokens)), problem)(problem)
+    kernel = bs.make_kernel(kind, len(tokens), **bs.variant_options(kind, problem, variant))
+    got, _ = bs.Launcher(kernel, problem)(problem)
+    torch.cuda.synchronize()
+    bs.assert_same_bytes(got, expected, f"{kind} {variant}")
+    assert not torch.isnan(got["d"].float()).any()
+
+
+POISON_CASES = [
+    ("glu", "a", False),
+    ("glu", "sfa", False),
+]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind, late, compact", POISON_CASES, ids=[f"{bs.KIND_IDS[k]}-late_{late}{'-compact' * c}" for k, late, c in POISON_CASES])
+def test_poison_reaches_d(kind, late, compact):
+    """The detector works: with A codes or SFA atoms poisoned, the stock scheduler's D holds NaN, so the producer tests
+    see an early read of either."""
+    tokens = bs.ROUTINGS["uneven"]
+    problem = bs.make_problem(kind, tokens, seed=1)
+    bs.poison_inputs(problem, late)
+    out, _ = bs.Launcher(bs.make_kernel(kind, len(tokens), use_dynamic_sched=True), problem)(problem)
+    torch.cuda.synchronize()
+    assert torch.isnan(out["d"].float()).any(), f"poisoned {late} left D finite"
+
+
+@pytest.mark.L1
+@pytest.mark.parametrize("kind", ["glu"], ids=bs.KIND_IDS.get)
+def test_signal_waits_for_producer_big_expert(kind):
+    """The determinism file's producer cases on an expert of several batches (5000 rows): every release order gives the
+    stock bytes."""
+    _, expected, results = bs.producer_case(kind, "signal", "big_expert")
+    for order, got in results.items():
+        bs.assert_same_bytes(got, expected, f"{order} release")
+
+
+def rejected(kind):
+    """(options, exception, message) of the rejected input-signal constructions of ``kind``."""
+    from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
+
+    signal = dict(use_dynamic_sched=True, streaming_signal_capacity=4)
+    cases = [
+        (dict(streaming_signal_capacity=4), ValueError, "use_dynamic_sched"),
+        (dict(signal, weight_mode=MoEWeightMode.DISCRETE), ValueError, "dense weights"),
+        (dict(signal, cluster_shape_mn=(4, 1)), ValueError, "cluster"),
+    ]
+    slots_ready = "launch_pdl_dependents_at_all_streaming_signal_slots_ready"
+    return cases + [(dict(use_dynamic_sched=True, **{name: True}), ValueError, name) for name in ("device_layout", slots_ready)]
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("kind", ["glu"], ids=bs.KIND_IDS.get)
+def test_input_signal_rejects_invalid(kind):
+    for options, error, message in rejected(kind):
+        with pytest.raises(error, match=message):
+            bs.make_kernel(kind, 4, **options)
