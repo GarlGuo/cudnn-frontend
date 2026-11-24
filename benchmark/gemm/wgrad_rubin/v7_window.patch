@@ -1,0 +1,168 @@
+diff --git a/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_blockscaled_grouped_gemm_wgrad.py b/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_blockscaled_grouped_gemm_wgrad.py
+index 975e5a53..b2b71ad2 100644
+--- a/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_blockscaled_grouped_gemm_wgrad.py
++++ b/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_blockscaled_grouped_gemm_wgrad.py
+@@ -1061,8 +1061,12 @@ class BlockScaledMoEGroupedGemmWgradKernel:
+                 signal_ptr = streaming_signal_ptr(self._get_sched_counter_ptr(workspace_ptr))
+                 # Token rows from offs[E - 1] on are never signalled: no K block waits on them.
+                 signal_valid_rows = offs[self.expert_cnt - 1]
++                signal_tiles = (signal_valid_rows + cutlass.Int32(STREAMING_SIGNAL_TOKEN_TILE - 1)) // cutlass.Int32(STREAMING_SIGNAL_TOKEN_TILE)
+                 # The expert of this thread's previous work tile: its K loop acquired every token tile of that expert.
+                 signal_last_expert = cutlass.Int32(-1)
++                # Token tiles this thread acquired: bit i of signal_window_ready is tile signal_window_first + i.
++                signal_window_first = cutlass.Int32(0)
++                signal_window_ready = cutlass.Int32(0)
+ 
+             sched_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_sched_stages)
+ 
+@@ -1223,8 +1227,16 @@ class BlockScaledMoEGroupedGemmWgradKernel:
+                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                     if cutlass.const_expr(self.streaming_signal_capacity is not None):
+                         if k_tile == signal_next_k_tile:
+-                            signal_ready_through, signal_next_k_tile = wait_k_block_token_tiles(
+-                                signal_ptr, signal_ready_through, ext.token_offset, k_tile, signal_valid_rows, self.cta_tile_shape_mnk[2]
++                            signal_ready_through, signal_next_k_tile, signal_window_first, signal_window_ready = wait_k_block_token_tiles(
++                                signal_ptr,
++                                signal_ready_through,
++                                ext.token_offset,
++                                k_tile,
++                                signal_valid_rows,
++                                signal_tiles,
++                                signal_window_first,
++                                signal_window_ready,
++                                self.cta_tile_shape_mnk[2],
+                             )
+                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
+                     peek_ab_empty_status = cutlass.Boolean(1)
+diff --git a/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_grouped_gemm_wgrad.py b/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_grouped_gemm_wgrad.py
+index 771b4daf..35286e8a 100644
+--- a/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_grouped_gemm_wgrad.py
++++ b/python/cudnn/gemm/cutedsl/grouped/wgrad/moe_grouped_gemm_wgrad.py
+@@ -877,8 +877,12 @@ class MoEGroupedGemmWgradBF16Kernel:
+                 signal_ptr = streaming_signal_ptr(self._get_sched_counter_ptr(workspace_ptr))
+                 # Token rows from offs[E - 1] on are never signalled: no K block waits on them.
+                 signal_valid_rows = offs[self.expert_cnt - 1]
++                signal_tiles = (signal_valid_rows + cutlass.Int32(STREAMING_SIGNAL_TOKEN_TILE - 1)) // cutlass.Int32(STREAMING_SIGNAL_TOKEN_TILE)
+                 # The expert of this thread's previous work tile: its K loop acquired every token tile of that expert.
+                 signal_last_expert = cutlass.Int32(-1)
++                # Token tiles this thread acquired: bit i of signal_window_ready is tile signal_window_first + i.
++                signal_window_first = cutlass.Int32(0)
++                signal_window_ready = cutlass.Int32(0)
+ 
+             sched_consumer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, self.num_sched_stages)
+ 
+@@ -962,8 +966,16 @@ class MoEGroupedGemmWgradBF16Kernel:
+                 for k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+                     if cutlass.const_expr(self.streaming_signal_capacity is not None):
+                         if k_tile == signal_next_k_tile:
+-                            signal_ready_through, signal_next_k_tile = wait_k_block_token_tiles(
+-                                signal_ptr, signal_ready_through, ext.token_offset, k_tile, signal_valid_rows, self.cta_tile_shape_mnk[2]
++                            signal_ready_through, signal_next_k_tile, signal_window_first, signal_window_ready = wait_k_block_token_tiles(
++                                signal_ptr,
++                                signal_ready_through,
++                                ext.token_offset,
++                                k_tile,
++                                signal_valid_rows,
++                                signal_tiles,
++                                signal_window_first,
++                                signal_window_ready,
++                                self.cta_tile_shape_mnk[2],
+                             )
+                     handle = ab_producer.acquire_and_advance(peek_ab_empty_status)
+                     peek_ab_empty_status = cutlass.Boolean(1)
+diff --git a/python/cudnn/gemm/cutedsl/grouped/wgrad/streaming_signal.py b/python/cudnn/gemm/cutedsl/grouped/wgrad/streaming_signal.py
+index 76b8e729..c0f43d15 100644
+--- a/python/cudnn/gemm/cutedsl/grouped/wgrad/streaming_signal.py
++++ b/python/cudnn/gemm/cutedsl/grouped/wgrad/streaming_signal.py
+@@ -39,6 +39,9 @@ STREAMING_SIGNAL_TOKEN_TILE = 256
+ #: Bytes from the claim counter to ``signal[]``, as in the forward contract.
+ STREAMING_SIGNAL_OFFSET = 4
+ 
++#: ``signal[]`` entries one window load reads (one bit each of an Int32).
++STREAMING_SIGNAL_WINDOW = 32
++
+ 
+ def check_streaming_signal_options(streaming_signal_capacity, atomic_counter_claim: bool) -> None:
+     """Build-time checks of the kernel option; ``None`` is off."""
+@@ -86,31 +89,65 @@ def fence_acquire_gpu(*, loc=None, ip=None) -> None:
+ 
+ 
+ @cute.jit
+-def wait_k_block_token_tiles(signal_ptr, ready_through: Int32, token_offset: Int32, k_block: Int32, valid_rows: Int32, block_k: cutlass.Constexpr):
++def _load_ready_window(signal_ptr, first_tile: Int32, signal_tiles: Int32) -> Int32:
++    """Bit ``i``: ``signal[first_tile + i]`` read ready.  Relaxed gpu-scope loads, all issued before any is used: one
++    L2 round trip.  Tiles at or past ``signal_tiles`` read the last valid tile instead (never queried)."""
++    ready = Int32(0)
++    for i in cutlass.range_constexpr(STREAMING_SIGNAL_WINDOW):
++        value = cute.arch.load((signal_ptr + cutlass.min(first_tile + i, signal_tiles - 1)).llvm_ptr, Int32, sem="relaxed", scope="gpu")
++        # ~value >> 31 (arithmetic) is all ones for a ready value (>= 0) and zero for -1.
++        ready = ready | ((~value >> 31) & Int32(-(2**31) if i == 31 else 1 << i))
++    return ready
++
++
++@cute.jit
++def wait_k_block_token_tiles(
++    signal_ptr,
++    ready_through: Int32,
++    token_offset: Int32,
++    k_block: Int32,
++    valid_rows: Int32,
++    signal_tiles: Int32,
++    window_first: Int32,
++    window_ready: Int32,
++    block_k: cutlass.Constexpr,
++):
+     """Wait, without bound, for the token tiles K block ``k_block`` of the expert at ``token_offset`` reads past
+-    ``ready_through``; return the new ``ready_through`` and the first K block that reads past it (INT32_MAX if no valid
+-    row does).
+-
+-    The block reads token rows up to ``min(token_offset + (k_block + 1) * block_k, valid_rows) - 1``. The caller calls
+-    this only for a block that reads past ``ready_through``.  Relaxed gpu-scope polls (no L1 invalidation per poll); once
+-    every tile reads ready, ``fence.acquire.gpu`` makes each poll that saw a tile ready an acquire of the producer's
+-    release, and ``fence.proxy.async.global`` orders the producer's generic-proxy stores before this thread's later TMA
+-    loads."""
++    ``ready_through``.  Return the new ``ready_through``, the first K block that reads past it (INT32_MAX if no valid
++    row does) and the new window.
++
++    The block reads token rows up to ``min(token_offset + (k_block + 1) * block_k, valid_rows) - 1``; the caller calls
++    this only for a block that reads past ``ready_through``.  The window (``window_ready`` bit ``i`` = tile
++    ``window_first + i`` acquired by this thread) lives across work tiles: a tile it holds costs no load.  Otherwise the
++    window moves to that tile: every lane loads the next ``STREAMING_SIGNAL_WINDOW`` entries itself (relaxed gpu scope,
++    one round trip), then spins on that tile alone until it is ready.  After any load, ``fence.acquire.gpu`` makes each
++    load that saw a tile ready an acquire of the producer's release (an acquire pattern in the loading thread), and
++    ``fence.proxy.async.global`` orders the producer's generic-proxy stores before this thread's later TMA loads."""
+     needed = (cutlass.min(token_offset + (k_block + 1) * block_k, valid_rows) - 1) // STREAMING_SIGNAL_TOKEN_TILE
++    loaded = Int32(0)
+     while ready_through < needed:
+         ready_through = ready_through + 1
+-        # One load point in the loop: a load ahead of it would make the compiler duplicate the loop.
+-        value = Int32(-1)
+-        while value < Int32(0):
+-            value = cute.arch.load((signal_ptr + ready_through).llvm_ptr, Int32, sem="relaxed", scope="gpu")
+-    fence_acquire_gpu()
+-    cute.arch.fence_proxy("async.global")
++        window_bit = ready_through - window_first
++        known = Int32(0)
++        if window_bit >= Int32(0):
++            if window_bit < Int32(STREAMING_SIGNAL_WINDOW):
++                known = (window_ready >> window_bit) & 1
++        if known == Int32(0):
++            window_first = ready_through
++            window_ready = _load_ready_window(signal_ptr, ready_through, signal_tiles)
++            while (window_ready & 1) == Int32(0):
++                value = cute.arch.load((signal_ptr + ready_through).llvm_ptr, Int32, sem="relaxed", scope="gpu")
++                window_ready = window_ready | ((~value >> 31) & 1)
++            loaded = Int32(1)
++    if loaded != Int32(0):
++        fence_acquire_gpu()
++        cute.arch.fence_proxy("async.global")
+     next_k_block = Int32(2**31 - 1)
+     ready_end = (ready_through + 1) * STREAMING_SIGNAL_TOKEN_TILE
+     if ready_end < valid_rows:
+         # ready_end > token_offset: the first block whose rows reach past ready_end.
+         next_k_block = (ready_end - token_offset) // block_k
+-    return ready_through, next_k_block
++    return ready_through, next_k_block, window_first, window_ready
+ 
+ 
+ # ---- Host side: the workspace byte map and its reset ----
