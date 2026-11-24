@@ -283,6 +283,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         compact_sfa_sf_warp: bool = False,
         streaming_signal_multi_batch_opening: bool = False,
         streaming_signal_acquire_once: bool = False,
+        tight_sf_tmem_cols: bool = False,
+        sfd_col_lane_scales: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -421,6 +423,12 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         self.act_func = act_func
         self.situ_beta1 = float(situ_beta1)
 
+        # tight_sf_tmem_cols (opt-in): SF TMEM columns = the SF TMEM layouts' footprints.
+        self.tight_sf_tmem_cols = tight_sf_tmem_cols
+        # sfd_col_lane_scales (opt-in): the column SFD's 32 warp maxima go through a per-warp smem scratch; lane l computes
+        # only column l's scale (one E8M0 round trip and reciprocal, not 32), and the scales come back through the scratch.
+        self.sfd_col_lane_scales = sfd_col_lane_scales
+
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
 
@@ -555,6 +563,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             self.occupancy,
             self.store_d_directly,
             self.generate_dbias,
+            # sfd_col_lane_scales' 64 FP32 per epilogue warp.
+            4 * 64 * self.num_epilog_warps if self.sfd_col_lane_scales else 0,
         )
 
         # Compute A/B/D/Scale shared memory layout
@@ -623,7 +633,24 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (self.cta_tile_shape_mnk[0] // sf_atom_mn) * mma_inst_tile_k
         self.num_sfb_tmem_cols = (self.cta_tile_shape_mnk_sfb[1] // sf_atom_mn) * mma_inst_tile_k
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            # The footprints of the SF TMEM layouts the MMA warp builds (what tcgen05.cp writes, every SF address an MMA
+            # of the K tile reads), not mma_inst_tile_k columns per 32 rows: MXFP8 at 256 x 256 takes 4 + 8 columns, 16
+            # with the granule, instead of 48.  The overlapping accumulator then overlaps the SF region by 16 columns
+            # and releases after the first epilogue subtile.
+            sfa_tmem_layout = blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfa_smem_layout_staged, (None, None, None, 0))
+            )
+            sfb_tmem_layout = blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma, self.mma_tiler, self.sf_vec_size, cute.slice_(self.sfb_smem_layout_staged, (None, None, None, 0))
+            )
+            self.num_sfa_tmem_cols = utils.compute_tmem_cols_from_layout(sfa_tmem_layout, self.sf_dtype)
+            self.num_sfb_tmem_cols = utils.compute_tmem_cols_from_layout(sfb_tmem_layout, self.sf_dtype)
+            # tcgen05.cp writes 4-column groups: SFB starts on one.
+            assert self.num_sfa_tmem_cols % 4 == 0, f"SFA's {self.num_sfa_tmem_cols} TMEM columns misalign SFB's tcgen05.cp"
         self.num_sf_tmem_cols = self.num_sfa_tmem_cols + self.num_sfb_tmem_cols
+        if cutlass.const_expr(self.tight_sf_tmem_cols):
+            self.num_sf_tmem_cols = -(-self.num_sf_tmem_cols // 16) * 16
         self.num_accumulator_tmem_cols = (
             self.cta_tile_shape_mnk[1] * self.num_acc_stage if not self.overlapping_accum else self.cta_tile_shape_mnk[1] * 2 - self.num_sf_tmem_cols
         )
@@ -1113,6 +1140,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                 ],
                 128 if self.generate_dbias else 4,
             ]
+            # sfd_col_lane_scales: per epilogue warp, 32 column maxima then 32 column scales
+            sColScratch: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, 64 * self.num_epilog_warps if self.sfd_col_lane_scales else 0],
+                16,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -1466,6 +1498,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         norm_const,
         rcp_limit,
         tRSrD,
+        scratch=None,
     ):
         # Get absolute max across a vector and Compute SFD
         tCompute = cute.make_rmem_tensor(src.shape, self.acc_dtype)
@@ -1479,7 +1512,34 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         fp32_max = cutlass.Float32(3.40282346638528859812e38)
         tidx, _, _ = cute.arch.thread_idx()
 
-        for vi in cutlass.range_constexpr(0, acc_frg.shape[0], 4):
+        if cutlass.const_expr(self.sfd_col_lane_scales):
+            # Same values as the loop below (NaN-propagating max, rn products, E8M0 round trip, rcp, fmin): one warp
+            # redux per column, then lane l's column scale only, shared through the warp's scratch.
+            lane = cute.arch.lane_idx()
+            col_max = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
+            for vi in cutlass.range_constexpr(self.sf_vec_size):
+                col_max[vi] = cutlass.Float32(cute.arch.warp_redux_sync(value=acc_frg[vi, 0], kind="fmax", mask_and_clamp=0xFFFFFFFF, nan=True))
+            scratch_max = cute.make_tensor(scratch.iterator, cute.make_layout(self.sf_vec_size))
+            scratch_scale = cute.make_tensor(scratch.iterator + self.sf_vec_size, cute.make_layout(self.sf_vec_size))
+            cute.arch.sync_warp()
+            cute.autovec_copy(col_max, scratch_max)
+            cute.arch.sync_warp()
+            scale = rcp_limit * norm_const
+            max_value, _ = cute.arch.mul_packed_f32x2((scratch_max[lane], scratch_max[lane]), (scale, scale), rnd="rn", ftz=False)
+            pvscale[None, None, tile_idx][0] = max_value
+            max_value_rcp = cute.arch.rcp_approx(self.cvt_f32_to_f8_to_f32(max_value, self.sf_dtype))
+            max_value_rcp = fmin(max_value_rcp, fp32_max, nan=True)
+            acc_scale_col, _ = cute.arch.mul_packed_f32x2((norm_const, norm_const), (max_value_rcp, max_value_rcp), rnd="rn", ftz=False)
+            scratch_scale[lane] = acc_scale_col
+            cute.arch.sync_warp()
+            col_scale = cute.make_rmem_tensor(cute.make_layout(self.sf_vec_size), cutlass.Float32)
+            cute.autovec_copy(scratch_scale, col_scale)
+            for vi in cutlass.range_constexpr(0, self.sf_vec_size, 2):
+                tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1] = cute.arch.mul_packed_f32x2(
+                    (tTR_rAcc_frg[vi], tTR_rAcc_frg[vi + 1]), (col_scale[vi], col_scale[vi + 1]), rnd="rn", ftz=False
+                )
+
+        for vi in cutlass.range_constexpr(0, 0 if self.sfd_col_lane_scales else acc_frg.shape[0], 4):
             max_value0 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi, 0]))
             max_value1 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 1, 0]))
             max_value2 = cutlass.Float32(warp_amax_with_nan(acc_frg[vi + 2, 0]))
@@ -2993,6 +3053,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
 
                 norm_const = cutlass.Float32(norm_const_tensor[0])
                 d_rcp_limits = get_dtype_rcp_limits(self.d_dtype)
+                column_scratch = None
+                if cutlass.const_expr(self.sfd_col_lane_scales):
+                    sColScratch = storage.sColScratch.get_tensor(cute.make_layout((64, self.num_epilog_warps), stride=(1, 64)))
+                    column_scratch = sColScratch[(None, warp_idx % self.num_epilog_warps)]
 
             # Extension for per-expert domain conversion in epilogue
             epi_ext = self._make_extension(workspace_ptr)
@@ -3362,6 +3426,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                             norm_const,
                             d_rcp_limits,
                             tRS_rD1_col,
+                            column_scratch,
                         )
                         self.quant_sfd_row(
                             (real_subtile_idx * 2 + 1) % 4,
@@ -3380,6 +3445,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                             norm_const,
                             d_rcp_limits,
                             tRS_rD2_col,
+                            column_scratch,
                         )
 
                         if subtile_idx % 2 == 1:
@@ -3879,6 +3945,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         occupancy: int,
         store_d_directly: bool,
         generate_dbias: bool = False,
+        epi_scratch_bytes: int = 0,
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/D operands based on heuristics.
 
@@ -3983,7 +4050,7 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # dBias transpose buffer: (128, 64) column-major FP32 = 32 KB
         dbias_bytes = 128 * 64 * cute.size_in_bytes(cutlass.Float32, cute.make_layout((1,))) if generate_dbias else 0
         # Epilogue bytes
-        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes
+        epi_bytes = c_bytes + d_bytes + amax_bytes + dbias_bytes + epi_scratch_bytes
 
         # Calculate A/B stages:
         # Start with total smem per CTA (capacity / occupancy)
