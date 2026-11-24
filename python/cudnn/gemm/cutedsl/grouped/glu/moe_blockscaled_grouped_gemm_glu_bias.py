@@ -259,6 +259,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         atoms; a dedicated SF warp builds the atoms (MXFP8, ``K % 512 == 0``, cluster (2, 1); contract section 4a).
     :param generate_sfd_col: With ``sfd_row`` and ``norm_const``: also write the column-quantized ``d_col`` and its
         ``sfd_col``. False writes only the row-quantized D and SFD (``d_col`` and ``sfd_col`` may then be None).
+    :param single_c_stage: With ``generate_sfd``: one C (pre-activation) smem stage instead of two, so the A/B pipeline
+        gets the smem (one more stage at 256x256 MXFP8). Opt-in.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -329,6 +331,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         generate_sfd_col: bool = True,
         streaming_signal_multi_batch_opening: bool = False,
         streaming_signal_acquire_once: bool = False,
+        single_c_stage: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -470,6 +473,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         self.generate_sfd = generate_sfd
         # __call__ narrows it to generate_sfd (an SFD is written at all) and this request.
         self.generate_sfd_col = generate_sfd_col
+        # single_c_stage (opt-in): one C stage instead of two with generate_sfd; the smem goes to the A/B pipeline.
+        self.single_c_stage = single_c_stage
         self.discrete_col_sfd = discrete_col_sfd
         self.weight_mode = weight_mode
         self.use_dynamic_sched = use_dynamic_sched
@@ -617,6 +622,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
             self.generate_sfd,
             bias_dtype=self.bias_dtype if self.enable_bias else None,
             generate_sfd_col=self.generate_sfd_col,
+            num_c_stage=1 if self.single_c_stage else None,
         )
 
         # Reserve local SFB-completion and paired-ready barriers for at most 16 stages.

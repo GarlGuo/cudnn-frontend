@@ -7,6 +7,7 @@ writes byte-equal to the default kernel's, on the stock dynamic scheduler and on
 the streaming signal suite (BF16 D) does not cover.
 
 - generate_sfd_col=False (GLU): the row-quantized D and row SFD only; the column pair is not written.
+- single_c_stage=True (GLU): one C stage (the smem goes to one more A/B stage).
 """
 
 import pytest
@@ -126,3 +127,12 @@ def test_glu_generate_sfd_col_off_matches_row_outputs(variant, routing, require_
     assert not torch.isnan(want["c"].float()).any()
     got = run_sfd("glu", problem, col=False, generate_sfd_col=False, **options)
     assert_equal_bytes(got, want, f"generate_sfd_col=False {variant} {routing}")
+
+
+@pytest.mark.parametrize("variant, routing", bs.levels(CASES, L0, lambda variant, routing: f"{variant}-{routing}"))
+def test_glu_single_c_stage_matches(variant, routing, require_sm100):
+    problem = bs.make_problem("glu", bs.ROUTINGS[routing], seed=4)
+    options = options_of("glu", problem, variant)
+    want = run_sfd("glu", problem, **options)
+    got = run_sfd("glu", problem, single_c_stage=True, **options)
+    assert_equal_bytes(got, want, f"single_c_stage {variant} {routing}")
