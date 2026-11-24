@@ -1,251 +1,183 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Time the SM90 (Hopper) BF16 grouped GEMMs against torch._grouped_mm.
+"""Compare the cooperative and pingpong warp-group schedules in the SM90 grouped GEMM kernels.
 
-One row is (model, op, arm) at one EP rank's sizes: --tokens per GPU times top_k
-routed rows, spread evenly over the rank's experts, each expert padded to 256 rows.
-This is a synthetic balanced-routing benchmark. Ops: fc1_fwd (N=2I, K=H), fc2_fwd
-(N=H, K=I), fc1_dgrad (N=H, K=2I) and fc2_dgrad (N=I, K=H); dgrad reads the forward
-weights N-major (b_major="n"). TFLOPs count the padded rows.
+DeepSeek-V3 default: H=7168, F=2048, 256 experts, top-8, one 4096-token
+microbatch on each of 8 EP ranks, TP=1. Uniform routing gives 32 local
+experts with M=1024 each. This is a synthetic balanced-routing benchmark.
 
-GLU and dGLU: fc1_glu is fc1_fwd with the SwiGLU fused (GroupedGemmGluSm90; D is
-N/2 wide) and fc2_dglu is fc2_dgrad with the dSwiGLU fused (GroupedGemmDgluSm90,
-reading the saved 2N-wide C and accumulating dprob, whose reset its timing
-includes). Their torch arm is torch._grouped_mm plus the activation in eager torch,
-and their TFLOPs count the GEMM only. fc2_dglu has one schedule, so it takes only
-the "default" and "torch" arms.
+python benchmark/gemm/benchmark_grouped_gemm_sm90.py --direction all
 
-python benchmark/gemm/benchmark_grouped_gemm_sm90.py --model deepseek_v3 --ep 8 --arms default cooperative pingpong torch
-
-Arms: "default" is the library's own schedule (its shape rule); "cooperative" and
-"pingpong" force one through the test hook moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE
-(pingpong runs only its 128x192 tile on a (2, 1) cluster); "torch" is
-torch._grouped_mm, which allocates its output per call. Each cudnn arm is built
-through its class API (fwd and dgrad: GroupedGemmSm90) with check_support and
-compile, and times the compiled plan's execute with fixed outputs and a
-preallocated workspace, so no wrapper allocation or dispatch. Input generation and
-JIT are outside timing; graph timing is device time for an actual captured bundle,
-while eager timing includes host dispatch and synchronization. Routing and token
-permutation are excluded; padding rows are zero, with a zero prob. Every cudnn
-arm's output is checked against the torch arm outside timing, and its hash is a
-cross-process control.
+Both schedules share identical BF16 operands. The schedule is forced through
+the test hook moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE; pingpong runs its only
+configuration, a 128x192 tile on a (2, 1) cluster, and cooperative a 128x256
+tile on the same cluster. Input generation and JIT are outside timing. Class
+execution uses fixed output buffers and a preallocated workspace; graph timing
+is device time for an actual captured bundle, while eager timing includes host
+dispatch and synchronization. Routing and FC2 forward are excluded.
+Forward measures the FC1 GEMM without GLU (N=2F, K=H).
+Glu measures FC1 forward + SwiGLU, writing C (interleaved_32).
+Dglu measures FC2 dgrad + dSwiGLU + dprob, including its buffer reset, without
+dbias; its kernel has one (cooperative) schedule and ignores the override.
+Dgrad measures the FC2 dgrad (N=F, K=H), reading the forward weights N-major.
+Schedule checks are exact.
 """
 
 import argparse
-import contextlib
-import functools
 import hashlib
 import importlib.metadata
+import inspect
 import json
+import math
 import statistics
 import time
 from pathlib import Path
 
 import torch
 import cudnn
-from cudnn.tensor_adapter import has_wgmma
+from cudnn.gemm.cutedsl.grouped.unfused import moe_grouped_gemm_sm90
 
-#: hidden H, global experts, top_k and expert intermediate I (FC1 N = 2I, gate + up), from the HF config.json.
-MODEL_SHAPES = {
-    "deepseek_v3": dict(hidden=7168, experts=256, top_k=8, intermediate=2048),
-    "qwen35_122b": dict(hidden=3072, experts=256, top_k=8, intermediate=1024),
-    "qwen35_397b": dict(hidden=4096, experts=512, top_k=10, intermediate=1024),
-    "qwen38_2p4t": dict(hidden=8192, experts=512, top_k=10, intermediate=2048),
-    "glm53_flash": dict(hidden=4096, experts=288, top_k=8, intermediate=2048),
-}
-OPS = ("fc1_fwd", "fc2_fwd", "fc1_dgrad", "fc2_dgrad", "fc1_glu", "fc2_dglu")
-ARMS = ("default", "cooperative", "pingpong", "torch")
+SCHEDULES = ("cooperative", "pingpong")
+#: direction -> its public wrapper, its class API and the schedules its kernel runs.
+DIRECTIONS = dict(
+    forward=("grouped_gemm_wrapper_sm90", "GroupedGemmSm90", SCHEDULES),
+    glu=("grouped_gemm_glu_wrapper_sm90", "GroupedGemmGluSm90", SCHEDULES),
+    dglu=("grouped_gemm_dglu_wrapper_sm90", "GroupedGemmDgluSm90", ("cooperative",)),
+    dgrad=("grouped_gemm_wrapper_sm90", "GroupedGemmSm90", SCHEDULES),
+)
 
 
-def problem(args, model, op):
-    shape = MODEL_SHAPES[model]
-    hidden, inter = shape["hidden"], shape["intermediate"]
-    n, k = dict(
-        fc1_fwd=(2 * inter, hidden),
-        fc2_fwd=(hidden, inter),
-        fc1_dgrad=(hidden, 2 * inter),
-        fc2_dgrad=(inter, hidden),
-        fc1_glu=(2 * inter, hidden),
-        fc2_dglu=(inter, hidden),
-    )[op]
-    groups = shape["experts"] // args.ep
-    valid_m = -(-args.tokens * shape["top_k"] // groups)
-    m = -(-valid_m // 256) * 256
-    b_major = "n" if op in ("fc1_dgrad", "fc2_dgrad", "fc2_dglu") else "k"
+def problem(args, direction, schedule):
     torch.manual_seed(args.seed)
-    tensors = dict(
-        a=torch.randn(groups * m, k, device="cuda", dtype=torch.bfloat16) * 0.125,
-        # (E, N, K) K-major for fwd; dgrad reads the forward weights (E, K, N) N-major.
-        b=torch.randn((groups, n, k) if b_major == "k" else (groups, k, n), device="cuda", dtype=torch.bfloat16) * 0.125,
+    groups = 256 // args.ep
+    valid_m = math.ceil(args.context * args.microbatch * args.ep * 8 / 256)
+    m = math.ceil(valid_m / 256) * 256
+    h, f = 7168, 2048
+    n, k = (2 * f, h) if direction in ("forward", "glu") else (f, h)
+    rows = groups * m
+    # Pingpong runs only its 128x192 tile on a (2, 1) cluster.
+    tile_n = 192 if schedule == "pingpong" else 256
+    a = torch.randn(rows, k, device="cuda", dtype=torch.bfloat16) * 0.125
+    kwargs = dict(
+        a_tensor=a,
         padded_offsets=torch.arange(1, groups + 1, device="cuda", dtype=torch.int32) * m,
-        alpha=torch.ones(groups, device="cuda"),
-        prob=torch.ones(groups * m, device="cuda"),
-        c=torch.empty(groups * m, n, device="cuda", dtype=torch.bfloat16),  # unused without generate_c
+        alpha_tensor=torch.ones(groups, device="cuda"),
+        prob_tensor=torch.ones(rows, device="cuda"),
+        mma_tiler_mn=(128, tile_n),
+        cluster_shape_mn=(2, 1),
+        use_dynamic_sched=True,
     )
-    if op == "fc2_dglu":
-        # The forward's saved pre-activation C (gate | up, 2N wide) and the accumulated dprob.
-        tensors.update(c=torch.randn(groups * m, 2 * n, device="cuda", dtype=torch.bfloat16), dprob=torch.zeros(groups * m, device="cuda"))
-    metadata = dict(model=model, op=op, b_major=b_major, groups=groups, M=m, valid_M=valid_m, N=n, K=k, total_rows=groups * m)
     if valid_m != m:
         for expert in range(groups):
-            tensors["a"][expert * m + valid_m : (expert + 1) * m].zero_()
-            tensors["prob"][expert * m + valid_m : (expert + 1) * m].zero_()
-    return tensors, metadata
-
-
-def grouped_mm(t, b_major):
-    b_kn = t["b"].transpose(1, 2) if b_major == "k" else t["b"]  # torch._grouped_mm takes (G, K, N)
-    return functools.partial(torch._grouped_mm, t["a"], b_kn, offs=t["padded_offsets"], out_dtype=torch.bfloat16)
-
-
-BLOCK = 32  # interleaved_32 gate/up column blocks
-
-
-def split_gate_up(x):
-    m, two_n = x.shape
-    blocks = x.view(m, two_n // (2 * BLOCK), 2, BLOCK)
-    return blocks[:, :, 0].reshape(m, -1), blocks[:, :, 1].reshape(m, -1)
-
-
-def torch_swiglu(acc, prob):
-    gate, up = split_gate_up(acc.float())
-    return (up * torch.nn.functional.silu(gate) * prob[:, None]).to(torch.bfloat16)
-
-
-def torch_dswiglu(g, c, prob):
-    """D (dgate | dup, interleaved) of SwiGLU from g = dY @ W^T and the saved C; alpha = beta = 1."""
-    g = g.float()
-    x1, x2 = (half.float() for half in split_gate_up(c))
-    s = torch.sigmoid(x1)
-    d1 = g * prob[:, None] * x2 * s * (1 + x1 * (1 - s))
-    d2 = g * prob[:, None] * x1 * s
-    m, n = d1.shape
-    return torch.stack((d1.view(m, n // BLOCK, BLOCK), d2.view(m, n // BLOCK, BLOCK)), dim=2).reshape(m, 2 * n).to(torch.bfloat16)
-
-
-def torch_arm(t, op, b_major):
-    """The torch arm and the check reference: torch._grouped_mm, plus the activation in eager torch for fc1_glu / fc2_dglu."""
-    mm = grouped_mm(t, b_major)
-    if op == "fc1_glu":
-        return lambda: torch_swiglu(mm(), t["prob"])
-    if op == "fc2_dglu":
-        return lambda: torch_dswiglu(mm(), t["c"], t["prob"])
-    return mm
-
-
-def prepare_glu(t, op, b_major, arm):
-    """fc1_glu / fc2_dglu through the GLU / dGLU class API; the timed call is the backend plan's execute."""
-    m, n = t["a"].shape[0], t["b"].shape[1] if b_major == "k" else t["b"].shape[2]
-    if op == "fc1_glu":
-        d = torch.empty(m, n // 2, device="cuda", dtype=torch.bfloat16)
-        common = dict(sample_c=t["c"], sample_d=d, sample_sfa=None, sample_d_col=None, act_func="swiglu")
-        operands = dict(c_tensor=t["c"], d_tensor=d)
-        cls = cudnn.GroupedGemmGluSm90
-    else:
-        d = torch.empty(m, 2 * n, device="cuda", dtype=torch.bfloat16)
-        common = dict(sample_c=t["c"], sample_d_row=d, sample_d_col=None, sample_sfa=None, sample_beta=t["alpha"], sample_dprob=t["dprob"])
-        common.update(act_func="dswiglu")
-        operands = dict(c_tensor=t["c"], d_row_tensor=d, beta_tensor=t["alpha"], dprob_tensor=t["dprob"])
-        cls = cudnn.GroupedGemmDgluSm90
-    with forced_schedule(None if arm == "default" else arm):
-        api = cls(
-            sample_a=t["a"],
-            sample_padded_offsets=t["padded_offsets"],
-            sample_alpha=t["alpha"],
-            sample_b=t["b"],
-            sample_prob=t["prob"],
-            b_major=b_major,
-            use_dynamic_sched=True,
-            **common,
+            a[expert * m + valid_m : (expert + 1) * m].zero_()
+            kwargs["prob_tensor"][expert * m + valid_m : (expert + 1) * m].zero_()
+    if direction == "forward":
+        kwargs.update(
+            b_tensor=torch.randn(groups, n, k, device="cuda", dtype=torch.bfloat16) * 0.125,
+            b_major="k",
+            # Without generate_c the kernel does not write C, but the class API takes a sample.
+            c_tensor=torch.empty(rows, n, device="cuda", dtype=torch.bfloat16),
         )
-        if not api.check_support():
-            raise RuntimeError(f"Unsupported configuration for the {arm} arm")
-        api.compile()
-    implementation = api._implementation
-    run_plan = functools.partial(
-        implementation.execute,
-        a_tensor=t["a"],
-        padded_offsets=t["padded_offsets"],
-        alpha_tensor=t["alpha"],
-        b_tensor=t["b"],
-        prob_tensor=t["prob"],
-        **operands,
-    )
-    if op == "fc1_glu":
-        nbytes = implementation._scratch_nbytes
-        run = functools.partial(run_plan, _workspace=torch.empty(nbytes, device="cuda", dtype=torch.uint8) if nbytes else None)
-    else:
-        workspace = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    if direction == "glu":
+        kwargs.update(
+            b_tensor=torch.randn(groups, n, k, device="cuda", dtype=torch.bfloat16) * 0.125,
+            b_major="k",
+            sfa_tensor=None,
+            c_dtype=torch.bfloat16,
+            generate_c=True,
+            act_func="swiglu",
+        )
+    if direction == "dglu":
+        kwargs.update(
+            b_tensor=torch.randn(groups, k, n, device="cuda", dtype=torch.bfloat16) * 0.125,
+            b_major="n",
+            sfa_tensor=None,
+            # The forward's saved C (gate | up, 2N wide, interleaved_32).
+            c_tensor=torch.randn(rows, 2 * n, device="cuda", dtype=torch.bfloat16) * 0.125,
+            beta_tensor=torch.ones(groups, device="cuda"),
+            dprob_tensor=torch.zeros(rows, device="cuda", dtype=torch.float32),
+            act_func="dswiglu",
+        )
+    if direction == "dgrad":
+        kwargs.update(
+            # The forward weights (E, K, N), read N-major.
+            b_tensor=torch.randn(groups, k, n, device="cuda", dtype=torch.bfloat16) * 0.125,
+            b_major="n",
+            c_tensor=torch.empty(rows, n, device="cuda", dtype=torch.bfloat16),
+        )
+    metadata = dict(groups=groups, M=m, valid_M=valid_m, N=n, K=k, total_rows=rows, mma_tiler_mn=(128, tile_n), cluster_shape_mn=kwargs["cluster_shape_mn"])
+    return kwargs, metadata
 
-        def run():
-            # dprob accumulates, so each call starts from zero, as a training step's would.
-            t["dprob"].zero_()
-            run_plan(workspace=workspace)
 
-    run()
-    torch.cuda.synchronize()
-    schedule = "pingpong" if getattr(implementation, "_pingpong", False) else "cooperative"
-    return run, d, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
-
-
-@contextlib.contextmanager
-def forced_schedule(schedule):
-    """The SM90 schedule test hook: plans built inside run ``schedule`` (None: the shape rule's pick)."""
-    import cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm_sm90 as sm90
-
-    saved, sm90._SCHEDULE_OVERRIDE = sm90._SCHEDULE_OVERRIDE, schedule
+def prepare(kwargs, direction, schedule):
+    wrapper, cls = (getattr(cudnn, name) for name in DIRECTIONS[direction][:2])
+    # Test hook: every SM90 plan built while it is set runs this schedule; restored once the plans are built.
+    saved, moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE = moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE, schedule
     try:
-        yield
-    finally:
-        sm90._SCHEDULE_OVERRIDE = saved
-
-
-def prepare(t, op, b_major, arm):
-    """One arm's timed call, its output buffer (None for torch) and its plan's configuration."""
-    if arm == "torch":
-        return torch_arm(t, op, b_major), None, {}
-    if op in ("fc1_glu", "fc2_dglu"):
-        return prepare_glu(t, op, b_major, arm)
-    d = torch.empty_like(t["c"])
-    with forced_schedule(None if arm == "default" else arm):
-        api = cudnn.GroupedGemmSm90(
-            sample_a=t["a"],
-            sample_c=t["c"],
-            sample_d=d,
-            sample_padded_offsets=t["padded_offsets"],
-            sample_alpha=t["alpha"],
-            sample_b=t["b"],
-            sample_prob=t["prob"],
-            b_major=b_major,
-            use_dynamic_sched=True,
-        )
+        outputs = wrapper(**kwargs)
+        operands = {**kwargs, **{name: value for name, value in outputs.items() if value is not None}}
+        samples = {"sample_" + name.removesuffix("_tensor"): value for name, value in operands.items()}
+        constructor = inspect.signature(cls).parameters
+        init = {name: kwargs[name] for name in constructor if name in kwargs}
+        for name, parameter in constructor.items():
+            if name.startswith("sample_"):
+                if name in samples:
+                    init[name] = samples[name]
+                elif parameter.default is inspect.Parameter.empty:
+                    init[name] = None
+        api = cls(**init)
         if not api.check_support():
-            raise RuntimeError(f"Unsupported configuration for the {arm} arm")
+            raise RuntimeError(f"Unsupported requested configuration: {direction} {schedule}")
         api.compile()
-    # The backend plan directly, with its per-call workspace allocated once: no wrapper work in timing.
+    finally:
+        moe_grouped_gemm_sm90._SCHEDULE_OVERRIDE = saved
+    # Bind through the real backend's signature; no wrapper allocation in timing.
     implementation = api._implementation
-    nbytes = implementation._scratch_nbytes
-    workspace = torch.empty(nbytes, device="cuda", dtype=torch.uint8) if nbytes else None
-    run = functools.partial(
-        implementation.execute,
-        a_tensor=t["a"],
-        c_tensor=t["c"],
-        d_tensor=d,
-        padded_offsets=t["padded_offsets"],
-        alpha_tensor=t["alpha"],
-        b_tensor=t["b"],
-        prob_tensor=t["prob"],
-        _workspace=workspace,
-    )
+    execute = implementation.execute
+    arguments = {name: operands[name] for name in inspect.signature(execute).parameters if name in operands}
+    for name, parameter in inspect.signature(execute).parameters.items():
+        if name not in arguments and parameter.default is inspect.Parameter.empty:
+            arguments[name] = None
+    if "workspace" in inspect.signature(execute).parameters:
+        arguments["workspace"] = torch.empty(api.scratch_workspace_bytes(), device="cuda", dtype=torch.uint8)
+    if "_workspace" in inspect.signature(execute).parameters:
+        # The kernel scratch the wrapper allocates per call.
+        arguments["_workspace"] = torch.empty(implementation._scratch_nbytes, device="cuda", dtype=torch.uint8)
+
+    def run():
+        if kwargs.get("dprob_tensor") is not None:
+            kwargs["dprob_tensor"].zero_()
+        execute(**arguments)
+
     run()
     torch.cuda.synchronize()
-    schedule = "pingpong" if implementation._pingpong else "cooperative"
-    return run, d, dict(schedule=schedule, mma_tiler_mn=implementation.mma_tiler_mn, cluster_shape_mn=implementation.cluster_shape_mn)
+    return run, outputs, api
 
 
-def output_sha256(value):
-    """Cross-process control; copying/hashing is outside timing."""
-    return hashlib.sha256(value.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+def snapshots(outputs):
+    # The wrapper returns c_tensor=None without generate_c, so forward/dgrad's empty C sample is never compared or hashed.
+    return {name: value.detach().clone() for name, value in outputs.items() if value is not None}
+
+
+def check(actual, expected):
+    for name, target in expected.items():
+        value = actual[name]
+        if not torch.isfinite(value.float()).all():
+            raise AssertionError(f"Nonfinite {name}")
+        torch.testing.assert_close(value.float(), target.float(), rtol=0, atol=0)
+
+
+def output_hashes(values):
+    """Cross-process controls; copying/hashing is outside timing.
+
+    dprob uses an existing atomic reduction. Its bytes are not a deterministic
+    regression contract.
+    """
+    return {
+        name: hashlib.sha256(value.contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()
+        for name, value in values.items()
+        if name != "dprob_tensor"
+    }
 
 
 def distribution(samples):
@@ -254,11 +186,12 @@ def distribution(samples):
 
 
 def measure(runs, args):
-    # Every arm is compiled before any is warmed or sampled. Adjacent repeats
-    # alternate AB/BA so clock drift cannot separate the arms' measurement windows.
+    # Compile both schedules before warming or sampling either of them. Adjacent
+    # pairs alternate AB/BA so clock drift cannot separate the two schedule
+    # measurement windows.
     graphs, events = {}, {}
-    samples = {arm: dict(graph_device_us=[], eager_wall_us=[]) for arm in runs}
-    for arm, run in runs.items():
+    samples = {schedule: dict(graph_device_us=[], eager_wall_us=[]) for schedule in runs}
+    for schedule, run in runs.items():
         for _ in range(args.warmup):
             run()
         torch.cuda.synchronize()
@@ -266,65 +199,58 @@ def measure(runs, args):
         with torch.cuda.graph(graph):
             for _ in range(args.bundle):
                 run()
-        graphs[arm] = graph
-        events[arm] = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        graphs[schedule] = graph
+        events[schedule] = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
     for _ in range(args.warmup):
         for graph in graphs.values():
             graph.replay()
     torch.cuda.synchronize()
     for repeat in range(args.repeats):
         order = tuple(runs) if repeat % 2 == 0 else tuple(reversed(runs))
-        for arm in order:
-            begin, end = events[arm]
+        for schedule in order:
+            begin, end = events[schedule]
             begin.record()
-            graphs[arm].replay()
+            graphs[schedule].replay()
             end.record()
             end.synchronize()
-            samples[arm]["graph_device_us"].append(begin.elapsed_time(end) * 1000 / args.bundle)
-        for arm in order:
+            samples[schedule]["graph_device_us"].append(begin.elapsed_time(end) * 1000 / args.bundle)
+        for schedule in order:
             start = time.perf_counter()
             for _ in range(args.bundle):
-                runs[arm]()
+                runs[schedule]()
             torch.cuda.synchronize()
-            samples[arm]["eager_wall_us"].append((time.perf_counter() - start) * 1e6 / args.bundle)
+            samples[schedule]["eager_wall_us"].append((time.perf_counter() - start) * 1e6 / args.bundle)
     measurements = {}
-    for arm, metrics in samples.items():
-        measurements[arm] = {name: statistics.median(values) for name, values in metrics.items()}
-        measurements[arm]["distributions"] = {name: distribution(values) for name, values in metrics.items()}
-    if "torch" in runs:
-        for arm in runs:
-            if arm != "torch":
-                measurements[arm]["paired_ratio_to_torch"] = {
-                    name: distribution([a / t for a, t in zip(samples[arm][name], values)]) for name, values in samples["torch"].items()
-                }
+    for schedule, metrics in samples.items():
+        measurements[schedule] = {name: statistics.median(values) for name, values in metrics.items()}
+        measurements[schedule]["distributions"] = {name: distribution(values) for name, values in metrics.items()}
+    if "cooperative" in runs and "pingpong" in runs:
+        measurements["pingpong"]["paired_ratio_to_cooperative"] = {
+            name: distribution([p / c for p, c in zip(samples["pingpong"][name], values)]) for name, values in samples["cooperative"].items()
+        }
     return measurements
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", nargs="+", choices=tuple(MODEL_SHAPES), default=["deepseek_v3"], metavar="MODEL", help=", ".join(MODEL_SHAPES))
-    parser.add_argument("--op", nargs="+", choices=OPS, default=list(OPS), metavar="OP", help=", ".join(OPS))
-    parser.add_argument("--arms", nargs="+", choices=ARMS, default=["default", "torch"], metavar="ARM", help=", ".join(ARMS))
+    parser.add_argument("--direction", choices=("all", *DIRECTIONS), default="all")
+    parser.add_argument("--schedule", choices=("compare", *SCHEDULES), default="compare")
     parser.add_argument("--ep", type=int, default=8)
-    parser.add_argument("--tokens", type=int, default=8192, help="Tokens per GPU")
+    parser.add_argument("--context", type=int, default=4096)
+    parser.add_argument("--microbatch", type=int, default=1)
     parser.add_argument("--seed", type=int, default=401)
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--bundle", type=int, default=20)
     parser.add_argument("--repeats", type=int, default=8)
     parser.add_argument("--json", type=Path)
     args = parser.parse_args()
-    if args.ep < 1 or any(MODEL_SHAPES[model]["experts"] % args.ep for model in args.model):
-        parser.error("EP must divide every selected model's expert count")
-    if min(args.tokens, args.warmup, args.bundle, args.repeats) < 1:
-        parser.error("tokens and timing counts must be positive")
-    if "fc2_dglu" in args.op and {"cooperative", "pingpong"} & set(args.arms):
-        parser.error("fc2_dglu has one schedule (the dGLU kernel ignores the schedule override): use --arms default torch")
-    capability = torch.cuda.get_device_capability()
-    if not has_wgmma(capability[0]):
-        raise SystemExit(f"This benchmark requires an SM90 (Hopper) GPU, found compute capability {capability}")
+    if args.ep < 1 or 256 % args.ep or min(args.context, args.microbatch, args.warmup, args.bundle, args.repeats) < 1:
+        parser.error("EP must divide 256; context, microbatch and timing counts must be positive")
+    if args.direction == "dglu" and args.schedule == "pingpong":
+        parser.error("dglu has one (cooperative) schedule")
     runtime = dict(
         gpu=torch.cuda.get_device_name(),
-        capability=capability,
+        capability=torch.cuda.get_device_capability(),
         torch=torch.__version__,
         cuda=torch.version.cuda,
         cudnn_source=cudnn.__file__,
@@ -332,27 +258,28 @@ def main():
         cutlass=importlib.metadata.version("nvidia-cutlass-dsl"),
     )
     print(json.dumps(dict(runtime=runtime, configuration=vars(args)), default=str), flush=True)
+    directions = tuple(DIRECTIONS) if args.direction == "all" else (args.direction,)
     rows = []
-    for model in args.model:
-        for op in args.op:
-            tensors, shape = problem(args, model, op)
-            reference = torch_arm(tensors, op, shape["b_major"])().float()
-            runs, cases = {}, {}
-            for arm in args.arms:
-                run, d, plan = prepare(tensors, op, shape["b_major"], arm)
-                cases[arm] = dict(**shape, arm=arm, **plan)
-                if d is not None:
-                    cases[arm]["max_abs_diff_vs_torch"] = (d.float() - reference).abs().max().item()
-                    cases[arm]["output_sha256"] = output_sha256(d)
-                    torch.testing.assert_close(d.float(), reference, rtol=2e-2, atol=2e-2)
-                runs[arm] = run
-            measurements = measure(runs, args)
-            flops = 2.0 * shape["total_rows"] * shape["N"] * shape["K"]
-            for arm, case in cases.items():
-                row = {**case, **measurements[arm], "tflops": flops / measurements[arm]["graph_device_us"] / 1e6}
-                rows.append(row)
-                print(json.dumps(row), flush=True)
-            del tensors, reference, run, d, runs, cases
+    for direction in directions:
+        expected = None
+        runs, cases = {}, {}
+        for schedule in (schedule for schedule in DIRECTIONS[direction][2] if args.schedule in ("compare", schedule)):
+            kwargs, shape = problem(args, direction, schedule)
+            run, outputs, api = prepare(kwargs, direction, schedule)
+            values = snapshots(outputs)
+            if expected is None:
+                expected = values
+            else:
+                check(values, expected)
+            runs[schedule] = run
+            cases[schedule] = dict(direction=direction, schedule=schedule, **shape, output_sha256=output_hashes(values))
+            del run, outputs, api, values, kwargs
+        measurements = measure(runs, args)
+        for schedule, case in cases.items():
+            row = {**case, **measurements[schedule]}
+            rows.append(row)
+            print(json.dumps(row), flush=True)
+        del expected, runs, cases
     report = dict(runtime=runtime, configuration=vars(args), measurements=rows)
     if args.json:
         args.json.write_text(json.dumps(report, indent=2, default=str) + "\n")
