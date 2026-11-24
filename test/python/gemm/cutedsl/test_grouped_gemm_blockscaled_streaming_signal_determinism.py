@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Bitwise determinism of the streaming signal options on the SM100 block-scaled grouped GEMM kernels: N_CHUNK output
-notify on the MXFP8 quant kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1).
+notify on the MXFP8 quant kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1; stock SF atoms or
+``compact_sfa_sf_warp``).
 
 The options change which cluster runs a tile and when, never the tile math, so the outputs (FC2: BF16 D; FC1: BF16 C
 and D) must be raw-byte equal across replays, extra clusters that stop early or never stop, chunk sizes, producer
@@ -59,8 +60,9 @@ def test_mxfp8_output_notify_chunk_size_invariance():
 
 # ---- The input signal (FC1 GLU) ----
 
-# Variants (``variant_options``): the signal, and with its trigger (the device layout and all-slots-ready trigger).
-REPLAY_CASES = [("glu", v, r) for v in ("signal", "trigger") for r in ("many_experts_64", "big_expert")]
+# Variants (``variant_options``): the signal, with its trigger (the device layout and all-slots-ready trigger), and with
+# the compact SF warp.
+REPLAY_CASES = [("glu", v, r) for v in ("signal", "trigger", "compact_signal", "compact_trigger") for r in ("many_experts_64", "big_expert")]
 
 
 @pytest.mark.L0
@@ -75,15 +77,15 @@ def test_signal_replays_match_dynamic(kind, variant, routing):
     assert_bitwise(assert_replays(lambda: run(launcher, problem), repeats=REPLAYS), expected, f"{variant} vs stock")
 
 
-RELEASE_CASES = [("glu", "signal"), ("glu", "trigger")]
+RELEASE_CASES = [("glu", "signal"), ("glu", "trigger"), ("glu", "compact_signal"), ("glu", "compact_trigger")]
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("kind, variant", RELEASE_CASES, ids=case_ids(RELEASE_CASES))
 def test_signal_producer_release_order_invariance(kind, variant):
-    """The GEMM starts while every M tile reads not-ready and A and its SF atoms hold NaN, with ``device_layout`` also
-    the expert layout; a producer stream writes each M tile and releases it, in order, in reverse and in a seeded random
-    order, over 64 experts.  Every order gives the stock scheduler's bytes."""
+    """The GEMM starts while every M tile reads not-ready and A and its scales (SF atoms or compact rows) hold NaN, with
+    ``device_layout`` also the expert layout; a producer stream writes each M tile and releases it, in order, in reverse
+    and in a seeded random order, over 64 experts.  Every order gives the stock scheduler's bytes."""
     _, expected, results = bs.producer_case(kind, variant, "many_experts_64")
     expected = snapshot(expected)
     for order, got in results.items():
@@ -117,15 +119,15 @@ def test_target_expert_batch_invariance(kind, variant):
             assert_bitwise(snapshot({key: value[rows] for key, value in out.items()}), expected, f"target in {name} (copy {copy})")
 
 
-WARM_CASES = [("quant", "n_chunk"), ("glu", "signal")]
+WARM_CASES = [("quant", "n_chunk"), ("glu", "signal"), ("glu", "compact_signal")]
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("kind, variant", WARM_CASES, ids=case_ids(WARM_CASES))
 def test_claim_slot_release_warm_stress(kind, variant):
-    """The claim slot each cluster broadcasts is released only after every lane read it (python/cudnn/AGENTS.md Rule
-    11): back-to-back and shared-memory-poisoned launches of a 5000-row expert on 4 clusters (many claims per cluster),
-    every byte against stock."""
+    """The claim slot each cluster broadcasts, and with the SF warp its tile_info slot, are released only after every
+    lane read them (python/cudnn/AGENTS.md Rule 11): back-to-back and shared-memory-poisoned launches of a 5000-row
+    expert on 4 clusters (many claims per cluster), every byte against stock."""
     from warm_stress import StressCase, assert_warm_stress
 
     clusters, tokens = 4, bs.ROUTINGS["big_expert"]

@@ -2,13 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Streaming signal options of the SM100 block-scaled grouped GEMM kernels: N_CHUNK output notify on the MXFP8 quant
-kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1).
+kernel (FC2) and the input signal on the MXFP8 SwiGLU kernel (FC1), with stock SF atoms or ``compact_sfa_sf_warp``.
 
 The options reorder tiles, wait and count; they never change the tile math, so every output must be raw-byte equal to
 the stock dynamic scheduler's.  Input direction: the producer writes A and its scales, then releases ``signal[t] = t``
-for the 256-row M tile t (SFA atom rows 2t and 2t + 1); until then they hold NaN, so a tile read early carries NaN into
-D.  Output direction: a concurrent consumer copies each N chunk the moment ``signal[u] == u``; a chunk published before
-its rows are in global memory carries the NaN prefill into that copy.
+for the 256-row M tile t (SFA atom rows 2t and 2t + 1, or the compact rows); until then they hold NaN, so a tile read
+early carries NaN into D.  Output direction: a concurrent consumer copies each N chunk the moment ``signal[u] == u``; a
+chunk published before its rows are in global memory carries the NaN prefill into that copy.
 
 Replays, producer release orders, batch invariance and claim-slot warm stress are in the determinism file.  L0 keeps
 one case per behaviour; the remaining shapes, routings and cluster shapes are L1.
@@ -168,12 +168,17 @@ def test_with_no_rows_exits(kind, variant):
 # ---- The input signal (FC1 GLU) ----
 
 # (kind, variant, routing) beside the replay determinism cases (64 experts, a 5000-row expert): the uneven routing (an
-# empty and a one-row expert).
+# empty and a one-row expert) and the compact SF warp on the stock dynamic scheduler.
 MATCH_CASES = [
     ("glu", "signal", "uneven"),
     ("glu", "trigger", "uneven"),
+    ("glu", "compact", "big_expert"),
+    ("glu", "compact", "many_experts_64"),
+    ("glu", "compact", "uneven"),
+    ("glu", "compact_signal", "uneven"),
+    ("glu", "compact_trigger", "uneven"),
 ]
-MATCH_L0 = [("glu", "trigger", "uneven")]
+MATCH_L0 = [("glu", "trigger", "uneven"), ("glu", "compact", "big_expert")]
 
 
 @pytest.mark.parametrize("kind, variant, routing", bs.levels(MATCH_CASES, MATCH_L0, lambda kind, variant, routing: f"{bs.KIND_IDS[kind]}-{variant}-{routing}"))
@@ -192,18 +197,19 @@ def test_signal_matches_dynamic(kind, variant, routing):
 POISON_CASES = [
     ("glu", "a", False),
     ("glu", "sfa", False),
+    ("glu", "sfa", True),
 ]
 
 
 @pytest.mark.L0
 @pytest.mark.parametrize("kind, late, compact", POISON_CASES, ids=[f"{bs.KIND_IDS[k]}-late_{late}{'-compact' * c}" for k, late, c in POISON_CASES])
 def test_poison_reaches_d(kind, late, compact):
-    """The detector works: with A codes or SFA atoms poisoned, the stock scheduler's D holds NaN, so the producer tests
-    see an early read of either."""
+    """The detector works: with A codes, SFA atoms or compact SFA rows poisoned, the stock scheduler's D holds NaN,
+    so the producer tests see an early read of any of them."""
     tokens = bs.ROUTINGS["uneven"]
     problem = bs.make_problem(kind, tokens, seed=1)
     bs.poison_inputs(problem, late)
-    out, _ = bs.Launcher(bs.make_kernel(kind, len(tokens), use_dynamic_sched=True), problem)(problem)
+    out, _ = bs.Launcher(bs.make_kernel(kind, len(tokens), use_dynamic_sched=True, compact_sfa_sf_warp=compact), problem)(problem)
     torch.cuda.synchronize()
     assert torch.isnan(out["d"].float()).any(), f"poisoned {late} left D finite"
 
@@ -218,10 +224,14 @@ def test_signal_waits_for_producer_big_expert(kind):
         bs.assert_same_bytes(got, expected, f"{order} release")
 
 
-def rejected(kind):
+def rejected(kind, compact):
     """(options, exception, message) of the rejected input-signal constructions of ``kind``."""
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 
+    if compact:
+        one_cta = dict(use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1))
+        options = [one_cta, dict(sf_vec_size=16), dict(glu_layout="gate_then_up")]
+        return [(dict(use_dynamic_sched=True, compact_sfa_sf_warp=True, **extra), ValueError, "compact_sfa_sf_warp") for extra in options]
     signal = dict(use_dynamic_sched=True, streaming_signal_capacity=4)
     cases = [
         (dict(streaming_signal_capacity=4), ValueError, "use_dynamic_sched"),
@@ -232,9 +242,20 @@ def rejected(kind):
     return cases + [(dict(use_dynamic_sched=True, **{name: True}), ValueError, name) for name in ("device_layout", slots_ready)]
 
 
+REJECT_CASES = [("glu", False), ("glu", True)]
+
+
 @pytest.mark.L0
-@pytest.mark.parametrize("kind", ["glu"], ids=bs.KIND_IDS.get)
-def test_input_signal_rejects_invalid(kind):
-    for options, error, message in rejected(kind):
+@pytest.mark.parametrize("kind, compact", REJECT_CASES, ids=[f"{bs.KIND_IDS[k]}{'-compact' * c}" for k, c in REJECT_CASES])
+def test_input_signal_rejects_invalid(kind, compact):
+    for options, error, message in rejected(kind, compact):
         with pytest.raises(error, match=message):
             bs.make_kernel(kind, 4, **options)
+    if kind == "glu" and compact:
+        # K = 384 is a whole number of SF atoms but not of the SF warp's 4-K-tile loads.
+        import cutlass.cute as cute
+
+        problem = bs.make_problem("glu", [256, 0, 0, 0], k=384)
+        kernel = bs.make_kernel("glu", 4, use_dynamic_sched=True, compact_sfa_sf_warp=True)
+        with pytest.raises(Exception, match="K % 512"):
+            cute.compile(kernel, *bs.kernel_args(kernel, problem, *bs.new_buffers(kernel, problem)), 4, bs.cu_stream())

@@ -10,7 +10,7 @@ Kernel kinds (K = 512, cluster (2, 1) with the 2-CTA 256 x 256 tile unless ``one
 - "glu": the MXFP8 SwiGLU kernel (FC1), N = gate and up -> BF16 C [rows, N] and D [rows, N / 2]; the input signal.
 
 MXFP8 operands are E4M3 codes with E8M0 exponents, kept row-major (``a_exp``, ``b_exp``) and as the swizzled SF atoms
-the kernels read (``sfa``, ``sfb``).
+the kernels read (``sfa``, ``sfb``); with ``compact_sfa_sf_warp`` the kernel reads ``a_exp`` and builds the atoms.
 """
 
 import pytest
@@ -80,6 +80,7 @@ def make_kernel(kind, experts, one_cta=False, **options):
     common.update({name: options.pop(name) for name in list(options) if name in common})
     kernel = kernel_class(kind)(**common, **options)
     kernel.test_kind, kernel.test_cluster_size = kind, 1 if one_cta else 2
+    kernel.test_compact = bool(options.get("compact_sfa_sf_warp"))
     kernel.test_signal = bool(options.get("streaming_signal_capacity"))
     kernel.test_device_layout = bool(options.get("device_layout"))
     kernel.test_compile_key = (type(kernel).__qualname__, frozen({**common, **options}))
@@ -93,8 +94,11 @@ def trigger_options(kind):
 
 def variant_options(kind, problem, variant):
     """Options of an input-signal ``variant``: "signal" (one flag per M tile) or "trigger" (the signal and
-    ``trigger_options``)."""
+    ``trigger_options``); a "compact" prefix adds ``compact_sfa_sf_warp`` ("compact" alone: on the stock dynamic
+    scheduler)."""
     options = dict(use_dynamic_sched=True)
+    if variant.startswith("compact"):
+        options["compact_sfa_sf_warp"] = True
     if variant.endswith(("signal", "trigger")):
         options["streaming_signal_capacity"] = problem["rows"] // ROWS_ALIGNMENT
     if variant.endswith("trigger"):
@@ -212,7 +216,7 @@ def kernel_args(kernel, problem, *buffers):
     head += [cutlass.Int32(n), cutlass.Int32(k), cutlass.Int64(k), OperandMajorMode.K, from_dlpack(buffers[-1], assumed_align=128).iterator]
     offsets, alpha, prob = from_dlpack(problem["offsets"], assumed_align=4), tensor(problem["alpha"]), tensor(problem["prob"])
     d = tensor(buffers[1] if kind == "glu" else buffers[0])
-    sfa = e8m0(problem["sfa"])
+    sfa = e8m0(problem["a_exp"] if kernel.test_compact else problem["sfa"])
     if kind == "quant":
         # (d, d_col, sfa, sfd_row, sfd_col, amax, norm_const, offsets, alpha, row_scale, bias, prob)
         return head + [d, d, sfa, None, None, None, None, offsets, alpha, None, None, prob]
@@ -451,18 +455,20 @@ def signal_view(kernel, workspace):
 
 
 def poison_inputs(problem, late):
-    """NaN in the operands ``late`` names ("a", "sfa" or "both"); returns their final bytes."""
-    final = {name: problem[name].view(torch.uint8).clone() for name in ("a", "sfa")}
+    """NaN in the operands ``late`` names ("a", "sfa" or "both"; SFA in both forms, atoms and compact rows); returns
+    their final bytes."""
+    final = {name: problem[name].view(torch.uint8).clone() for name in ("a", "sfa", "a_exp") if name in problem}
     if late in ("a", "both"):
         problem["a"].view(torch.uint8).fill_(POISON)
     if late in ("sfa", "both"):
         problem["sfa"].fill_(POISON)
+        problem["a_exp"].fill_(POISON)
     return final
 
 
 def produce_tiles(problem, final, late, signal, order):
     """The fake producer, enqueued on the current stream: per M tile in ``order``, write the late operands' rows and SFA
-    bytes (``[t * 256 * Kc, (t + 1) * 256 * Kc)`` of the atoms), then ``signal[t] = t``."""
+    bytes (``[t * 256 * Kc, (t + 1) * 256 * Kc)`` of the atoms, and the compact rows), then ``signal[t] = t``."""
     sf_bytes = ROWS_ALIGNMENT * sf_cols(problem["k"])
     for tile in order:
         rows = slice(tile * ROWS_ALIGNMENT, (tile + 1) * ROWS_ALIGNMENT)
@@ -471,6 +477,7 @@ def produce_tiles(problem, final, late, signal, order):
         if late in ("sfa", "both"):
             sf = slice(tile * sf_bytes, (tile + 1) * sf_bytes)
             problem["sfa"][sf].copy_(final["sfa"][sf])
+            problem["a_exp"][rows].copy_(final["a_exp"][rows])
         signal[tile].fill_(tile)
 
 
