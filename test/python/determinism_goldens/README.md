@@ -9433,7 +9433,8 @@ H100 run s10 at `37a80724` (NVIDIA H100 80GB HBM3, SM90): the suite passed 19
 of 19 (L0 and L1). The L1 control shows the atomic dprob changed in 19 of 19
 replays, in up to 6444 of 8192 rows, while the deterministic path replayed
 bitwise and D never changed. The full SM90 L0 regression passed 235 of 235, the
-8 SM90 goldens passed a strict check, and compute-sanitizer memcheck (2 cases,
+8 SM90 goldens of the time (5 since the 2026-11-24 dedup)
+passed a strict check, and compute-sanitizer memcheck (2 cases,
 including N tiles rounded up to whole clusters), racecheck and synccheck found
 nothing. Cost on fc2 dGLU (deterministic / atomic time): EP8 and EP4
 DeepSeek-V3 and qwen38_2p4t measured 1.007 to 1.009 gated and 0.991 to 1.006

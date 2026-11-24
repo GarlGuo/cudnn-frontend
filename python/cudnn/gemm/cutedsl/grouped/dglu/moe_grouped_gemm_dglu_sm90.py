@@ -37,6 +37,7 @@ from ..moe_utils import MoEWeightMode, compute_expert_token_range, rewrite_tenso
 from ..moe_sched_extension import ContiguousGroupedGemmSchedExtension
 from ..moe_kernel_helpers import atomic_add_float32, compute_grid, fmax, fmin, sigmoid_f32
 from ..unfused.moe_grouped_gemm_sm90 import _widen_for_cluster, check_register_split
+from cudnn.frost.tile_dsl.consume import consume_then_arrive, release_zero
 
 
 class MoEGroupedGemmDgluBf16KernelSm90:
@@ -538,6 +539,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
             self.d_smem_layout_staged,
             self.epi_tile,
             self.sched_params,
+            cutlass.Int32(0),
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -574,13 +576,20 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         copy_atom_s2r = cute.make_copy_atom(warp.LdMatrix8x8x16bOp(layout.is_m_major_c(), 4), dtype)
         return cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_c_atom)
 
-    def load_c(self, tiled_copy_s2r, c_pipeline, c_consumer_state, tSR_sC, tSR_rC):
+    def load_c(self, tiled_copy_s2r, c_pipeline, c_consumer_state, tSR_sC, tSR_rC, rz):
         """Wait for the next C subtile, move it to registers and give its SMEM stage back to the load warp.
-        The caller advances c_consumer_state: only a call on the name in the kernel body makes it loop-carried."""
+        The caller advances c_consumer_state: only a call on the name in the kernel body makes it loop-carried.
+        Every epilogue warp loads and releases: its signaling lane (lane 0) arrives, through tile_dsl.consume, on an
+        address computed from every C register this lane loaded (Rule 11). The fence stays: the refill is a TMA load."""
         c_pipeline.consumer_wait(c_consumer_state)
         cute.copy(tiled_copy_s2r, tSR_sC[(None, None, None, c_consumer_state.index)], tSR_rC)
         cute.arch.fence_proxy("async.shared", space="cta")
-        c_pipeline.consumer_release(c_consumer_state)
+        consume_then_arrive(
+            c_pipeline.consumer_get_barrier(c_consumer_state),
+            cute.recast_tensor(tSR_rC, cutlass.Int32).load(),
+            rz,
+            pred=c_pipeline.is_signaling_thread,
+        )
 
     @cute.jit
     def store_d(
@@ -655,7 +664,10 @@ class MoEGroupedGemmDgluBf16KernelSm90:
         d_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cutlass.Constexpr,
         sched_params: MoESchedulerParams,
+        rz_arg: cutlass.Int32,
     ):
+        # The release-zero (python/cudnn/AGENTS.md Rule 11): the host passes 0; its only use is this call.
+        rz = release_zero(rz_arg)
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
 
@@ -807,7 +819,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[0] >= cutlass.Int32(0)
             cute.arch.fence_proxy("async.shared", space="cta")
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            consume_then_arrive(tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
@@ -847,7 +859,9 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                consume_then_arrive(
+                    tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz
+                )
                 tile_info_consumer_state.advance()
             c_pipeline.producer_tail(c_producer_state)
 
@@ -863,7 +877,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[0] >= cutlass.Int32(0)
             cute.arch.fence_proxy("async.shared", space="cta")
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            consume_then_arrive(tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
             tile_info_consumer_state.advance()
 
             while is_valid_tile:
@@ -928,7 +942,9 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                consume_then_arrive(
+                    tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz
+                )
                 tile_info_consumer_state.advance()
             ab_pipeline.producer_tail(ab_producer_state)
 
@@ -976,7 +992,7 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                 tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
             is_valid_tile = tile_info[0] >= cutlass.Int32(0)
             cute.arch.fence_proxy("async.shared", space="cta")
-            tile_info_pipeline.consumer_release(tile_info_consumer_state)
+            consume_then_arrive(tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz)
             tile_info_consumer_state.advance()
 
             num_prev_subtiles = cutlass.Int32(0)
@@ -1057,9 +1073,9 @@ class MoEGroupedGemmDgluBf16KernelSm90:
 
                 # Accumulator subtile s pairs C and D subtiles 2 s (gate) and 2 s + 1 (up): same rows, 32 columns apart.
                 for pair_idx in cutlass.range_constexpr(subtile_cnt // 2):
-                    self.load_c(tiled_copy_s2r, c_pipeline, c_consumer_state, tSR_sC, tSR_rGate)
+                    self.load_c(tiled_copy_s2r, c_pipeline, c_consumer_state, tSR_sC, tSR_rGate, rz)
                     c_consumer_state.advance()
-                    self.load_c(tiled_copy_s2r, c_pipeline, c_consumer_state, tSR_sC, tSR_rUp)
+                    self.load_c(tiled_copy_s2r, c_pipeline, c_consumer_state, tSR_sC, tSR_rUp, rz)
                     c_consumer_state.advance()
                     acc_base = pair_idx * size_tRS_rD
                     # Hopper has no packed f32x2 math (SM100+), so vectorized_f32 is accepted for API parity only.
@@ -1134,7 +1150,9 @@ class MoEGroupedGemmDgluBf16KernelSm90:
                     tile_info[idx] = sInfo[(idx, tile_info_consumer_state.index)]
                 is_valid_tile = tile_info[0] >= cutlass.Int32(0)
                 cute.arch.fence_proxy("async.shared", space="cta")
-                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                consume_then_arrive(
+                    tile_info_pipeline.consumer_get_barrier(tile_info_consumer_state), [tile_info[0], tile_info[1], tile_info[2], tile_info[3]], rz
+                )
                 tile_info_consumer_state.advance()
 
             d_pipeline.producer_tail()

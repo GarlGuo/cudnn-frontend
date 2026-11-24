@@ -9,6 +9,8 @@ dGLU's dprob is an atomic sum across N tiles, so only its D (dgate | dup) is hel
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -120,18 +122,64 @@ def test_sm90_glu_warm_stress(op):
         graph.reset()
 
 
-@pytest.mark.parametrize("op", OPS)
-def test_sm90_glu_golden(op):
+@pytest.mark.parametrize("op,schedule", [("glu", "cooperative"), ("glu", "pingpong"), ("dglu", None)], ids=["glu-cooperative", "glu-pingpong", "dglu"])
+def test_sm90_glu_golden(op, schedule):
+    # The GLU's one record serves both schedules: pingpong (128x192, (2, 1), with C) must give the cooperative C and D
+    # bytes. The cooperative case records; pingpong only compares.
+    if schedule == "pingpong" and os.environ.get("CUDNN_DETERMINISM_RECORD"):
+        pytest.skip("pingpong compares against the cooperative record: record the cooperative case, then check")
+    kwargs = {} if schedule is None else dict(schedule=schedule)
     problem = make_problem((256, 0, 512), n=384, k=320, seed=21)
-    result = assert_replays(lambda: outputs(op, problem), repeats=2)
-    check(op, problem)
+    result = assert_replays(lambda: outputs(op, problem, **kwargs), repeats=2)
+    check(op, problem, **kwargs)
     inputs = {name: problem[name] for name in ("a", "weights", "offsets", "alpha", "prob")}
     if op == "dglu":
         inputs.update(c=problem["c"], beta=problem["beta"])
     assert_golden(f"grouped_gemm_{op}_sm90_bf16", inputs, result)
 
 
-# ---- GLU forward, pingpong schedule: 128x192 on (2, 1) clusters, without the saved C (recorded on H100) ----
+# The tile-info slots (2 stages) turn over once per tile, dGLU's C stages once per C subtile. K = 64 makes each tile one
+# k-block: 64 experts x 256 rows at N = 3072 give 1536 (cooperative 128x256) or 2048 (pingpong 128x192) tiles, about 12
+# or 16 per CTA on H100, so the producers wait on an empty stage at nearly every release (python/cudnn/AGENTS.md Rule 11).
+TILE_INFO_STRESS = {
+    "glu-cooperative": ("glu", dict(schedule="cooperative", mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1))),
+    "glu-pingpong": ("glu", dict(schedule="pingpong", mma_tiler_mn=(128, 192), cluster_shape_mn=(2, 1))),
+    "dglu": ("dglu", dict(mma_tiler_mn=(128, 256), cluster_shape_mn=(2, 1))),
+}
+
+
+@pytest.mark.parametrize("case", list(TILE_INFO_STRESS))
+def test_sm90_glu_tile_info_warm_stress(case):
+    import cutlass
+    from warm_stress import StressCase, assert_warm_stress
+
+    op, kwargs = TILE_INFO_STRESS[case]
+    problem = make_problem((256,) * 64, n=3072, k=64, seed=17)
+    check(op, problem, **kwargs)
+    torch.cuda.synchronize()
+    clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(2)
+    tile_m, tile_n = kwargs["mma_tiler_mn"]
+    tiles = (sum(problem["counts"]) // tile_m) * (problem["n"] // tile_n)
+    dprob = torch.zeros_like(problem["prob"])
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            captured = outputs(op, problem, **kwargs) if op == "glu" else {"d": run_dglu(problem, dprob=dprob, **kwargs)["d_row_tensor"]}
+        report = assert_warm_stress(
+            StressCase(
+                f"SM90 grouped GEMM {case} tile-info{' and C' if op == 'dglu' else ''} M=64x256 N=3072 K=64 ({tiles} tiles)",
+                launch=graph.replay,
+                outputs=captured,
+                thread_blocks=2 * clusters,
+                refills_per_launch=-(-tiles // (2 * clusters)),  # tile-info fills per CTA (dGLU's C stages: per subtile)
+            )
+        )
+        print(report.text())
+    finally:
+        graph.reset()
+
+
+# ---- GLU forward, pingpong schedule: 128x192 on (2, 1) clusters without the saved C (golden: test_sm90_glu_golden) ----
 
 PINGPONG = dict(schedule="pingpong", generate_c=False)
 
@@ -149,11 +197,3 @@ def test_sm90_glu_pingpong_batch_invariance():
     result = snapshot(outputs("glu", segment_problem(segments), **PINGPONG))
     for index in (1, 3):
         assert_bitwise(rows_of(result, segments, index), expected, f"packed segment {index}")
-
-
-def test_sm90_glu_pingpong_golden():
-    problem = make_problem((256, 0, 512), n=576, k=320, seed=21)
-    result = assert_replays(lambda: outputs("glu", problem, **PINGPONG), repeats=2)
-    check("glu", problem, **PINGPONG)
-    inputs = {name: problem[name] for name in ("a", "weights", "offsets", "alpha", "prob")}
-    assert_golden("grouped_gemm_glu_sm90_bf16_pingpong_noc", inputs, result)
