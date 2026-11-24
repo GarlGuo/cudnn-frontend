@@ -4,6 +4,39 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22, records deduplicated 2026-11-24)
+
+Forward record in `d7223a07b419e232/`: `grouped_gemm_sm90_bf16_fwd`. Its golden case runs
+both warp-group schedules against the one record (`test_sm90_golden[fwd-{cooperative,pingpong}]`):
+pingpong (128x192 tile, (2, 1) cluster) must give the cooperative bytes. Recording writes
+the cooperative case; the pingpong case skips there and compares under `CUDNN_DETERMINISM_GOLDENS`.
+The removed `grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` held the cooperative hashes.
+dgrad has no golden record; replay, batch invariance and warm stress cover it.
+
+Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch 2.14.0+cu130,
+CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0, tvm-ffi 0.1.16,
+compute-sanitizer 2026.1.1.0; source built from the commit under test.
+
+```
+G=gemm/cutedsl
+F=$(ls $G/test_grouped_gemm*sm90*.py)
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=<new directory> pytest -m L0 $F   # sharded over 5 GPUs
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS=determinism_goldens pytest -m L0 $F -k golden
+```
+
+- Recorded at `c36a50af` (113 passed, 0 skipped); forward and dgrad re-recorded at
+  `3a99fdb4` (run s9, strict check 8/8 then; the dgrad record is since dropped): D is
+  scaled once per row by `alpha * prob`, at most one bf16 ulp from `(acc * alpha) * prob`.
+- Replay: 8 fresh-buffer launches against concurrent second-stream work. Batch invariance:
+  alone, packed, reordered, duplicated, changed neighbors. Pingpong also: bytes equal to
+  cooperative 128x192, claim-order invariance down to one persistent cluster.
+- Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000 warm + 3000
+  poisoned launches for forward and dgrad; the unsafe control failed 200 of 200.
+  The tile-info case (`test_sm90_tile_info_warm_stress`: K = 64; about 12 (cooperative)
+  or 16 (pingpong) tiles per CTA) covers the Rule 11 release sites.
+- compute-sanitizer at `c36a50af`: racecheck and synccheck 0 errors; memcheck 0 device
+  errors (exit 99 on 28 host API messages: cuda-python requests CUDA 13030 > driver 13020).
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
