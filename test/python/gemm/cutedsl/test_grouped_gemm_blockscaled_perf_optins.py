@@ -1,14 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Perf opt-ins of the SM100 MXFP8 GLU and dGLU kernels (all off by default): each one leaves the outputs it still
-writes byte-equal to the default kernel's, on the stock dynamic scheduler and on the streaming input signal scheduler
+"""Perf options of the SM100 MXFP8 GLU and dGLU kernels: each one leaves the outputs it still writes byte-equal to the
+kernel without it, on the stock dynamic scheduler and on the streaming input signal scheduler
 (compact SFA, every M tile ready).  The outputs here are E4M3 D with its SFD (the EP layer's FC1 and dGLU outputs), which
 the streaming signal suite (BF16 D) does not cover.
 
 - generate_sfd_col=False (GLU): the row-quantized D and row SFD only; the column pair is not written.
 - single_c_stage=True (GLU): one C stage (the smem goes to one more A/B stage).
 - tight_sf_tmem_cols=True (GLU): SF TMEM columns sized to the SF layouts (the freed columns go to the accumulator).
+- streaming_signal_multi_batch_opening (on by default; GLU and dGLU on the signal scheduler): one batch opening also
+  publishes the other lanes' complete ready runs; off, one batch per opening.
 """
 
 import pytest
@@ -146,3 +148,19 @@ def test_glu_tight_sf_tmem_cols_matches(variant, routing, require_sm100):
     want = run_sfd("glu", problem, **options)
     got = run_sfd("glu", problem, tight_sf_tmem_cols=True, single_c_stage=True, **options)
     assert_equal_bytes(got, want, f"tight_sf_tmem_cols + single_c_stage {variant} {routing}")
+
+
+MB_CASES = [(kind, variant) for kind in ("glu", "dglu") for variant in ("signal", "compact_signal")]
+MB_L0 = {("glu", "compact_signal"), ("dglu", "signal")}
+
+
+@pytest.mark.parametrize("kind, variant", bs.levels(MB_CASES, MB_L0, lambda kind, variant: f"{bs.KIND_IDS[kind]}-{variant}"))
+def test_signal_multi_batch_opening_off_matches(kind, variant, require_sm100):
+    """The batch opener changes how many batches one opening publishes, never the tile math: with
+    streaming_signal_multi_batch_opening off and on (the default) over 64 experts (several lane rounds) the E4M3 D, both
+    SFD planes and C (GLU) or the dprob slots (dGLU) are byte-equal."""
+    problem = bs.make_problem(kind, bs.ROUTINGS["many_experts_64"], seed=6)
+    options = bs.variant_options(kind, problem, variant)
+    want = run_sfd(kind, problem, streaming_signal_multi_batch_opening=False, **options)
+    got = run_sfd(kind, problem, **options)
+    assert_equal_bytes(got, want, f"streaming_signal_multi_batch_opening off vs on, {kind} {variant}")

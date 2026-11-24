@@ -281,10 +281,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         use_pdl: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
         compact_sfa_sf_warp: bool = False,
-        streaming_signal_multi_batch_opening: bool = False,
+        streaming_signal_multi_batch_opening: bool = True,
         streaming_signal_acquire_once: bool = False,
-        tight_sf_tmem_cols: bool = False,
-        sfd_col_lane_scales: bool = False,
+        tight_sf_tmem_cols: Optional[bool] = None,
+        sfd_col_lane_scales: Optional[bool] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -423,11 +423,22 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         self.act_func = act_func
         self.situ_beta1 = float(situ_beta1)
 
-        # tight_sf_tmem_cols (opt-in): SF TMEM columns = the SF TMEM layouts' footprints.
-        self.tight_sf_tmem_cols = tight_sf_tmem_cols
-        # sfd_col_lane_scales (opt-in): the column SFD's 32 warp maxima go through a per-warp smem scratch; lane l computes
-        # only column l's scale (one E8M0 round trip and reciprocal, not 32), and the scales come back through the scratch.
-        self.sfd_col_lane_scales = sfd_col_lane_scales
+        # tight_sf_tmem_cols: SF TMEM columns = the SF TMEM layouts' footprints.
+        # sfd_col_lane_scales: the column SFD's 32 warp maxima go through a per-warp smem scratch; lane l computes only
+        # column l's scale (one E8M0 round trip and reciprocal, not 32), and the scales come back through the scratch.
+        # None (default): on for MXFP8 (FP8 A/B with 32-element E8M0 scale vectors), where both are validated
+        # byte-identical to the off path; off otherwise.  Resolved in __call__, once A's dtype is known.
+        self.tight_sf_tmem_cols_option = tight_sf_tmem_cols
+        self.sfd_col_lane_scales_option = sfd_col_lane_scales
+        self.tight_sf_tmem_cols = bool(tight_sf_tmem_cols)
+        self.sfd_col_lane_scales = bool(sfd_col_lane_scales)
+
+    def _resolve_epilogue_defaults(self):
+        """The MXFP8 epilogue defaults (``__init__``), once A's dtype is known: on for FP8 A/B with 32-element scale
+        vectors, unless set explicitly.  Plain Python (not traced): the results size shared memory."""
+        mxfp8 = self.a_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2) and self.sf_vec_size == 32
+        self.tight_sf_tmem_cols = mxfp8 if self.tight_sf_tmem_cols_option is None else bool(self.tight_sf_tmem_cols_option)
+        self.sfd_col_lane_scales = mxfp8 if self.sfd_col_lane_scales_option is None else bool(self.sfd_col_lane_scales_option)
 
     def _setup_attributes(self):
         """Set up configurations that are dependent on GEMM inputs
@@ -861,6 +872,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
             raise TypeError(f"Type must match: {self.a_dtype} != {self.b_dtype}")
+
+        self._resolve_epilogue_defaults()
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()

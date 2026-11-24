@@ -1,24 +1,32 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""MXFP8 dGLU (SM100) epilogue opt-ins against the default kernel: ``tight_sf_tmem_cols`` and ``sfd_col_lane_scales``
-change where scale factors live and how the column scales are computed, never a value, so the E4M3 row and column D,
-both SFD planes and the deterministic dprob slots must equal the default kernel's bytes, on the stock dynamic scheduler
-and on the streaming input signal scheduler (every M tile ready).  Ragged experts (one empty) vary the per-expert column
-SFD strides; NaN pre-activations exercise the NaN-propagating maxima."""
+"""MXFP8 dGLU (SM100) epilogue options against the kernel with both off: ``tight_sf_tmem_cols`` and
+``sfd_col_lane_scales`` (on by default for MXFP8) change where scale factors live and how the column scales are computed,
+never a value, so the E4M3 row and column D, both SFD planes and the deterministic dprob slots must equal the bytes with
+both off, on the stock dynamic scheduler (2-CTA 256 x 256 and 1-CTA 128 x 256) and on the streaming input signal
+scheduler (every M tile ready).  Ragged experts (one empty) vary the per-expert column SFD strides; NaN pre-activations
+exercise the NaN-propagating maxima."""
 
 import pytest
 import torch
 
+#: The reference: both options off.
+BOTH_OFF = dict(tight_sf_tmem_cols=False, sfd_col_lane_scales=False)
 OPTIONS = {
-    "tight_sf_tmem_cols": dict(tight_sf_tmem_cols=True),
-    "sfd_col_lane_scales": dict(sfd_col_lane_scales=True),
-    "tight_and_lane": dict(tight_sf_tmem_cols=True, sfd_col_lane_scales=True),
+    "tight_sf_tmem_cols": dict(tight_sf_tmem_cols=True, sfd_col_lane_scales=False),
+    "sfd_col_lane_scales": dict(tight_sf_tmem_cols=False, sfd_col_lane_scales=True),
+    "default": {},
 }
 ROWS = [256, 1280, 512, 0, 768, 2048, 256, 1024]
 K, I = 1024, 1024
-#: The scheduler: the stock dynamic one, or the streaming input signal scheduler with every M tile ready.
-SCHEDULERS = {"dynamic": {}, "signal": dict(streaming_signal_capacity=sum(ROWS) // 256)}
+#: The scheduler and tile: the stock dynamic one (2-CTA 256 x 256, or 1-CTA 128 x 256), or the streaming input signal
+#: scheduler with every M tile ready.
+SCHEDULERS = {
+    "dynamic": {},
+    "dynamic_1cta": dict(use_2cta_instrs=False, mma_tiler_mn=(128, 256), cluster_shape_mn=(1, 1)),
+    "signal": dict(streaming_signal_capacity=sum(ROWS) // 256),
+}
 
 
 @pytest.fixture(autouse=True)
@@ -63,12 +71,10 @@ def run(inputs, **options):
     from cudnn.gemm.cutedsl.grouped.moe_utils import MoEWeightMode
 
     m, e = sum(ROWS), len(ROWS)
+    options = dict(dict(use_2cta_instrs=True, mma_tiler_mn=(256, 256), cluster_shape_mn=(2, 1)), **options)
     kernel = BlockScaledMoEGroupedGemmDgluDbiasKernel(
         sf_vec_size=32,
         acc_dtype=cutlass.Float32,
-        use_2cta_instrs=True,
-        mma_tiler_mn=(256, 256),
-        cluster_shape_mn=(2, 1),
         vectorized_f32=False,
         discrete_col_sfd=True,
         expert_cnt=e,
@@ -115,7 +121,8 @@ def run(inputs, **options):
     if kernel.use_streaming_signal_sched:
         reset_streaming_signal_workspace(workspace, kernel, all_complete=True)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    compiled = cute.compile(kernel, *args, HardwareInfo().get_max_active_clusters(2), stream)
+    cluster_size = options["cluster_shape_mn"][0] * options["cluster_shape_mn"][1]
+    compiled = cute.compile(kernel, *args, HardwareInfo().get_max_active_clusters(cluster_size), stream)
     compiled(*[x for i, x in enumerate(args) if i != 6], stream)
     torch.cuda.synchronize()
     out["dprob"] = dprob
@@ -128,8 +135,8 @@ def run(inputs, **options):
 @pytest.mark.parametrize("scheduler", sorted(SCHEDULERS))
 def test_mxfp8_dglu_epilogue_option_matches_stock(scheduler, option, nan):
     inputs = make_inputs(nan)
-    stock = run(inputs, **SCHEDULERS[scheduler])
+    stock = run(inputs, **SCHEDULERS[scheduler], **BOTH_OFF)
     got = run(inputs, **SCHEDULERS[scheduler], **OPTIONS[option])
     for name in stock:
-        assert torch.equal(got[name].view(torch.uint8), stock[name].view(torch.uint8)), f"{option}: {name} differs from the stock kernel"
+        assert torch.equal(got[name].view(torch.uint8), stock[name].view(torch.uint8)), f"{option}: {name} differs with both options off"
     assert not (stock["sfd_col"] == 0xA5).all(), "the column SFD was written"

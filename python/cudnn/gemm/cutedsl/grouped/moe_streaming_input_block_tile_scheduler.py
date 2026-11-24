@@ -48,10 +48,11 @@ the opener takes one ``fence.acquire.gpu`` after its flag scan, so its release o
 producer's releases and the per-claim ``signal[]`` acquire goes; the leader CTA waits for its own broadcast with the
 default ``.acquire.cta`` try_wait and a peer polls relaxed at cluster scope, then takes one ``fence.acquire.cluster``.
 
-Opt-in ``multi_batch_opening``: the same opening also publishes, after that batch and in lane order, one batch per other
-lane whose best expert has a complete ready run (it ends the expert or fills the cap).  Openings are serialized, so one
-batch per opening starves the SMs with many small experts (qwen35 EP4, 128 experts of 3 M tiles: +12% to +43% over the
-stock dynamic scheduler with every tile ready; +1% to +3% with this).
+``multi_batch_opening`` (on by default): the same opening also publishes, after that batch and in lane order, one batch
+per other lane whose best expert has a complete ready run (it ends the expert or fills the cap).  Openings are
+serialized, so one batch per opening starves the SMs with many small experts (qwen35 EP4, 128 experts of 3 M tiles: +12%
+to +43% over the stock dynamic scheduler with every tile ready; +1% to +3% with this).  Off, each opening publishes one
+batch.
 
 Assumes A rows <= (2^31 - 1) * cluster tile M.
 """
@@ -777,14 +778,14 @@ class StreamingInputSignalMixin:
         use_pdl: bool = False,
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
-        streaming_signal_multi_batch_opening: bool = False,
+        streaming_signal_multi_batch_opening: bool = True,
         streaming_signal_acquire_once: bool = False,
     ) -> None:
         """Check and keep the options.  ``unmet_requirement``: what this kernel configuration lacks for a producer (for
-        example "dense weights"), or None.  ``streaming_signal_multi_batch_opening`` (opt-in, needs
+        example "dense weights"), or None.  ``streaming_signal_multi_batch_opening`` (default True; acts only with
         ``streaming_signal_capacity``): each batch opening also publishes the other lanes' complete ready runs (module
-        docstring).  ``streaming_signal_acquire_once`` (opt-in, needs ``streaming_signal_capacity``): one acquire per
-        claim, not per poll (module docstring)."""
+        docstring); False opens one batch per opening.  ``streaming_signal_acquire_once`` (opt-in, needs
+        ``streaming_signal_capacity``): one acquire per claim, not per poll (module docstring)."""
         self.streaming_signal_capacity = streaming_signal_capacity
         self.use_streaming_signal_sched = streaming_signal_capacity is not None
         if self.use_streaming_signal_sched and not use_dynamic_sched:
@@ -797,9 +798,8 @@ class StreamingInputSignalMixin:
             raise ValueError("launch_pdl_dependents_at_all_streaming_signal_slots_ready requires streaming_signal_capacity")
         if self.use_streaming_signal_sched:
             check_dynamic_sched_cluster_shape(use_2cta_instrs, cluster_shape_mn)
-        if streaming_signal_multi_batch_opening and not self.use_streaming_signal_sched:
-            raise ValueError("streaming_signal_multi_batch_opening requires streaming_signal_capacity")
-        self.streaming_signal_multi_batch_opening = streaming_signal_multi_batch_opening
+        # On by default; without a producer there is no signal scheduler for it to act on.
+        self.streaming_signal_multi_batch_opening = bool(streaming_signal_multi_batch_opening) and self.use_streaming_signal_sched
         if streaming_signal_acquire_once and not self.use_streaming_signal_sched:
             raise ValueError("streaming_signal_acquire_once requires streaming_signal_capacity")
         self.streaming_signal_acquire_once = streaming_signal_acquire_once

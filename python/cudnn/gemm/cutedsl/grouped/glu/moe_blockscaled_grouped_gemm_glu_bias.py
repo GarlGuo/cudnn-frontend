@@ -331,7 +331,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         compact_sfa_sf_warp: bool = False,
         generate_sfd_col: bool = True,
-        streaming_signal_multi_batch_opening: bool = False,
+        streaming_signal_multi_batch_opening: bool = True,
         streaming_signal_acquire_once: bool = False,
         single_c_stage: bool = False,
         tight_sf_tmem_cols: bool = False,
