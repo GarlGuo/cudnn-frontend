@@ -4,6 +4,45 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### H100 SM90 BF16 grouped GEMM goldens and determinism (2026-11-22, records deduplicated 2026-11-24)
+
+Records in `d7223a07b419e232/`, five: `grouped_gemm_sm90_bf16_{fwd,dgrad}`,
+`grouped_gemm_wgrad_sm90_bf16`, `grouped_gemm_{glu,dglu}_sm90_bf16`. Where an op has
+both warp-group schedules, its golden case runs both against the one record
+(`test_sm90_golden[{fwd,dgrad}-{cooperative,pingpong}]`, `test_sm90_glu_golden[glu-{cooperative,pingpong}]`):
+pingpong (128x192 tile, (2, 1) cluster) must give the cooperative bytes. Recording writes
+the cooperative case; the pingpong cases skip there and compare under `CUDNN_DETERMINISM_GOLDENS`.
+The removed `grouped_gemm_sm90_bf16_{fwd,dgrad}_pingpong` held the cooperative hashes;
+the removed `grouped_gemm_glu_sm90_bf16_pingpong_noc` (GLU without C, N = 576) is replaced by
+the GLU-with-C pingpong case on the cooperative record.
+
+Runtime: NVIDIA H100 80GB HBM3 (SM90, 132 SMs, x86-64 host), PyTorch 2.14.0+cu130,
+CUDA 13.0, driver API 13020, cuDNN 92400, CuTe DSL 4.8.0, tvm-ffi 0.1.16,
+compute-sanitizer 2026.1.1.0; source built from the commit under test.
+
+```
+G=gemm/cutedsl
+F="$G/test_grouped_gemm_sm90.py $G/test_grouped_gemm_sm90_determinism.py $G/test_grouped_gemm_wgrad_sm90.py \
+   $G/test_grouped_gemm_wgrad_sm90_determinism.py $G/test_grouped_gemm_glu_sm90.py $G/test_grouped_gemm_glu_sm90_determinism.py"
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_RECORD=<new directory> pytest -m L0 $F   # sharded over 5 GPUs
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS=determinism_goldens pytest -m L0 $F -k golden
+```
+
+- Recorded at `c36a50af` (113 passed, 0 skipped); forward and dgrad re-recorded at
+  `3a99fdb4` (run s9, strict check 8/8 then): D is scaled once per row by `alpha * prob`,
+  at most one bf16 ulp from `(acc * alpha) * prob`.
+- Replay: 8 fresh-buffer launches against concurrent second-stream work. Batch invariance:
+  alone, packed, reordered, duplicated, changed neighbors. Pingpong also: bytes equal to
+  cooperative 128x192, claim-order invariance down to one persistent cluster.
+- Warm stress (M = 8 x 512, N = 2048, K = 4096, 132 CTAs): 0 wrong of 3000 warm + 3000
+  poisoned launches for forward, dgrad, wgrad, GLU, dGLU; the unsafe control failed 200 of 200.
+  The tile-info cases (`test_sm90_tile_info_warm_stress`, `test_sm90_wgrad_warm_stress`,
+  `test_sm90_glu_tile_info_warm_stress`: K = 64, wgrad 256 tokens per expert; about 12
+  (cooperative) or 16 (pingpong) tiles per CTA) cover the Rule 11 release sites.
+- dGLU's atomic `dprob` is excluded from the byte checks; D is checked.
+- compute-sanitizer at `c36a50af`: racecheck and synccheck 0 errors; memcheck 0 device
+  errors (exit 99 on 28 host API messages: cuda-python requests CUDA 13030 > driver 13020).
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
