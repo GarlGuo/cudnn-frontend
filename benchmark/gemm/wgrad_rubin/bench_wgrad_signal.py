@@ -18,6 +18,7 @@ Routing as bench_wgrad_acc.py (the atomic_counter_claim PR): per EP rank a 4096-
                 stream: producer on one stream, the signal GEMM (max_active_clusters - 1) on another, from the same start.
                 End-to-end event time, median of --repeats; outputs byte-equal to the off path.
 """
+
 import argparse
 import json
 import math
@@ -65,8 +66,12 @@ def make_problem(args, gemm, local):
     else:
         p["a"] = (torch.randn(m, tokens, device="cuda") * 0.5).to(torch.float8_e4m3fn)
         p["b"] = (torch.randn(n, tokens, device="cuda") * 0.5).to(torch.float8_e4m3fn).t()
-        p["sfa"] = torch.randint(-2, 1, (math.ceil(m / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").float().exp2().to(torch.float8_e8m0fnu)
-        p["sfb"] = torch.randint(-2, 1, (math.ceil(n / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").float().exp2().to(torch.float8_e8m0fnu)
+        p["sfa"] = (
+            torch.randint(-2, 1, (math.ceil(m / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").cpu().float().exp2().to(torch.float8_e8m0fnu).cuda()
+        )
+        p["sfb"] = (
+            torch.randint(-2, 1, (math.ceil(n / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").cpu().float().exp2().to(torch.float8_e8m0fnu).cuda()
+        )
     meta = dict(M=m, N=n, experts=local, tokens=tokens, empty=sum(1 for x in groups if x == 0), min=min(groups), max=max(groups))
     return p, meta
 
@@ -207,7 +212,9 @@ def main():
                 e.record()
                 e.synchronize()
                 samples.append(b.elapsed_time(e) * 1000 / args.bundle)
-            row = dict(mode="off", shape=args.shape, ep=args.ep, precision=args.precision, gemm=gemm, **meta, off_us=statistics.median(samples), samples=samples)
+            row = dict(
+                mode="off", shape=args.shape, ep=args.ep, precision=args.precision, gemm=gemm, **meta, off_us=statistics.median(samples), samples=samples
+            )
             print(f"PERF off {args.shape} ep{args.ep} {args.precision} {gemm} E={local} T={meta['tokens']} off={row['off_us']:.1f}us", flush=True)
             rows.append(row)
             graph.reset()
@@ -247,12 +254,28 @@ def main():
             mig1 = pgmig()
             med = {arm: statistics.median(v) for arm, v in samples.items()}
             ratios = sorted(o / f for o, f in zip(samples["on"], samples["off"]))
-            row = dict(mode=args.mode, shape=args.shape, ep=args.ep, precision=args.precision, gemm=gemm, **meta, off_us=med["off"], on_us=med["on"],
-                       ratio_median=statistics.median(ratios), ratio_q25=ratios[len(ratios) // 4], ratio_q75=ratios[3 * len(ratios) // 4],
-                       bytes_equal=same, pgmigrate_delta=mig1 - mig0, samples=samples)
-            print(f"PERF {args.mode} {args.shape} ep{args.ep} {args.precision} {gemm} M={meta['M']} N={meta['N']} E={local} T={meta['tokens']} empty={meta['empty']} "
-                  f"off={med['off']:.1f}us on={med['on']:.1f}us ratio={row['ratio_median']:.4f} [{row['ratio_q25']:.4f},{row['ratio_q75']:.4f}] "
-                  f"bytes_equal={same} pgmig={mig1 - mig0}", flush=True)
+            row = dict(
+                mode=args.mode,
+                shape=args.shape,
+                ep=args.ep,
+                precision=args.precision,
+                gemm=gemm,
+                **meta,
+                off_us=med["off"],
+                on_us=med["on"],
+                ratio_median=statistics.median(ratios),
+                ratio_q25=ratios[len(ratios) // 4],
+                ratio_q75=ratios[3 * len(ratios) // 4],
+                bytes_equal=same,
+                pgmigrate_delta=mig1 - mig0,
+                samples=samples,
+            )
+            print(
+                f"PERF {args.mode} {args.shape} ep{args.ep} {args.precision} {gemm} M={meta['M']} N={meta['N']} E={local} T={meta['tokens']} empty={meta['empty']} "
+                f"off={med['off']:.1f}us on={med['on']:.1f}us ratio={row['ratio_median']:.4f} [{row['ratio_q25']:.4f},{row['ratio_q75']:.4f}] "
+                f"bytes_equal={same} pgmig={mig1 - mig0}",
+                flush=True,
+            )
             rows.append(row)
             for g in graphs.values():
                 g.reset()
@@ -314,12 +337,29 @@ def main():
                         samples[arm].append(b.elapsed_time(e) * 1000)
                 same = torch.equal(out_off.view(torch.int16), out_on.view(torch.int16))
                 med = {k: statistics.median(v) for k, v in samples.items()}
-                row = dict(mode="overlap", shape=args.shape, ep=args.ep, precision=args.precision, gemm=gemm, **meta, order=order_name, window=window,
-                           gemm_alone_us=g_us, producer_us=interval * len(order) / 1000, serial_us=med["serial"], stream_us=med["stream"],
-                           speedup=med["serial"] / med["stream"], bytes_equal=same, samples=samples)
-                print(f"PERF overlap {args.shape} ep{args.ep} {args.precision} {gemm} E={local} T={meta['tokens']} order={order_name} window={window} "
-                      f"G={g_us:.1f}us D={row['producer_us']:.1f}us serial={med['serial']:.1f}us stream={med['stream']:.1f}us "
-                      f"speedup={row['speedup']:.3f} bytes_equal={same}", flush=True)
+                row = dict(
+                    mode="overlap",
+                    shape=args.shape,
+                    ep=args.ep,
+                    precision=args.precision,
+                    gemm=gemm,
+                    **meta,
+                    order=order_name,
+                    window=window,
+                    gemm_alone_us=g_us,
+                    producer_us=interval * len(order) / 1000,
+                    serial_us=med["serial"],
+                    stream_us=med["stream"],
+                    speedup=med["serial"] / med["stream"],
+                    bytes_equal=same,
+                    samples=samples,
+                )
+                print(
+                    f"PERF overlap {args.shape} ep{args.ep} {args.precision} {gemm} E={local} T={meta['tokens']} order={order_name} window={window} "
+                    f"G={g_us:.1f}us D={row['producer_us']:.1f}us serial={med['serial']:.1f}us stream={med['stream']:.1f}us "
+                    f"speedup={row['speedup']:.3f} bytes_equal={same}",
+                    flush=True,
+                )
                 rows.append(row)
     if args.out:
         json.dump(rows, open(args.out, "w"))

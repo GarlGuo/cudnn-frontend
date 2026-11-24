@@ -10,6 +10,7 @@ BF16 operands use the training layouts (A M-major, B N-major); MXFP8 operands ar
 tokens. Both arms run the wrapper (tile 256x256, cluster (2, 1)) and must agree byte for byte. Timing: a graph of
 --bundle launches per arm, --warmup replays, then --repeats rounds in alternating AB/BA order; median per launch.
 """
+
 import argparse, json, math, statistics, time
 
 import torch
@@ -41,16 +42,30 @@ def problem(args, gemm, local):
     groups = counts(args, local, gran)
     tokens = sum(groups)
     torch.manual_seed(args.seed)
-    kw = dict(offsets_tensor=torch.tensor(groups, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32), output_mode="dense", acc_dtype=torch.float32,
-              wgrad_dtype=torch.bfloat16, mma_tiler_mn=(256, 256), cluster_shape_mn=(2, 1))
+    kw = dict(
+        offsets_tensor=torch.tensor(groups, dtype=torch.int32, device="cuda").cumsum(0, dtype=torch.int32),
+        output_mode="dense",
+        acc_dtype=torch.float32,
+        wgrad_dtype=torch.bfloat16,
+        mma_tiler_mn=(256, 256),
+        cluster_shape_mn=(2, 1),
+    )
     if args.precision == "bf16":
-        kw.update(a_tensor=(torch.randn(tokens, m, device="cuda") * 0.125).to(torch.bfloat16).t(), b_tensor=(torch.randn(tokens, n, device="cuda") * 0.125).to(torch.bfloat16),
-                  sfa_tensor=None, sfb_tensor=None)
+        kw.update(
+            a_tensor=(torch.randn(tokens, m, device="cuda") * 0.125).to(torch.bfloat16).t(),
+            b_tensor=(torch.randn(tokens, n, device="cuda") * 0.125).to(torch.bfloat16),
+            sfa_tensor=None,
+            sfb_tensor=None,
+        )
     else:
         a = (torch.randn(m, tokens, device="cuda") * 0.5).to(torch.float8_e4m3fn)
         b = (torch.randn(n, tokens, device="cuda") * 0.5).to(torch.float8_e4m3fn).t()
-        sfa = torch.randint(-2, 1, (math.ceil(m / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").float().exp2().to(torch.float8_e8m0fnu)
-        sfb = torch.randint(-2, 1, (math.ceil(n / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").float().exp2().to(torch.float8_e8m0fnu)
+        sfa = (
+            torch.randint(-2, 1, (math.ceil(m / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").cpu().float().exp2().to(torch.float8_e8m0fnu).cuda()
+        )
+        sfb = (
+            torch.randint(-2, 1, (math.ceil(n / 128) * 128, math.ceil(tokens / 32 / 4) * 4), device="cuda").cpu().float().exp2().to(torch.float8_e8m0fnu).cuda()
+        )
         kw.update(a_tensor=a, b_tensor=b, sfa_tensor=sfa, sfb_tensor=sfb, sf_vec_size=32)
     kw["wgrad_tensor"] = torch.empty((local, m, n), dtype=torch.bfloat16, device="cuda")
     meta = dict(M=m, N=n, experts=local, tokens=tokens, empty=sum(1 for x in groups if x == 0), min=min(groups), max=max(groups))
@@ -107,13 +122,28 @@ def main():
         mig1 = pgmig()
         med = {arm: statistics.median(v) for arm, v in samples.items()}
         ratios = sorted(c / l for c, l in zip(samples["counter"], samples["clc"]))
-        row = dict(shape=args.shape, ep=args.ep, precision=args.precision, gemm=gemm, **meta, clc_us=med["clc"], counter_us=med["counter"],
-                   ratio_median=statistics.median(ratios), ratio_q25=ratios[len(ratios) // 4], ratio_q75=ratios[3 * len(ratios) // 4], bytes_equal=same,
-                   pgmigrate_delta=mig1 - mig0, samples=samples)
+        row = dict(
+            shape=args.shape,
+            ep=args.ep,
+            precision=args.precision,
+            gemm=gemm,
+            **meta,
+            clc_us=med["clc"],
+            counter_us=med["counter"],
+            ratio_median=statistics.median(ratios),
+            ratio_q25=ratios[len(ratios) // 4],
+            ratio_q75=ratios[3 * len(ratios) // 4],
+            bytes_equal=same,
+            pgmigrate_delta=mig1 - mig0,
+            samples=samples,
+        )
         rows.append(row)
-        print(f"PERF {args.shape} ep{args.ep} {args.precision} {gemm} M={meta['M']} N={meta['N']} E={local} T={meta['tokens']} empty={meta['empty']} "
-              f"clc={med['clc']:.1f}us counter={med['counter']:.1f}us ratio={row['ratio_median']:.4f} [{row['ratio_q25']:.4f},{row['ratio_q75']:.4f}] "
-              f"bytes_equal={same} pgmig={mig1 - mig0}", flush=True)
+        print(
+            f"PERF {args.shape} ep{args.ep} {args.precision} {gemm} M={meta['M']} N={meta['N']} E={local} T={meta['tokens']} empty={meta['empty']} "
+            f"clc={med['clc']:.1f}us counter={med['counter']:.1f}us ratio={row['ratio_median']:.4f} [{row['ratio_q25']:.4f},{row['ratio_q75']:.4f}] "
+            f"bytes_equal={same} pgmig={mig1 - mig0}",
+            flush=True,
+        )
         for g in graphs.values():
             g.reset()
     if args.out:
