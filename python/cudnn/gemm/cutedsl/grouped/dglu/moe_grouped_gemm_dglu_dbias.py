@@ -83,6 +83,9 @@ class MoEGroupedGemmDgluDbiasBf16Kernel(StreamingInputSignalMixin):
 
     :param streaming_signal_capacity, use_pdl, launch_pdl_dependents_at_entry: a streaming input producer of A (the
         dispatched output gradient); see docs/operations/moe/streaming_signal_contract.md (section 4a).
+    :param streaming_signal_multi_batch_opening: With ``streaming_signal_capacity`` (default True): each batch opening
+        of the input signal scheduler also opens one batch for every other expert whose ready M tiles are complete, so
+        many small experts keep the SMs busy; False opens one batch per opening.  Ignored without a producer.
     """
 
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
@@ -148,6 +151,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel(StreamingInputSignalMixin):
         streaming_signal_capacity: Optional[int] = None,
         use_pdl: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
+        streaming_signal_multi_batch_opening: bool = True,
     ):
         # Validate FIX_PAD_SIZE compatibility with tile size
         mma_tile_m = mma_tiler_mn[0]
@@ -169,6 +173,7 @@ class MoEGroupedGemmDgluDbiasBf16Kernel(StreamingInputSignalMixin):
             unmet_requirement=None if weight_mode == MoEWeightMode.DENSE else "dense weights",
             use_pdl=use_pdl,
             launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
+            streaming_signal_multi_batch_opening=streaming_signal_multi_batch_opening,
         )
 
         self.glu_layout = validate_glu_layout(glu_layout)
