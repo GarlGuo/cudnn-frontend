@@ -299,6 +299,47 @@ generates the same code as without them):
 | `use_pdl=True` | The main kernel launches as the programmatic dependent of the kernel before it on the stream, so its setup (shared memory, barriers, scheduler state) overlaps that kernel's tail; every thread waits for that grid (`griddepcontrol.wait`) before its first global memory access. When the call launches the helper kernel (every block-scaled call; BF16 with TensorRagged inputs, discrete output or `atomic_counter_claim`), the helper launches the same way and waits for its predecessor at its start, and the main kernel waits for the helper: previous kernel, helper, main kernel. | Every configuration, BF16 and block-scaled. |
 | `launch_pdl_dependents_at_entry=True` | The main kernel lets its own programmatic dependent launch at its entry. The dependent must wait (`griddepcontrol.wait`) before it reads the wgrad output. | Every configuration, BF16 and block-scaled. |
 
+### Split launches on a caller-owned counter (MXFP8 kernel classes, experimental)
+
+The SM100/SM103 block-scaled kernel classes (stock, global-descriptor and
+A-reuse; the Rubin subclasses inherit them) take two more options for running
+one wgrad as several launches, each with its own persistent grid
+(`max_active_clusters`). One example is a "tail" on the SMs that a
+communication kernel frees, followed by a "base" on the rest. The API wrapper
+does not expose these options.
+
+- `scheduler_counter` (a `__call__` argument, with `atomic_counter_claim=True`)
+  is a caller-owned 1-D int32 tensor, with the same name and contract as on the
+  streaming-signal GEMMs.
+  - The clusters claim from `scheduler_counter[0]`, and no helper launch resets
+    it.
+  - The caller zeroes it once before the first launch of a group. Launches that
+    share it split one tile list, and each tile runs once.
+  - The global-descriptor and A-reuse kernels then launch nothing in front of
+    the GEMM. The stock kernel still launches its descriptor helper, so give each
+    concurrent launch its own workspace.
+- `pdl_mode` (constructor, with `use_pdl=True`; default `"wait_at_start"`, the
+  placement above) has two other values. They set the trigger themselves, so
+  they exclude `launch_pdl_dependents_at_entry`:
+  - `"wait_then_trigger"`: the same wait, then every thread lets the dependent
+    launch. The dependent starts only once this kernel's predecessor has ended.
+  - `"trigger_then_wait_at_exit"`: the dependent may launch at entry. There is no
+    wait in front; every thread waits for the predecessor as its last
+    instruction, so the grid still ends after it.
+    - **The caller guarantees that none of the GEMM's inputs (A, B, scale
+      factors, offsets, counter) is written by its predecessor.** Each must come
+      from a grid that had ended before the predecessor let this one launch, for
+      example a predecessor in `"wait_then_trigger"` mode.
+    - It is rejected where a helper kernel would be that predecessor: on the
+      stock kernels, and on the others with `atomic_counter_claim` but no
+      `scheduler_counter`.
+
+A split as a chain on one stream: the producers of A and B, then the tail
+(`pdl_mode="wait_then_trigger"`), then the base
+(`pdl_mode="trigger_then_wait_at_exit"`), with one counter zeroed before the
+producers. `test_grouped_gemm_wgrad_split_counter.py` checks this order, and
+two orders that break the guarantee.
+
 The BF16 kernel uses dynamic persistent scheduling. The token dimension is
 compiled dynamically, and the wrapper cache abstracts the token-sized axes of A
 and B while retaining static dimensions, layouts, dtypes, output descriptors,
