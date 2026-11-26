@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Rubin (SM107) MXFP8 wgrad keeping A in shared memory across the N tiles of a work unit, against the Rubin kernel.
+"""Rubin (SM107) MXFP8 wgrad keeping A in shared memory across the N tiles of a work unit, and the Rubin
+global-descriptor wgrad (the same without A reuse), against the Rubin kernel.
 
-The wgrad API does not pick this kernel; these tests force it in place of the Rubin kernel for dense output and
-compare dW bitwise with the discrete output mode, which runs the Rubin kernel on the same inputs. They run on Rubin
-only.
+The wgrad API picks neither kernel; these tests force one in place of the Rubin kernel for dense output and compare
+dW bitwise with the discrete output mode, which runs the Rubin kernel on the same inputs. They run on Rubin only.
 """
 
 import pytest
@@ -22,10 +22,12 @@ def require_rubin():
     from cudnn.api_base import get_device_type
 
     if not torch.cuda.is_available() or get_device_type() != "rubin":
-        pytest.skip("The Rubin A-reuse wgrad runs on SM107 only")
+        pytest.skip("The Rubin A-reuse and global-descriptor wgrads run on SM107 only")
 
 
-def _force_rubin_reuse(monkeypatch, a_stages=None):
+def _force_rubin_reuse(monkeypatch, a_stages=None, kernel_class=None):
+    """Make the API run ``kernel_class`` (default: the Rubin A-reuse kernel, with ``a_stages`` if given) for dense
+    output, on fresh wrapper caches."""
     import cudnn
     from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse_rubin import BlockScaledMoEGroupedGemmWgradReuseRubinKernel
 
@@ -35,7 +37,9 @@ def _force_rubin_reuse(monkeypatch, a_stages=None):
     def select(self):
         kernel = original(self)
         if self.weight_mode == MoEWeightMode.DENSE:
-            if a_stages is None:
+            if kernel_class is not None:
+                kernel = kernel_class
+            elif a_stages is None:
                 kernel = BlockScaledMoEGroupedGemmWgradReuseRubinKernel
             else:
 
@@ -70,3 +74,21 @@ def test_rubin_reuse_wgrad_matches_rubin_stock(monkeypatch, n, groups, experts, 
     reuse = _run(problem, "dense", counter=counter)
     stock = _run(problem, "discrete", counter=counter)
     assert_bitwise({"wgrad": reuse}, snapshot({"wgrad": stock}), "Rubin A reuse vs Rubin stock")
+
+
+# The global-descriptor kernel has no N-unit constraint: also one N tile, with a last expert shorter than one SF atom
+# (96 tokens) and data after it.
+DENSE_CASES = CASES + [pytest.param(256, (384, 0, 1024, 96, 160), 4, id="n256-one-n-tile", marks=pytest.mark.L1)]
+
+
+@pytest.mark.parametrize("n, groups, experts", DENSE_CASES)
+@pytest.mark.parametrize("counter", [False, True], ids=["clc", "counter"])
+def test_rubin_dense_wgrad_matches_rubin_stock(monkeypatch, n, groups, experts, counter):
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+
+    picked = _force_rubin_reuse(monkeypatch, kernel_class=BlockScaledMoEGroupedGemmWgradDenseRubinKernel)
+    problem = _problem(groups, experts, seed=17, n=n)
+    dense = _run(problem, "dense", counter=counter)
+    stock = _run(problem, "discrete", counter=counter)
+    assert BlockScaledMoEGroupedGemmWgradDenseRubinKernel in picked
+    assert_bitwise({"wgrad": dense}, snapshot({"wgrad": stock}), "Rubin global descriptors vs Rubin stock")
