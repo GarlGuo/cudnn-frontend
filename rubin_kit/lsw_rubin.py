@@ -10,13 +10,16 @@ Env: FE_PYTHON (the cuDNN-FE python/ root of the tree under test; the compiled m
 Arms (kernel classes constructed directly, so nothing depends on the API's selection):
   stock        the Rubin wgrad (BlockScaledMoEGroupedGemmWgradRubinKernel): what the API runs on Rubin today
   stock2       A/A control (a second instance of stock)
+  dense_rubin  2.a on Rubin: the Rubin global-descriptor wgrad (BlockScaledMoEGroupedGemmWgradDenseRubinKernel), same
+               K64 MMA, 256-token K tile and TMEM plan as stock and reuse; reuse without the A reuse
+  reuse        2.a + 2.b: the Rubin A-reuse wgrad (BlockScaledMoEGroupedGemmWgradReuseRubinKernel), a_stages = a_stages_for(rows, experts)
   dense        the SM100 global-descriptor wgrad (BlockScaledMoEGroupedGemmWgradDenseKernel), forced: SM100 K32 MMA
   stock_sm100  the SM100 stock wgrad, forced: the bit reference of dense (same MMA)
-  reuse        the Rubin A-reuse wgrad (BlockScaledMoEGroupedGemmWgradReuseRubinKernel), a_stages = a_stages_for(rows, experts)
-On SM100 the "stock" and "reuse" arms are the SM100 classes (smoke test of the harness only).
+On SM100 the "stock", "dense_rubin" and "reuse" arms are the SM100 classes (smoke test of the harness only).
 
-Byte checks per GEMM: stock2, reuse vs stock (expected 0 differing bytes); dense vs stock_sm100 (expected 0); dense vs
-stock (a different MMA K, so bits may differ: reported as the differing count and the max |diff| / max |stock|).
+Byte checks per GEMM: stock2, dense_rubin and reuse vs stock, reuse vs dense_rubin (expected 0 differing bytes); dense
+vs stock_sm100 (expected 0); dense vs stock (a different MMA K, so bits may differ: reported as the differing count and
+the max |diff| / max |stock|).
 Shape: T * top_k * ep / E rows per local expert (balanced), padded to 256; K-major FP8 A/B, random E8M0 scales, BF16 dW.
 """
 import argparse, json, os, sys, time, types
@@ -85,11 +88,12 @@ def main():
     if rubin:
         from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_rubin import BlockScaledMoEGroupedGemmWgradRubinKernel as Stock
         from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse_rubin import BlockScaledMoEGroupedGemmWgradReuseRubinKernel as Reuse
+        from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel as DenseRubin
     else:
-        Stock = StockSm100
+        Stock, DenseRubin = StockSm100, Dense
         from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel as Reuse
-    classes = dict(stock=Stock, stock2=Stock, dense=Dense, stock_sm100=StockSm100, reuse=Reuse)
-    names = [x for x in os.environ.get("LSW_ARMS", "stock,dense,reuse,stock2,stock_sm100").split(",") if x]
+    classes = dict(stock=Stock, stock2=Stock, dense_rubin=DenseRubin, dense=Dense, stock_sm100=StockSm100, reuse=Reuse)
+    names = [x for x in os.environ.get("LSW_ARMS", "stock,dense_rubin,reuse,stock2,dense,stock_sm100").split(",") if x]
     assert names[0] == "stock", "the first arm is the reference"
 
     out = open(f"{args.out}.r{rank}", "a")
@@ -172,6 +176,8 @@ def main():
                 continue
             rec[f"{arm}_diff_bytes"] = int((o.view(torch.uint16) != ref).sum().item())
             rec[f"{arm}_nan"] = int(torch.isnan(o).sum().item())
+        if "reuse" in outs and "dense_rubin" in outs:
+            rec["reuse_vs_dense_rubin_diff_bytes"] = int((outs["reuse"].view(torch.uint16) != outs["dense_rubin"].view(torch.uint16)).sum().item())
         if "dense" in outs and "stock_sm100" in outs:
             rec["dense_vs_stock_sm100_diff_bytes"] = int((outs["dense"].view(torch.uint16) != outs["stock_sm100"].view(torch.uint16)).sum().item())
         if "dense" in outs:
@@ -180,8 +186,7 @@ def main():
         emit(rec)
         del outs
         pairs += [(f"{gname}_{x}", f"{gname}_stock") for x in names if x != "stock"]
-        if "reuse" in names and "dense" in names:
-            pairs.append((f"{gname}_reuse", f"{gname}_dense"))
+        pairs += [(f"{gname}_{x}", f"{gname}_{y}") for x, y in (("reuse", "dense_rubin"), ("reuse", "dense")) if x in names and y in names]
     torch.cuda.empty_cache()
     lockstep.run(arms, pairs, emit, args.budget, args.reps, flush, t_start)
 

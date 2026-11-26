@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Tables from lsw_rubin.py output: python agg_rubin.py <files with one JSON record per line (optionally "KP "-prefixed)>
-Cell = median over passes of the per-pass ratio (95% CI: bootstrap over passes). "2.a+2.b (EPC rule)": reuse where the
-rule picks it, else the fallback arm; the refined rule also needs more than one work unit per M tile (n / 256 > n_group)."""
+Cell = median over passes of the per-pass ratio (95% CI: bootstrap over passes). "auto_<rule>_<fallback>" (2.a+2.b): reuse
+where the rule picks it, else the fallback arm; EPC rule = ReuseRubin.can_implement, refined rule also needs more than one
+work unit per M tile (n / 256 > n_group). Per mode two tables: Rubin-native (dense_rubin = 2.a, reuse = 2.a + 2.b, same
+K64 MMA) and continuity with the earlier runs (the SM100 arms dense and stock_sm100)."""
 import sys, json, math, random, statistics as st, collections
 
 MORDER = ["deepseek_v3", "qwen35_122b", "qwen35_397b", "glm53_flash", "qwen38_2p4t"]
@@ -43,7 +45,7 @@ def boot(v, n=1000):
 
 def t(p, k, g, arm):
     if arm.startswith("auto"):
-        rule, fb = arm.split("_")[1:]  # auto_<epc|ref>_<fallback arm>
+        _, rule, fb = arm.split("_", 2)  # auto_<epc|ref>_<fallback arm>
         pick = rules[(*k, g)]["epc_reuse" if rule == "epc" else "refined_reuse"]
         return p[f"{g}_reuse"] if pick else p[f"{g}_{fb}"]
     return p[f"{g}_{arm}"]
@@ -60,38 +62,54 @@ print(f"checks: {len(checks)} records; build errors: {len(errs)}")
 for r in errs:
     print("BUILD_ERROR", r["model"], r["ep"], r["arm"], r["error"][-300:])
 for r in checks:
-    # dense and stock_sm100 vs the Rubin stock may differ (SM100 K32 vs Rubin K64 MMA); dense vs stock_sm100 may not.
+    # dense and stock_sm100 vs the Rubin stock may differ (SM100 K32 vs Rubin K64 MMA); dense vs stock_sm100, dense_rubin
+    # and reuse vs stock, and reuse vs dense_rubin may not.
     bad = {x: v for x, v in r.items() if (x.endswith("_diff_bytes") and x not in ("dense_diff_bytes", "stock_sm100_diff_bytes")) or x.endswith("_nan")}
     flag = "OK" if not any(bad.values()) else "DIFF"
     print(f"CHECK {flag} {r['model']} EP{r['ep']} {r['gemm']} " + " ".join(f"{x}={v}" for x, v in r.items() if "diff" in x or "nan" in x or "err" in x))
 shapes = sorted({(m, e) for (_, m, e) in passes}, key=lambda s: (s[1], MORDER.index(s[0])))
 arms_avail = set(next(iter(passes.values()))[0]) if passes else set()
 has = lambda a: f"dW1_{a}" in arms_avail
+TABLES = [
+    ("Rubin-native: 2.a (dense_rubin) and 2.a + 2.b (reuse), K64 MMA",
+     [("dense_rubin", "stock"), ("reuse", "stock"), ("reuse", "dense_rubin"), ("auto_epc_dense_rubin", "dense_rubin"),
+      ("auto_ref_dense_rubin", "dense_rubin"), ("auto_epc_dense_rubin", "stock"), ("auto_ref_dense_rubin", "stock"), ("stock2", "stock")]),
+    ("continuity: SM100 arms (dense = SM100 2.a forced, K32 MMA)",
+     [("dense", "stock"), ("reuse", "dense"), ("auto_epc_stock", "stock"), ("auto_ref_stock", "stock"), ("auto_epc_dense", "dense"),
+      ("auto_ref_dense", "dense"), ("stock_sm100", "stock"), ("dense_rubin", "dense")]),
+]
+
+
+def arm_of(a):
+    return a.split("_", 2)[2] if a.startswith("auto") else a
+
+
 for c in sorted({c for (c, _, _) in passes}):
-    print(f"\n### {'atomic counter' if c else 'CLC'}\n")
-    cols = [("dense", "stock"), ("reuse", "stock"), ("reuse", "dense"), ("auto_epc_stock", "stock"), ("auto_ref_stock", "stock"),
-            ("auto_epc_dense", "dense"), ("auto_ref_dense", "dense"), ("stock2", "stock"), ("stock_sm100", "stock")]
-    cols = [(x, y) for x, y in cols if all(has(a.split("_")[-1] if a.startswith("auto") else a) for a in (x, y)) and (not x.startswith("auto") or has("reuse"))]
-    print("| Model | EP | GEMM | rows/expert (A stages) | EPC rule | refined | stock (us) | " + " | ".join(f"{x} / {y}" for x, y in cols) + " | passes (GPUs) |")
-    print("|" + " --- |" * (7 + len(cols) + 1))
-    agg = collections.defaultdict(list)
-    for g in ("dW1", "dW2", "layer"):
-        for k in shapes:
-            if g == "layer":
-                ru = "/".join("R" if rules[(*k, h)]["epc_reuse"] else "-" for h in ("dW1", "dW2"))
-                rf = "/".join("R" if rules[(*k, h)]["refined_reuse"] else "-" for h in ("dW1", "dW2"))
-            else:
-                ru = "reuse" if rules[(*k, g)]["epc_reuse"] else "-"
-                rf = "reuse" if rules[(*k, g)]["refined_reuse"] else "-"
-            cells = []
-            for x, y in cols:
-                r, ci, uy, n = ratio(c, k, g, x, y)
-                agg[(g, x, y)].append(r)
-                cells.append(f"{r:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]")
-            uy = ratio(c, k, g, "stock", "stock")[2]
-            print(f"| {k[0]} | {k[1]} | {'dW1 + dW2' if g == 'layer' else g} | {per[k][0]} ({per[k][1]}) | {ru} | {rf} | {uy:.1f} | " + " | ".join(cells) + f" | {n} ({len(meta[(c, *k)])}) |")
-    print("\n| Geomean | " + " | ".join(f"{x} / {y}" for x, y in cols) + " |")
-    print("|" + " --- |" * (len(cols) + 1))
-    for g in ("dW1", "dW2", "layer"):
-        print(f"| {g} | " + " | ".join(f"{gm(agg[(g, x, y)]):.3f}" for x, y in cols) + " |")
-    print("| all 20 GEMMs | " + " | ".join(f"{gm(agg[('dW1', x, y)] + agg[('dW2', x, y)]):.3f}" for x, y in cols) + " |")
+    for title, cols in TABLES:
+        cols = [(x, y) for x, y in cols if all(has(arm_of(a)) for a in (x, y)) and (not x.startswith("auto") or has("reuse"))]
+        if not cols:
+            continue
+        print(f"\n### {'atomic counter' if c else 'CLC'}: {title}\n")
+        print("| Model | EP | GEMM | rows/expert (A stages) | EPC rule | refined | stock (us) | " + " | ".join(f"{x} / {y}" for x, y in cols) + " | passes (GPUs) |")
+        print("|" + " --- |" * (7 + len(cols) + 1))
+        agg = collections.defaultdict(list)
+        for g in ("dW1", "dW2", "layer"):
+            for k in shapes:
+                if g == "layer":
+                    ru = "/".join("R" if rules[(*k, h)]["epc_reuse"] else "-" for h in ("dW1", "dW2"))
+                    rf = "/".join("R" if rules[(*k, h)]["refined_reuse"] else "-" for h in ("dW1", "dW2"))
+                else:
+                    ru = "reuse" if rules[(*k, g)]["epc_reuse"] else "-"
+                    rf = "reuse" if rules[(*k, g)]["refined_reuse"] else "-"
+                cells = []
+                for x, y in cols:
+                    r, ci, uy, n = ratio(c, k, g, x, y)
+                    agg[(g, x, y)].append(r)
+                    cells.append(f"{r:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]")
+                uy = ratio(c, k, g, "stock", "stock")[2]
+                print(f"| {k[0]} | {k[1]} | {'dW1 + dW2' if g == 'layer' else g} | {per[k][0]} ({per[k][1]}) | {ru} | {rf} | {uy:.1f} | " + " | ".join(cells) + f" | {n} ({len(meta[(c, *k)])}) |")
+        print("\n| Geomean | " + " | ".join(f"{x} / {y}" for x, y in cols) + " |")
+        print("|" + " --- |" * (len(cols) + 1))
+        for g in ("dW1", "dW2", "layer"):
+            print(f"| {g} | " + " | ".join(f"{gm(agg[(g, x, y)]):.3f}" for x, y in cols) + " |")
+        print("| all 20 GEMMs | " + " | ".join(f"{gm(agg[('dW1', x, y)] + agg[('dW2', x, y)]):.3f}" for x, y in cols) + " |")
