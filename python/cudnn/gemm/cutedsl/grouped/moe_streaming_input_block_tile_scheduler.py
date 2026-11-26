@@ -537,9 +537,7 @@ class MoEStreamingInputBlockSignalTileScheduler:
         lane_m_tiles = Int32(0)
         if lane_idx == top_lane:
             lane_m_tiles = m_tile_count
-        elif lane_run_complete:
-            if lane_expert != expert:
-                lane_m_tiles = lane_ready_m_tile_count
+        # Experiment: one batch per opening (the other lanes' complete runs are not published).
         # Exclusive prefix of the other lanes' M tiles in lane order, after the chosen batch.
         other_m_tiles = lane_m_tiles
         if lane_idx == top_lane:
