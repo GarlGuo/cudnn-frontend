@@ -83,15 +83,6 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             and cls.short_experts(tokens, experts, a_stages)
         )
 
-    @staticmethod
-    def _sf_atom(k_tile, sf_k, sf_k_atoms: int, k_atoms):
-        """The expert's SF atom (within a 128-row block) for atom ``sf_k`` of K tile ``k_tile``. With more than one
-        atom per K tile, a partial last K tile can end inside its first atom: its later atoms repeat the expert's
-        last one, whose scale factors then multiply only the zeros the bounded A and B loads put there."""
-        if sf_k_atoms == 1:
-            return k_tile
-        return cutlass.min(k_tile * sf_k_atoms + sf_k, k_atoms - 1)
-
     def _setup_attributes(self) -> None:
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
         self.mma_inst_shape_mn_sfb = (
