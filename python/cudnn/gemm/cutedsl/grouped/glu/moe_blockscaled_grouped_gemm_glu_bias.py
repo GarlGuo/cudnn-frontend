@@ -325,6 +325,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         use_pdl: bool = False,
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         compact_sfa_sf_warp: bool = False,
+        regcap_setmaxnreg: Optional[Tuple[int, int]] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -439,6 +440,13 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
             warps_wo_sched.append(self.sf_warp_id)
         self.threads_per_cta = self.threads_per_warp * len(all_warps)
         self.threads_wo_sched = self.threads_per_warp * len(warps_wo_sched)
+        # Experimental: (producer, epilogue) registers via setmaxnreg on a 9-warp CTA (launch count 168): warps 4-7
+        # drop to producer after the prologue, the epilogue warps 0-3 rise to epilogue; epilogue + producer <= 336.
+        self.regcap_setmaxnreg = None if regcap_setmaxnreg is None else tuple(int(x) for x in regcap_setmaxnreg)
+        if self.regcap_setmaxnreg is not None:
+            prod, epi = self.regcap_setmaxnreg
+            if len(all_warps) != 9 or prod % 8 or epi % 8 or not 24 <= prod <= 168 <= epi <= 256 or prod + epi > 336:
+                raise ValueError(f"regcap_setmaxnreg {self.regcap_setmaxnreg}: 9 warps, multiples of 8, prod + epi <= 336")
 
         # Set barrier for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -2067,6 +2075,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         if not self.device_layout and total_token <= 0:
             cute.arch.nvvm.exit()
 
+        if cutlass.const_expr(self.regcap_setmaxnreg is not None):
+            if warp_idx >= self.mma_warp_id and warp_idx < self.mma_warp_id + 4:
+                cute.arch.setmaxregister_decrease(self.regcap_setmaxnreg[0])
+
         self.streaming_input_trigger_warp(warp_idx, scheduler)
 
         #
@@ -2710,6 +2722,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
+            if cutlass.const_expr(self.regcap_setmaxnreg is not None):
+                cute.arch.setmaxregister_increase(self.regcap_setmaxnreg[1])
             #
             # Alloc tensor memory buffer
             #
