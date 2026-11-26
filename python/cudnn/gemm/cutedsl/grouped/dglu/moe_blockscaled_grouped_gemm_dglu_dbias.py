@@ -413,6 +413,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         self.num_epilog_warps = len(self.epilog_warp_id)
 
         self.discrete_col_sfd = discrete_col_sfd
+        # Experiment switch for the staged E8M0 stores (see __call__): off by default (the per-subtile stores); a kernel
+        # A/B over 15 MXFP8 dGLU shapes measured no gain from staging (dynamic scheduler +0.5%, signal scheduler +0.0%).
+        self.stage_sfd_smem_opt = False
+        self.stage_sfd_smem = False
         self.weight_mode = weight_mode
 
         self.act_func = act_func
@@ -561,8 +565,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             self.occupancy,
             self.store_d_directly,
             self.generate_dbias,
-            # The column SFD's scratch: 64 FP32 per epilogue warp.
-            4 * 64 * self.num_epilog_warps if self.generate_sfd else 0,
+            # The column SFD's scratch: 64 FP32 per epilogue warp; the staged E8M0 tile.
+            (4 * 64 * self.num_epilog_warps if self.generate_sfd else 0) + (4096 if self.stage_sfd_smem else 0),
         )
 
         # Compute A/B/D/Scale shared memory layout
@@ -856,6 +860,22 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
 
         # Before _setup_attributes: it sizes the column SFD's scratch.
         self.generate_sfd = self._generates_sfd()
+        # MXFP8 dH with per-expert column SF atoms and whole 512-column D tiles: each CTA tile's E8M0 bytes (2 KB of row
+        # atoms, four 512 B column atoms, each contiguous in global memory) are staged in shared memory in global byte
+        # order and stored 32 bytes per epilogue thread once per tile, instead of 4-byte row and 1-byte column stores
+        # every two subtiles.
+        self.stage_sfd_smem = (
+            self.stage_sfd_smem_opt
+            and self.generate_sfd
+            and self.discrete_col_sfd
+            and self.glu_layout == "interleaved_32"
+            and self.use_2cta_instrs
+            and tuple(self.mma_tiler[:2]) == (256, 256)
+            and self.num_epilog_warps == 4
+            and cute.is_static(d.shape[1])
+            and cute.size(d, mode=[1]) % 512 == 0
+            and self.d_layout == LayoutEnum.ROW_MAJOR
+        )
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes()
@@ -1129,6 +1149,11 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                     128 * self.epi_tile[1] * 2 if self.generate_dbias else 1,
                 ],
                 128 if self.generate_dbias else 4,
+            ]
+            # stage_sfd_smem: a CTA tile's E8M0 bytes, [0, 2048) row atoms, [2048, 4096) four 512 B column atoms
+            sSFDStage: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Int32, 1024 if self.stage_sfd_smem else 0],
+                16,
             ]
             # The column SFD: per epilogue warp, 32 column maxima then 32 column scales
             sColScratch: cute.struct.Align[
@@ -1580,6 +1605,34 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         src_vf32x8 = cute.logical_divide(src_f32, vec_shape)
         for ei in cutlass.range_constexpr(dst_vf32x8.shape[1]):
             self.stg_256(dst_vf32x8[None, ei].iterator.llvm_ptr, src_vf32x8[None, ei].load())
+
+    @cute.jit
+    def store_staged_sfd_tile(self, sSFDStage, mSFDRow_mnl, mSFDCol_mnl, n_d, epi_ext, work_tile_info, tiled_mma, mma_tile_coord_v, tidx):
+        """stage_sfd_smem: store the CTA tile's staged E8M0 bytes, 32 per epilogue thread. Threads 0-63 store the 2 KB of
+        row atoms (contiguous in the row SFD); threads 64-127 store the four 512 B column atoms, each contiguous in the
+        expert's column SFD (byte N * s / 32 + (c // 128) * 4 * n + (r // 128) * 512 + ... for expert rows s .. s + n).
+        The caller's barrier after the subtile loop orders every thread's staging stores before these loads."""
+        row0 = (work_tile_info.tile_m_idx // cute.size(tiled_mma.thr_id.shape)) * self.mma_tiler[0] + mma_tile_coord_v * self.cta_tile_shape_mnk[0]
+        words = cute.make_rmem_tensor(cute.make_layout(8), cutlass.Int32)
+        for word in cutlass.range_constexpr(8):
+            words[word] = sSFDStage[tidx * 8 + word]
+        addr = cutlass.Int64(0)
+        if tidx < 64:
+            addr = (
+                mSFDRow_mnl.iterator.toint()
+                + cutlass.Int64((epi_ext.token_offset + row0) // 128) * cutlass.Int64(4 * n_d)
+                + cutlass.Int64(work_tile_info.tile_n_idx * 2048 + tidx * 32)
+            )
+        else:
+            column_thread = tidx - 64
+            addr = (
+                mSFDCol_mnl.iterator.toint()
+                + cutlass.Int64(epi_ext.token_offset) * cutlass.Int64(n_d // 32)
+                + cutlass.Int64(work_tile_info.tile_n_idx * 4 + column_thread // 16) * cutlass.Int64(4 * epi_ext.tokens_i)
+                + cutlass.Int64((row0 // 128) * 512 + (column_thread % 16) * 32)
+            )
+        dst = cute.make_tensor(cute.make_ptr(cutlass.Int32, addr, AddressSpace.gmem, assumed_align=32), cute.make_layout(8))
+        self.store_global_memory_256b(dst, words)
 
     @cute.jit
     def create_and_partition_new_SFDCol(
@@ -2957,6 +3010,9 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                 d_rcp_limits = get_dtype_rcp_limits(self.d_dtype)
                 sColScratch = storage.sColScratch.get_tensor(cute.make_layout((64, self.num_epilog_warps), stride=(1, 64)))
                 column_scratch = sColScratch[(None, warp_idx % self.num_epilog_warps)]
+                if cutlass.const_expr(self.stage_sfd_smem):
+                    sSFDStage = storage.sSFDStage.get_tensor(cute.make_layout(1024))
+                    sSFDStage_u8 = cute.make_tensor(cute.recast_ptr(sSFDStage.iterator, dtype=cutlass.Uint8), cute.make_layout(4096))
 
             # Extension for per-expert domain conversion in epilogue
             epi_ext = self._make_extension(workspace_ptr)
@@ -3348,59 +3404,79 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                             column_scratch,
                         )
 
-                        if subtile_idx % 2 == 1:
-                            local_m_tile = epi_work_tile_info.tile_m_idx
-                            local_n_tile = epi_work_tile_info.tile_n_idx
-                            sfd_row_idx_mn = (
-                                local_m_tile * self.epi_tile_cnt[0] + 0,
-                                local_n_tile * self.epi_tile_cnt[1] // 2 + (real_subtile_idx // 2),
-                            )
-                            sfd_col_idx_mn = sfd_row_idx_mn
-                            if cutlass.const_expr(self.discrete_col_sfd):
-                                sfd_col_idx_mn = (
+                        if cutlass.const_expr(self.stage_sfd_smem):
+                            if subtile_idx % 2 == 1:
+                                # The 4 row and 4 column scales of this thread for the 128 D columns of group
+                                # real_subtile_idx // 2, into the staged tile in global byte order: row atom bytes
+                                # g * 512 + (row % 32) * 16 + (row // 32) * 4 + slot (one 32-bit word per thread); column
+                                # atom bytes 2048 + g * 512 + (column % 32) * 16 + slot * 4 + 32-row block.
+                                if cutlass.const_expr(not self.use_fp8_ptx_cvt):
+                                    tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
+                                    tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
+                                else:
+                                    self.cvt_f32x4_to_f8x4(tCrSFDRow_pvscale, tCrSFDRow)
+                                    self.cvt_f32x4_to_f8x4(tCrSFDCol_pvscale, tCrSFDCol)
+                                stage_lane = tidx % 32
+                                stage_warp = warp_idx % self.num_epilog_warps
+                                stage_group = real_subtile_idx // 2
+                                sSFDStage[stage_group * 128 + stage_lane * 4 + stage_warp] = cute.recast_tensor(tCrSFDRow, cutlass.Int32)[0]
+                                col_bytes = cute.recast_tensor(tCrSFDCol, cutlass.Uint8)
+                                for scale_slot in cutlass.range_constexpr(4):
+                                    sSFDStage_u8[2048 + stage_group * 512 + stage_lane * 16 + scale_slot * 4 + stage_warp] = col_bytes[scale_slot]
+                        if cutlass.const_expr(not self.stage_sfd_smem):
+                            if subtile_idx % 2 == 1:
+                                local_m_tile = epi_work_tile_info.tile_m_idx
+                                local_n_tile = epi_work_tile_info.tile_n_idx
+                                sfd_row_idx_mn = (
                                     local_m_tile * self.epi_tile_cnt[0] + 0,
                                     local_n_tile * self.epi_tile_cnt[1] // 2 + (real_subtile_idx // 2),
                                 )
+                                sfd_col_idx_mn = sfd_row_idx_mn
+                                if cutlass.const_expr(self.discrete_col_sfd):
+                                    sfd_col_idx_mn = (
+                                        local_m_tile * self.epi_tile_cnt[0] + 0,
+                                        local_n_tile * self.epi_tile_cnt[1] // 2 + (real_subtile_idx // 2),
+                                    )
 
-                            tCgSFDRow = tCgSFDRow_mn[
-                                (
-                                    None,
-                                    None,
-                                    None,
-                                    *sfd_row_idx_mn,
-                                )
-                            ]
-                            tCgSFDCol = tCgSFDCol_mn[
-                                (
-                                    None,
-                                    None,
-                                    None,
-                                    *sfd_col_idx_mn,
-                                )
-                            ]
-                            if cutlass.const_expr(not self.use_fp8_ptx_cvt):
-                                tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
-                                tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
-                            else:
-                                self.cvt_f32x4_to_f8x4(tCrSFDRow_pvscale, tCrSFDRow)
-                                self.cvt_f32x4_to_f8x4(tCrSFDCol_pvscale, tCrSFDCol)
-                            if cutlass.const_expr(self.glu_layout == "gate_then_up"):
-                                # Each thread owns one row scale and one column
-                                # scale per 32-column branch tile. Scatter only
-                                # these scale bytes to canonical atoms; payloads
-                                # use TMA above. No global scale repack is needed.
-                                two_n = cute.size(mSFDRow_mnl, mode=[1])
-                                for scale_slot in cutlass.range_constexpr(4):
-                                    paired_n = sfd_row_idx_mn[1] * 128 + scale_slot * 32
-                                    canonical_n = self.canonical_glu_column(paired_n, two_n)
-                                    if paired_n < two_n:
-                                        real_sfd_row[(mPosition, canonical_n, 0)] = tCrSFDRow[scale_slot]
-                                        real_sfd_col[(mPosition - tidx % 32, canonical_n + tidx % 32, 0)] = tCrSFDCol[scale_slot]
-                            else:
-                                if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
-                                    cute.autovec_copy(tCrSFDRow, tCgSFDRow)
-                                if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
-                                    cute.autovec_copy(tCrSFDCol, tCgSFDCol)
+                                tCgSFDRow = tCgSFDRow_mn[
+                                    (
+                                        None,
+                                        None,
+                                        None,
+                                        *sfd_row_idx_mn,
+                                    )
+                                ]
+                                tCgSFDCol = tCgSFDCol_mn[
+                                    (
+                                        None,
+                                        None,
+                                        None,
+                                        *sfd_col_idx_mn,
+                                    )
+                                ]
+                                if cutlass.const_expr(not self.use_fp8_ptx_cvt):
+                                    tCrSFDRow.store(tCrSFDRow_pvscale.load().to(self.sf_dtype))
+                                    tCrSFDCol.store(tCrSFDCol_pvscale.load().to(self.sf_dtype))
+                                else:
+                                    self.cvt_f32x4_to_f8x4(tCrSFDRow_pvscale, tCrSFDRow)
+                                    self.cvt_f32x4_to_f8x4(tCrSFDCol_pvscale, tCrSFDCol)
+                                if cutlass.const_expr(self.glu_layout == "gate_then_up"):
+                                    # Each thread owns one row scale and one column
+                                    # scale per 32-column branch tile. Scatter only
+                                    # these scale bytes to canonical atoms; payloads
+                                    # use TMA above. No global scale repack is needed.
+                                    two_n = cute.size(mSFDRow_mnl, mode=[1])
+                                    for scale_slot in cutlass.range_constexpr(4):
+                                        paired_n = sfd_row_idx_mn[1] * 128 + scale_slot * 32
+                                        canonical_n = self.canonical_glu_column(paired_n, two_n)
+                                        if paired_n < two_n:
+                                            real_sfd_row[(mPosition, canonical_n, 0)] = tCrSFDRow[scale_slot]
+                                            real_sfd_col[(mPosition - tidx % 32, canonical_n + tidx % 32, 0)] = tCrSFDCol[scale_slot]
+                                else:
+                                    if sfd_row_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDRow_mnl.layout, mode=[1])):
+                                        cute.autovec_copy(tCrSFDRow, tCgSFDRow)
+                                    if sfd_col_idx_mn[1] * 32 * regPerSubtile < cute.size(cute.shape(mSFDCol_mnl.layout, mode=[1])):
+                                        cute.autovec_copy(tCrSFDCol, tCgSFDCol)
                     else:
                         #
                         # Convert to D type
@@ -3501,6 +3577,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                                 )
                             # Fence and barrier to make sure shared memory store is visible to TMA store
                             d_pipeline.producer_commit()
+                    self.epilog_sync_barrier.arrive_and_wait()
+
+                if cutlass.const_expr(self.stage_sfd_smem):
+                    self.store_staged_sfd_tile(
+                        sSFDStage, mSFDRow_mnl, mSFDCol_mnl, cute.size(mD_mnl, mode=[1]), epi_ext, epi_work_tile_info, tiled_mma, mma_tile_coord_v, tidx
+                    )
+                    # The next tile's staging stores wait for this tile's loads.
                     self.epilog_sync_barrier.arrive_and_wait()
 
                 #
