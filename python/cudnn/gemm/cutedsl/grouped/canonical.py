@@ -207,7 +207,8 @@ def kernel_facing_mx(tensor):
     """Canonical (m, x) -> (m, x, 1) with the dense unit-L stride; rank 3 passes through.
 
     The unit-L stride m * x is formed in 64 bits, as in the rank-3 fakes: m * x passes 2^31 elements at
-    realistic token counts, and a wrapped 32-bit stride would reach the TMA descriptor.
+    realistic token counts. The L mode has size 1, so the stride is not used for addressing today, but it must
+    not wrap if that changes.
     """
     if tensor is None or cute.rank(tensor) != 2:
         return tensor
