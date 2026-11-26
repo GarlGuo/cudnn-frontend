@@ -19,14 +19,14 @@ it issues the SM100 K32 MMA (`kind::mxf8f6f4.block_scale.block32`), not the Rubi
 cannot match the Rubin wgrad's. The harness forces it as an arm, so we learn whether it is correct and fast on Rubin.
 
 Two ways to get the kit:
-- Kit branch `wip/wgrad-rubin-kit`. It is `wip/wgrad-areuse-v2` @ 59c2b32e3 plus one commit that adds only
+- Kit branch `wip/wgrad-rubin-kit`. It is `wip/wgrad-areuse-v2` @ 59c2b32e3 plus kit-only commits that add only
   `rubin_kit/` (these files) at the repo root. One worktree then gives both the code under test and the kit.
 - The files sent verbatim by message: save them unchanged into one directory.
 
 ```
 git fetch https://github.com/GarlGuo/cudnn-frontend.git wip/wgrad-rubin-kit wip/wgrad-areuse-v2
 git worktree add ../w_wgrad2 FETCH_HEAD      # the wip/wgrad-rubin-kit head; its parent is 59c2b32e3
-git -C ../w_wgrad2 log --oneline -2          # expect: the kit commit, then 59c2b32e3
+git -C ../w_wgrad2 log --oneline -3          # expect: kit-only commits (rubin_kit/), then 59c2b32e3
 ```
 Kit dir: `../w_wgrad2/rubin_kit` (or wherever you saved the files). The code under test: `../w_wgrad2/python`.
 
