@@ -324,6 +324,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         use_pdl: bool = False,
         launch_pdl_dependents_at_all_streaming_signal_slots_ready: bool = False,
         compact_sfa_sf_warp: bool = False,
+        launch_pdl_dependents_at_entry: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -381,6 +382,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
             device_layout=device_layout,
             use_pdl=use_pdl,
             launch_pdl_dependents_at_all_streaming_signal_slots_ready=launch_pdl_dependents_at_all_streaming_signal_slots_ready,
+            launch_pdl_dependents_at_entry=launch_pdl_dependents_at_entry,
         )
         check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
@@ -1830,6 +1832,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         """
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        # Experiment: launch_pdl_dependents_at_entry lets the dependent grid launch here.
+        self.streaming_input_entry()
         lane_idx = cute.arch.lane_idx()
 
         #
