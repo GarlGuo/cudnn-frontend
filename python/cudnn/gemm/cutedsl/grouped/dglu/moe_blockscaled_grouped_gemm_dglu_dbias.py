@@ -345,8 +345,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # Experimental (wip/dglu-regcap): (producer, epilogue, sf) per-thread registers via setmaxnreg on the 9-warp
         # compact-SFA CTA, whose launch count is 168 (3 warps on SM sub-partition 0).  Warpgroup 1 (warps 4-7: MMA, TMA,
         # C load, scheduler) drops to ``producer``, the SF warp 8 (alone in warpgroup 2) to ``sf`` (0: unchanged), and
-        # the epilogue warpgroup 0 rises to ``epilogue``.  Both the per-CTA pool and sub-partition 0 (warps 0, 4, 8)
-        # must cover the increase.
+        # the epilogue warpgroup 0 rises to ``epilogue``.  Measured on GB200: the increase is served per SM
+        # sub-partition from that sub-partition's launch share, so on sub-partitions 1-3 (two warps each: epilogue
+        # warp i and warpgroup-1 warp 4 + i) epilogue + producer <= 2 * 168 = 336; (96, 256, 56) hangs, (96, 240, 56)
+        # and (96, 240, 0) run.  The SF warp's decrease frees registers only on sub-partition 0.
         self.regcap_setmaxnreg = None if regcap_setmaxnreg is None else tuple(int(x) for x in regcap_setmaxnreg)
         if self.regcap_setmaxnreg is not None:
             if not compact_sfa_sf_warp:
@@ -361,6 +363,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
                 raise ValueError(f"regcap_setmaxnreg: producer / sf <= {launch} <= epilogue, got {self.regcap_setmaxnreg}")
             if (epi - launch) * 128 > (launch - prod) * 128 + (launch - sf_eff) * 32:
                 raise ValueError(f"regcap_setmaxnreg: the per-CTA pool does not cover the epilogue increase {self.regcap_setmaxnreg}")
+            if epi + prod > 2 * launch:
+                raise ValueError(f"regcap_setmaxnreg: epilogue + producer must be <= {2 * launch} (SM sub-partitions 1-3), got {self.regcap_setmaxnreg}")
             if (epi + prod + sf_eff) * 32 > 16384:
                 raise ValueError(f"regcap_setmaxnreg: SM sub-partition 0 (warps 0, 4, 8) exceeds 16384 registers {self.regcap_setmaxnreg}")
 
