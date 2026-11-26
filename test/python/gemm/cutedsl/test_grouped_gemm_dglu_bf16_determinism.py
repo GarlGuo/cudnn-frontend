@@ -129,8 +129,8 @@ def test_bf16_deterministic_dprob(act_func, linear_offset, discrete, use_dynamic
 @pytest.mark.parametrize("act_func", ["dswiglu", "dgeglu"])
 def test_bf16_deterministic_dprob_expert_batch_invariance(act_func, glu_layout):
     """An expert's dprob and D bytes do not depend on which experts share the launch."""
-    if glu_layout == "gate_then_up" and (act_func != "dswiglu" or torch.cuda.get_device_capability() not in ((10, 0), (10, 3))):
-        pytest.skip("BF16 gate_then_up dGLU is dSwiGLU on SM100/103 only")
+    if glu_layout == "gate_then_up" and (act_func != "dswiglu" or torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7))):
+        pytest.skip("BF16 gate_then_up dGLU is dSwiGLU on SM100/103/107 only")
     group_m = (512, 256, 768)
     p = make_problem(group_m=group_m, tail_m=0, seed=1)
     # Natural ranks: A (m, k), C (m, 2n), prob/dprob (m,), B (experts, n, k).
