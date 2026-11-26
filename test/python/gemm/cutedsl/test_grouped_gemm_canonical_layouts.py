@@ -10,9 +10,6 @@ the pre-permuted kernel-facing views (legacy) and once through the canonical
 forms: A (sum_m, k) row-major, B (l, n, k) C-contiguous, SFA/SFB as dense
 C-contiguous buffers (physical atom shape or flat 1-D), prob (sum_m,) -- and
 requires identical results. Canonical calls return natural-shaped outputs.
-
-The last two tests cover canonical (m, x) operands whose m x x can pass 2^31 elements: one checks the unit-L stride
-type, the other runs operands past 2^31 elements.
 """
 
 import pytest
@@ -328,74 +325,47 @@ def test_grouped_gemm_canonical_requires_alpha(request, backward):
 
 @pytest.mark.L0
 def test_kernel_facing_mx_unit_l_stride_is_64_bit():
-    """The unit-L stride m x x of a canonical (m, x) operand is a 64-bit value when m is dynamic, as in the rank-3 fakes."""
+    """The unit-L stride of a canonical (m, x) operand is Int64 when m is dynamic, as in the rank-3 fakes."""
     import cutlass
     import cutlass.cute as cute
-
     from cudnn.gemm.cutedsl.grouped.canonical import kernel_facing_mx
 
-    seen = {}
+    seen = []
 
     @cute.jit
     def trace(tensor: cute.Tensor):
-        stride = kernel_facing_mx(tensor).stride[2]
-        seen["stride"] = (type(stride).__name__, cute.is_static(stride))
+        seen.append(type(kernel_facing_mx(tensor).stride[2]).__name__)
 
-    dynamic_m = cute.runtime.make_fake_compact_tensor(cutlass.BFloat16, (cute.sym_int(divisibility=256), 7168), stride_order=(1, 0), assumed_align=16)
-    cute.compile(trace, dynamic_m)
-    assert seen["stride"] == ("Int64", False)
-    static_m = cute.runtime.make_fake_compact_tensor(cutlass.BFloat16, (512, 7168), stride_order=(1, 0), assumed_align=16)
-    cute.compile(trace, static_m)
-    assert seen["stride"] == ("int", True)
-
-
-def _large_repeated_rows(rows, columns, generator, block=65536):
-    pattern = (torch.randn((block, columns), generator=generator, device="cuda") * 0.125).to(torch.bfloat16)
-    out = torch.empty((rows, columns), device="cuda", dtype=torch.bfloat16)
-    for row in range(0, rows, block):
-        out[row : row + block] = pattern[: min(block, rows - row)]
-    return out
+    for m in (cute.sym_int(divisibility=256), 512):
+        cute.compile(trace, cute.runtime.make_fake_compact_tensor(cutlass.BFloat16, (m, 7168), stride_order=(1, 0), assumed_align=16))
+    assert seen == ["Int64", "int"]
 
 
 @pytest.mark.L1
-@pytest.mark.parametrize("m,k,n", [(532480, 4096, 256), (532480, 256, 4096)], ids=["a_past_2g", "cd_past_2g"])
-def test_bf16_grouped_gemm_canonical_past_2g_elements(m, k, n):
-    """BF16 grouped GEMM with A (or C/D) past 2^31 elements: canonical matches legacy bitwise (needs about 16 GB free)."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("SM100 is required")
-    if torch.cuda.mem_get_info()[0] < 16 * 2**30:
-        pytest.skip("needs about 16 GB of free device memory")
-    assert max(m * k, m * n) >= 2**31
+@pytest.mark.parametrize("k,n", [(4096, 256), (256, 4096)], ids=["a_past_2g", "cd_past_2g"])
+def test_bf16_grouped_gemm_canonical_past_2g_elements(k, n):
+    """BF16 grouped GEMM with A or C/D past 2^31 elements: canonical equals legacy bitwise (needs about 16 GB free)."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10 or torch.cuda.mem_get_info()[0] < 16 * 2**30:
+        pytest.skip("needs SM100 and about 16 GB of free device memory")
     import cudnn
 
-    generator = torch.Generator(device="cuda").manual_seed(31)
-    a = _large_repeated_rows(m, k, generator)
-    b = (torch.randn((2, n, k), generator=generator, device="cuda") * 0.125).to(torch.bfloat16)
-    offsets = torch.tensor([m - 2048, m], dtype=torch.int32, device="cuda")
+    m = 532480  # m x 4096 > 2^31
+    g = torch.Generator(device="cuda").manual_seed(31)
+    a = (torch.randn((65536, k), generator=g, device="cuda") * 0.125).bfloat16().repeat(9, 1)[:m]
+    b = (torch.randn((2, n, k), generator=g, device="cuda") * 0.125).bfloat16()
     alpha = torch.tensor([0.75, -1.25], device="cuda")
     prob = torch.linspace(0.25, 0.875, m, device="cuda")
-    rows = torch.cat([torch.arange(0, 1024, device="cuda"), torch.arange(m - 4096, m, device="cuda")])
-    expert = (rows >= m - 2048).long()
-    expected_c = torch.empty((len(rows), n), device="cuda")
-    for e in range(2):
-        mask = expert == e
-        expected_c[mask] = alpha[e] * (a[rows[mask]].float() @ b[e].float().t())
-    expected_d = expected_c * prob[rows, None]
-
-    outputs = {}
-    for layout in ("legacy", "canonical"):
-        if layout == "legacy":
-            args = dict(a_tensor=a.unsqueeze(-1), b_tensor=b.permute(1, 2, 0), prob_tensor=prob.view(m, 1, 1))
-        else:
-            args = dict(a_tensor=a, b_tensor=b, prob_tensor=prob)
-        result = cudnn.grouped_gemm_wrapper_sm100(
-            padded_offsets=offsets, alpha_tensor=alpha, c_dtype=torch.bfloat16, d_dtype=torch.bfloat16, generate_c=True, **args
-        )
-        c, d = result["c_tensor"].reshape(m, n)[rows], result["d_tensor"].reshape(m, n)[rows]
-        torch.testing.assert_close(c.float(), expected_c.bfloat16().float(), rtol=2e-2, atol=3e-2)
-        torch.testing.assert_close(d.float(), expected_d.bfloat16().float(), rtol=2e-2, atol=3e-2)
-        outputs[layout] = (c, d)
+    common = dict(padded_offsets=torch.tensor([m - 2048, m], dtype=torch.int32, device="cuda"), alpha_tensor=alpha)
+    common.update(c_dtype=torch.bfloat16, d_dtype=torch.bfloat16, generate_c=True)
+    rows = torch.cat([torch.arange(1024), torch.arange(m - 4096, m)]).cuda()
+    out = []
+    for args in (dict(a_tensor=a.unsqueeze(-1), b_tensor=b.permute(1, 2, 0), prob_tensor=prob.view(m, 1, 1)), dict(a_tensor=a, b_tensor=b, prob_tensor=prob)):
+        result = cudnn.grouped_gemm_wrapper_sm100(**common, **args)
+        out.append([result[key].reshape(m, n)[rows] for key in ("c_tensor", "d_tensor")])
         del result
-        torch.cuda.empty_cache()
-    assert torch.equal(outputs["legacy"][0], outputs["canonical"][0])
-    assert torch.equal(outputs["legacy"][1], outputs["canonical"][1])
+    ref = [alpha[e] * (a[rows].float() @ b[e].float().t()) for e in range(2)]
+    ref = torch.where((rows >= m - 2048)[:, None], ref[1], ref[0])
+    for c, d in out:
+        torch.testing.assert_close(c.float(), ref.bfloat16().float(), rtol=2e-2, atol=3e-2)
+        torch.testing.assert_close(d.float(), (ref * prob[rows, None]).bfloat16().float(), rtol=2e-2, atol=3e-2)
+    assert all(torch.equal(x, y) for x, y in zip(*out))
