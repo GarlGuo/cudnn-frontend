@@ -473,29 +473,33 @@ class MoEStreamingInputBlockSignalTileScheduler:
             lane_ready_m_tile_count = Int32(0)
             lane_expert = Int32(0)
             lane_run_complete = Boolean(False)
+            # Experiment: stop scanning after the first round with a complete ready run (later rounds' loads skipped).
+            found_complete_run = Boolean(False)
             for round_first_expert in cutlass.range_constexpr(0, local_expert_count, cute.arch.WARP_SIZE):
-                scanned_expert = round_first_expert + lane_idx
-                ready_m_tile_count = self._expert_ready_m_tiles(scanned_expert)
-                score = ready_m_tile_count
-                run_complete = Boolean(False)
-                if ready_m_tile_count > 0:
-                    last_batch = cute.arch.load((expert_last_batch_ptr + scanned_expert).llvm_ptr, Int32, sem="relaxed", scope="gpu")
-                    # Only a run that ends the expert or fills the batch cap: a shorter one (its rows still arriving)
-                    # would open a small batch and cannot spare the expert another pass over its weights.
-                    assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + scanned_expert
-                    assigned_m_tiles = cute.arch.load(assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
-                    run_end_m_tile = self._expert_first_m_tile(scanned_expert) + assigned_m_tiles + ready_m_tile_count
-                    ready_run_ends_expert_or_fills_batch = ready_m_tile_count == const_expr(EXPERT_BATCH_MAX_M_TILES) or (
-                        run_end_m_tile >= self._expert_end_m_tile(scanned_expert)
-                    )
-                    run_complete = ready_run_ends_expert_or_fills_batch
-                    if last_batch != 0 and ready_run_ends_expert_or_fills_batch:
-                        score = const_expr(EXPERT_BATCH_MAX_M_TILES) + last_batch
-                if score > lane_score:
-                    lane_score = score
-                    lane_ready_m_tile_count = ready_m_tile_count
-                    lane_expert = scanned_expert
-                    lane_run_complete = run_complete
+                if not found_complete_run:
+                    scanned_expert = round_first_expert + lane_idx
+                    ready_m_tile_count = self._expert_ready_m_tiles(scanned_expert)
+                    score = ready_m_tile_count
+                    run_complete = Boolean(False)
+                    if ready_m_tile_count > 0:
+                        last_batch = cute.arch.load((expert_last_batch_ptr + scanned_expert).llvm_ptr, Int32, sem="relaxed", scope="gpu")
+                        # Only a run that ends the expert or fills the batch cap: a shorter one (its rows still arriving)
+                        # would open a small batch and cannot spare the expert another pass over its weights.
+                        assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + scanned_expert
+                        assigned_m_tiles = cute.arch.load(assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+                        run_end_m_tile = self._expert_first_m_tile(scanned_expert) + assigned_m_tiles + ready_m_tile_count
+                        ready_run_ends_expert_or_fills_batch = ready_m_tile_count == const_expr(EXPERT_BATCH_MAX_M_TILES) or (
+                            run_end_m_tile >= self._expert_end_m_tile(scanned_expert)
+                        )
+                        run_complete = ready_run_ends_expert_or_fills_batch
+                        if last_batch != 0 and ready_run_ends_expert_or_fills_batch:
+                            score = const_expr(EXPERT_BATCH_MAX_M_TILES) + last_batch
+                    if score > lane_score:
+                        lane_score = score
+                        lane_ready_m_tile_count = ready_m_tile_count
+                        lane_expert = scanned_expert
+                        lane_run_complete = run_complete
+                    found_complete_run = cute.arch.vote_any_sync(lane_run_complete)
             top_expert_score = cute.arch.warp_redux_sync(lane_score, "max")
             # Only a lane that holds the best score names its expert; the others
             # answer with the expert count, which is past all of them.
