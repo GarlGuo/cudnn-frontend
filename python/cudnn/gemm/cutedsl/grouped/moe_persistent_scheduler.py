@@ -249,9 +249,11 @@ class MoESchedulerParams:
         cluster_shape_mn: Tuple[int, int],  # (cluster_m, cluster_n)
         use_dynamic_sched: bool = False,
         atomic_counter_claim: bool = False,  # 2Dx2D (SM90, no CLC): claim from the gmem atomic counter on persistent clusters
+        reset_counter_on_exit: bool = False,  # dynamic 2Dx3D: the last cluster out zeroes the counter (_count_cluster_out)
     ):
         self.scenario = scenario
         self.atomic_counter_claim = atomic_counter_claim
+        self.reset_counter_on_exit = reset_counter_on_exit
         e, i, h = expert_shape
         self.expert_cnt = e if isinstance(e, Int32) else Int32(e)
         self.intermediate = i if isinstance(i, Int32) else Int32(i)
@@ -303,6 +305,7 @@ class MoESchedulerParams:
             cluster_shape_mn=self.cluster_shape_mn,
             use_dynamic_sched=self.use_dynamic_sched,
             atomic_counter_claim=self.atomic_counter_claim,
+            reset_counter_on_exit=self.reset_counter_on_exit,
         )
 
     @staticmethod
@@ -776,6 +779,8 @@ class MoEPersistentTileScheduler:
             work_tile_info = self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
             self._release_cluster_idx(loc=loc, ip=ip)
             self._wait_last_cluster_release(work_tile_info, loc=loc, ip=ip)
+            if const_expr(self.params.reset_counter_on_exit):
+                self._count_cluster_out(work_tile_info, loc=loc, ip=ip)
             return work_tile_info
         return self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
 
@@ -790,6 +795,8 @@ class MoEPersistentTileScheduler:
             work_tile_info = self._get_work_tile_for_linear_idx(self._current_work_linear_idx, loc=loc, ip=ip)
             self._release_cluster_idx(loc=loc, ip=ip)
             self._wait_last_cluster_release(work_tile_info, loc=loc, ip=ip)
+            if const_expr(self.params.reset_counter_on_exit):
+                self._count_cluster_out(work_tile_info, loc=loc, ip=ip)
             return work_tile_info
         else:
             self._current_work_linear_idx += self.num_persistent_clusters
@@ -933,6 +940,22 @@ class MoEPersistentTileScheduler:
             if ds.is_leader_cta:
                 if work_tile_info.expert_idx < Int32(0):
                     self.cluster_pipeline.producer_acquire(ds.producer_state, loc=loc, ip=ip)
+
+    @dsl_user_op
+    @cute.jit
+    def _count_cluster_out(self, work_tile_info: MoEWorkTileInfo, *, loc=None, ip=None) -> None:
+        """reset_counter_on_exit: after the cluster's last (invalid) claim, count it out in the int32 after the counter;
+        the last cluster out zeroes both, so the next launch needs no reset kernel.  Both words are zero before the
+        first launch (the caller's zeroed workspace)."""
+        ds = self._dynamic_state
+        if work_tile_info.expert_idx < Int32(0) and ds.is_leader_cta and cute.arch.lane_idx() == 0:
+            cute.arch.fence_acq_rel_gpu()  # this cluster's claims before its count
+            clusters_out = atomic_add_i32((ds.counter_ptr + 1).llvm_ptr, Int32(1), loc=loc, ip=ip)
+            if clusters_out == self.num_persistent_clusters - 1:
+                cute.arch.fence_acq_rel_gpu()  # every cluster's claims before the zeroing
+                counter = cute.make_tensor(ds.counter_ptr, cute.make_layout((2,)))
+                counter[0] = Int32(0)
+                counter[1] = Int32(0)
 
     @dsl_user_op
     @cute.jit

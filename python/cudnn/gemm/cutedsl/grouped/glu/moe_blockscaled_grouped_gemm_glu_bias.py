@@ -325,6 +325,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         use_pdl: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
         compact_sfa_sf_warp: bool = False,
+        reset_scheduler_counter_on_exit: bool = False,
+        compact_sfa_handshake: str = "full",
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -387,6 +389,17 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         )
         check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
+        # Prototype (dynamic scheduler without signal[], dense weights): the last cluster out zeroes the claim counter
+        # and its clusters-out word (8 workspace bytes, zero before the first launch), so no helper kernel launches.
+        if reset_scheduler_counter_on_exit and not (
+            use_dynamic_sched and streaming_signal_capacity is None and weight_mode == MoEWeightMode.DENSE and tuple(cluster_shape_mn) in ((2, 1), (1, 1))
+        ):
+            raise ValueError("reset_scheduler_counter_on_exit: dynamic scheduler without signal[], dense weights, cluster (2, 1) or (1, 1)")
+        self.reset_scheduler_counter_on_exit = reset_scheduler_counter_on_exit
+        # Diagnostic: "full" (default, the sync_restrict handoff), "noacq" (no MMA-side re-wait + acquire fence),
+        # "light" (EPC main's handoff: plain arrive, no MMA-side acquire, no fence before the SF stores).
+        assert compact_sfa_handshake in ("full", "noacq", "light")
+        self.compact_sfa_handshake = compact_sfa_handshake
 
         self.glu_layout = validate_glu_layout(glu_layout)
         self.sf_vec_size = sf_vec_size
@@ -711,7 +724,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
     def get_workspace_bytes(self) -> int:
         """Return descriptor workspace plus optional dynamic scheduler state."""
         desc_workspace_bytes = self.get_desc_workspace_bytes()
-        dynamic_sched_bytes = 4 if self.use_dynamic_sched else 0
+        dynamic_sched_bytes = (8 if self.reset_scheduler_counter_on_exit else 4) if self.use_dynamic_sched else 0
         return desc_workspace_bytes + dynamic_sched_bytes + self.streaming_input_workspace_bytes()
 
     @cute.jit
@@ -1114,7 +1127,8 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
 
         # ---- Helper kernel: TMA desc init (discrete) + sched counter reset (dynamic) ----
         _need_helper = cutlass.const_expr(
-            self.weight_mode == MoEWeightMode.DISCRETE or (self.use_dynamic_sched and not self.use_streaming_signal_sched and scheduler_counter is None)
+            self.weight_mode == MoEWeightMode.DISCRETE
+            or (self.use_dynamic_sched and not self.use_streaming_signal_sched and scheduler_counter is None and not self.reset_scheduler_counter_on_exit)
         )
         reject_pdl_behind_helper(self.use_pdl, _need_helper, "streaming_signal_capacity, or a scheduler_counter that the caller resets")
         if cutlass.const_expr(_need_helper):

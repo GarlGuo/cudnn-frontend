@@ -722,6 +722,8 @@ class StreamingInputSignalMixin:
             cta_tile_shape_mnk=cta_tile_shape_mnk,
             cluster_shape_mn=cluster_shape_mn,
             use_dynamic_sched=use_dynamic_sched,
+            # A kernel's opt-in (e.g. the MXFP8 GLU's reset_scheduler_counter_on_exit): no helper launch resets the counter.
+            reset_counter_on_exit=use_dynamic_sched and getattr(self, "reset_scheduler_counter_on_exit", False),
         )
 
     def create_streaming_input_scheduler(self, sched_params, padded_offsets, counter_ptr, sched_storage, zero):

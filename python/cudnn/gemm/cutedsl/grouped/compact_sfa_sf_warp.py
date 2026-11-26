@@ -66,7 +66,7 @@ class CompactSfaSfWarpMixin:
     @cute.jit
     def compact_sfa_acquire(self, ab_pipeline, ab_consumer_state) -> None:
         """MMA warp, after the stage's full wait: acquire both SF warps' atom stores (the module docstring's pattern)."""
-        if cutlass.const_expr(self.compact_sfa_sf_warp):
+        if cutlass.const_expr(self.compact_sfa_sf_warp and getattr(self, "compact_sfa_handshake", "full") == "full"):
             full_barrier = ab_pipeline.sync_object_full.get_barrier(ab_consumer_state.index)
             sf_acquired = cutlass.Boolean(False)
             while not sf_acquired:
@@ -118,16 +118,23 @@ class CompactSfaSfWarpMixin:
     def _store_compact_sfa_stage(self, lines, slot, ab_pipeline, state, leader_cta, lane_idx):
         """One K tile: wait for the stage, store this lane's 4 words of the CTA's atom, release them to the leader."""
         ab_pipeline.sync_object_empty.wait(state.index, state.phase)
-        # The MMA's tcgen05.cp read this stage through the async proxy: order that before the stores.
-        cute.arch.fence_proxy("async.shared", space="cta")
+        light = cutlass.const_expr(getattr(self, "compact_sfa_handshake", "full") == "light")
+        if cutlass.const_expr(not light):
+            # The MMA's tcgen05.cp read this stage through the async proxy: order that before the stores.
+            cute.arch.fence_proxy("async.shared", space="cta")
         for row_group in cutlass.range_constexpr(4):
             lines[(lane_idx, row_group, state.index)] = slot[row_group]
         # tcgen05.cp reads the atoms through the async proxy (the peer's from the leader's MMA).
         cute.arch.fence_proxy("async.shared", space="cta")
         cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            fence_release_sync_restrict_shared_cta_cluster()
-            cute.arch.mbarrier_arrive(ab_pipeline.producer_get_barrier(state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER)
+        if cutlass.const_expr(light):
+            # Diagnostic (EPC main's arrive_after_compact_sfa): a plain arrive, no sync_restrict release.
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(ab_pipeline.producer_get_barrier(state), leader_cta)
+        else:
+            with cute.arch.elect_one():
+                fence_release_sync_restrict_shared_cta_cluster()
+                cute.arch.mbarrier_arrive(ab_pipeline.producer_get_barrier(state), leader_cta, relaxed=True, scope=nvvm.MemScopeKind.CLUSTER)
 
     @cute.jit
     def _load_compact_sfa_group(self, queue, rows, first_k_tile):
