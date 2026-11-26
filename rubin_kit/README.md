@@ -102,7 +102,7 @@ CPU). `PY` / `TORCHRUN` override the python and torchrun binaries.
 Byte checks, printed as `CHECK` lines at the top of `lsw_out/tables.md`:
 - stock2 vs stock and reuse vs stock: expect 0 differing bytes;
 - dense vs stock_sm100: expect 0 (same MMA);
-- dense vs stock: reported as a count plus `dense_max_rel_err`. It can be nonzero (K32 vs K64 MMA), but it should be
+- dense (and stock_sm100) vs stock: reported as a count plus `dense_max_rel_err`. It can be nonzero (K32 vs K64 MMA), but it should be
   small (~1e-2 or less for BF16 dW).
 - `*_nan` must be 0.
 

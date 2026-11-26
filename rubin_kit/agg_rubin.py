@@ -60,7 +60,8 @@ print(f"checks: {len(checks)} records; build errors: {len(errs)}")
 for r in errs:
     print("BUILD_ERROR", r["model"], r["ep"], r["arm"], r["error"][-300:])
 for r in checks:
-    bad = {x: v for x, v in r.items() if (x.endswith("_diff_bytes") and not x.startswith("dense_diff")) or x.endswith("_nan")}
+    # dense and stock_sm100 vs the Rubin stock may differ (SM100 K32 vs Rubin K64 MMA); dense vs stock_sm100 may not.
+    bad = {x: v for x, v in r.items() if (x.endswith("_diff_bytes") and x not in ("dense_diff_bytes", "stock_sm100_diff_bytes")) or x.endswith("_nan")}
     flag = "OK" if not any(bad.values()) else "DIFF"
     print(f"CHECK {flag} {r['model']} EP{r['ep']} {r['gemm']} " + " ".join(f"{x}={v}" for x, v in r.items() if "diff" in x or "nan" in x or "err" in x))
 shapes = sorted({(m, e) for (_, m, e) in passes}, key=lambda s: (s[1], MORDER.index(s[0])))
