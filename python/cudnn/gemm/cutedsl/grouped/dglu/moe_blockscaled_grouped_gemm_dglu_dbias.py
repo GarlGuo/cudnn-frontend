@@ -345,10 +345,10 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # Experimental (wip/dglu-regcap): (producer, epilogue, sf) per-thread registers via setmaxnreg on the 9-warp
         # compact-SFA CTA, whose launch count is 168 (3 warps on SM sub-partition 0).  Warpgroup 1 (warps 4-7: MMA, TMA,
         # C load, scheduler) drops to ``producer``, the SF warp 8 (alone in warpgroup 2) to ``sf`` (0: unchanged), and
-        # the epilogue warpgroup 0 rises to ``epilogue``.  Measured on GB200: the increase is served per SM
-        # sub-partition from that sub-partition's launch share, so on sub-partitions 1-3 (two warps each: epilogue
-        # warp i and warpgroup-1 warp 4 + i) epilogue + producer <= 2 * 168 = 336; (96, 256, 56) hangs, (96, 240, 56)
-        # and (96, 240, 0) run.  The SF warp's decrease frees registers only on sub-partition 0.
+        # the epilogue warpgroup 0 rises to ``epilogue`` (SASS: USETMAXREG.TRY_ALLOC.CTAPOOL, retried until granted).
+        # Measured on GB200: (96, 240, 0) and (96, 240, 56) run, (96, 256, 56) hangs although the CTA total would cover
+        # it, i.e. the SF warp's decrease does not fund the epilogue (it is alone on sub-partition 0 / in a partial
+        # warpgroup).  So require epilogue - 168 <= 168 - producer (epilogue + producer <= 336).
         self.regcap_setmaxnreg = None if regcap_setmaxnreg is None else tuple(int(x) for x in regcap_setmaxnreg)
         if self.regcap_setmaxnreg is not None:
             if not compact_sfa_sf_warp:
