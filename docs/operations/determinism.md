@@ -65,12 +65,17 @@ under `cudnn.gemm`) is a direct-call step entry of the same kind.
 The block-sparse attention (BSA) APIs `block_sparse_attention_forward`,
 `block_sparse_attention_backward` and `block_sparse_attention_backward_metadata`
 are in `cudnn.ops`; their rows cover the blk64 kernels (`sparse_block_size=64`).
+`MoeEp` (expert-parallel MoE, `cudnn.MoeEp`) has an inference entry (`__call__`)
+and stateless training entries (`training_forward`, `training_backward`,
+`training_wgrad`).
 The required settings below apply to this table. The `pygraph.custom_reduction`
 rows describe only the named reducer bodies and consumed graph outputs, not
 arbitrary user callbacks.
 
 | API | Direction | Datatype | SM90 (Hopper) | SM100/103 | SM107 (Rubin) |
 | --- | --- | --- | --- | --- | --- |
+| `pygraph.matmul` with numerical note `BATCH_INVARIANT`, optional column bias | fprop | BF16 inputs and output, FP32 accumulation | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
+| Scaled `pygraph.matmul` with numerical note `BATCH_INVARIANT` | fprop | Per-tensor E4M3/E5M2, groupwise E4M3, MXFP8, NVFP4, MXFP4, MXFP8 × MXFP4. FP16/BF16 output | Unsupported | Supported on SM100 for the tested configurations. SM103 unverified | Supported for the tested configurations |
 | `Conv3dRawSm100`, `Conv3dRmsNormSiluSm100`, `Conv3dRmsNormSiluPadSm100`, `Conv3dBiasResidualPadSm100`, `CausalConv3dWithCacheSm100` and their wrappers | fprop | BF16; FP32 with `allow_tf32=True` | Unsupported | Supported on SM100 | Unsupported |
 | `RmsNormSiluPadSm100` and its wrapper | fprop | BF16, FP32 | Unsupported | Supported on SM100 | Unsupported |
 | Cake `dsa_det_forward` / `dsa_det_backward` | fprop, bprop | BF16 | Unsupported | Unverified (SM100 repeatability and isolated-row bounds cases tested; general batch invariance and SM103 unverified) | Unverified |
@@ -91,6 +96,10 @@ arbitrary user callbacks.
 | `GdnVerifyFused` (fused GDN MTP-verify step) | fprop (inference step) | BF16 in; FP8 E4M3 and BF16 out; FP32 state | Unsupported | Replay only | Replay only |
 | `cudnn.ops.causal_conv1d_update`, width four | fprop (inference step) | FP16 inputs, output, and state with FP32 accumulation | Supported (GH200, tested configurations) | Unverified | Unsupported |
 | `SharedExpertDecode` (shared-expert decode pair) | fprop (inference step) | BF16 in / out; FP32 accumulate | Unsupported | Supported | Supported |
+| `MoeEp.__call__` (expert-parallel MoE inference) | fprop | MXFP8 activation and weights; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_forward` | fprop | MXFP8 compute; BF16 or MXFP8 combine; BF16 out | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_backward` | bprop | MXFP8 compute; FP32 dprob | Unsupported | Unsupported | Unverified |
+| `MoeEp.training_wgrad` | wgrad | MXFP8 operands; BF16 or FP32 dW | Unsupported | Unsupported | Supported (replay, expert invariance and warm stress; no golden) |
 | `AttentionGateQuantDecode` (attention gate + quantize decode step) | fprop (inference step) | BF16 in; FP8 E4M3 out | Unsupported | SM103: Supported; SM100: Unverified | Supported |
 | `Fp8ProjectionDecode` (FP8 split-K projection for decode rows) | fprop (inference step) | FP8 E4M3 in, one FP32 scale; BF16 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`, Unverified at the other served geometries | Supported at `ProjectionGeometry(4608, 8192)` and `(8192, 2048)`; Unverified at the other served geometries |
 | `AddNormQuantDecode` (add + RMSNorm + quantize decode step) | fprop (inference step) | BF16 in; BF16, FP8 E4M3 or NVFP4 out; FP32 accumulate | Unsupported | SM100: Supported; SM103: Unverified | Unverified |
@@ -105,8 +114,8 @@ arbitrary user callbacks.
 | `simplified_sparse_attention_forward_jax` | bprop | BF16 Q/K/V and indexer gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
 | `dense_indexer_kl_forward`, `use_kf=False` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unverified | SM100: Replay only; SM103: Replay only | Unverified |
 | `dense_indexer_kl_forward`, `use_kf=True` | fprop / bprop | BF16 inputs/gradients; FP32 loss and saved gradients | Unsupported | SM100: Not guaranteed; SM103: Not guaranteed | Unsupported |
-| `qsa_forward` | fprop | BF16 | Unverified | Replay only | Replay only |
-| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16 | Unverified | Replay only | Replay only |
+| `qsa_forward` | fprop | BF16, FP16 | Unverified | Replay only | Replay only |
+| `qsa_backward`, `qsa_indexed_backward` | bprop | BF16, FP16 | Unverified | Replay only | Replay only |
 | `CSA.csa_compressor_forward_wrapper` | fprop | BF16 output; FP32 APE | Unverified | Replay only | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (`deterministic=True`) | bprop | BF16 dKV/dScore; FP32 dAPE | Unverified | Supported | Unverified |
 | `CSA.csa_compressor_backward_wrapper` (default atomic dAPE) | bprop | BF16 dKV/dScore; FP32 dAPE | Not guaranteed | Not guaranteed | Not guaranteed |
@@ -377,8 +386,9 @@ for replay, batch-invariance, and stress-test results.
 - Phase 1 dense indexer KL: no deterministic mode. The chunked PyTorch path
   repeats on SM100 but changes loss or saved FP32 gradient bytes when packed
   rows move. The fused CuTe path also changes scalar loss and saved gradient
-  bytes across runs through atomic reductions. Only indexer Q/K receive
-  gradients; the teacher stays frozen. Tiny single-row goldens do not qualify
+  bytes across runs through atomic reductions, including forward loss replay
+  on SM103. Only indexer Q/K receive gradients; the teacher stays frozen.
+  Tiny single-row goldens do not qualify
   larger reductions. CPU and other GPUs are not qualified for determinism.
 
 - Simplified sparse attention (PyTorch and JAX): no deterministic mode. The SM100 forward
@@ -502,6 +512,28 @@ for replay, batch-invariance, and stress-test results.
   belong to one cc 10.3 runtime and one cc 10.7 runtime: on cc 10.0 the
   status rests on the replay and batch-invariance cells, and the golden
   comparison is not covered there. SM90 and SM120 are declined by type.
+- Expert-parallel MoE (`MoeEp`): no deterministic mode and no determinism
+  suite yet, so SM107 is unverified; SM90, SM100/103 and SM120 are declined by
+  the capability check. Known order-dependent reduction: training backward
+  adds per-tile dprob partials with FP32 atomics. Training forward and
+  backward route tokens in a fixed sequence; inference token communication
+  does not. The functionality tests check that the forward tuning fields write
+  the default tuning's output bytes, and that repeated calls do not
+  accumulate. Neither check qualifies replay or batch invariance.
+  `training_wgrad` is the exception: each output tile is reduced by one CTA
+  over its expert's whole padded segment, with no split-K and no atomics.
+  `test_moe_ep_wgrad.py` checks the following on raw bytes, also on a shape
+  that spans more than one wave of clusters and up to 16 K tiles per expert:
+  - replay with fresh outputs under concurrent work, for dense and discrete
+    destinations and for `accumulate=True` from the same starting value;
+  - that an expert's bytes survive new neighbors, reordering and duplication;
+  - that every output layout and storage form stores the same FP32
+    accumulator;
+  - a warm and poisoned stress against the grouped WGrad API's bytes.
+
+  `accumulate=True` adds to the destination once per element, so its bytes
+  also depend on the destination's prior contents. The bytes equal the
+  grouped WGrad API's on the same operands. No golden is recorded.
 - Attention gate + quantize decode step (`AttentionGateQuantDecode`): no
   determinism switch and no numerics knob. The kernel has no reduction, so a
   row's bytes are a function of its own operand values and of the scale: a

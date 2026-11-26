@@ -4,6 +4,126 @@ For API support by GPU and datatype, see the
 [determinism status page](../../../docs/operations/determinism.md).
 This report holds test coverage, measured results, and failure diagnostics.
 
+### Quantized batch-invariant matmul (2026-11-24)
+
+The [batch-invariant suite](../gemm/batch_invariant/README.md) passed on SM100 (P2021, 68 SMs) and SM107
+(208 SMs) with cuDNN 9.29.0 and CuTe DSL 4.8.1. On both devices the forward
+comparison covered per-tensor E4M3/E5M2, groupwise E4M3, MXFP8, NVFP4, MXFP4
+and MXFP8 × MXFP4, with BF16 and FP16 outputs. A single FlashInfer rollout row
+and reordered or repeated rows matched direct training outputs and the original
+FlashInfer kernels. The tests exercised N=128 with K=512 and K=8192 (including
+split-K), the two-block MMA path at M=257 and N=264, and native cuDNN matmuls for
+dX and dW of the effective floating-point inputs. The tests fix the already
+quantized payload and logical scales before changing the batch.
+
+At M=1024, N=4096, K=8192, six refilled-pipeline cases per GPU completed 3,000
+warm and 3,000 shared-memory-poisoned launches each. Each result matched an
+independently decoded FP64 reference rounded to BF16. The unsafe control
+reproduced on both devices. Fourteen small quantized forward cases per GPU
+also passed strict [golden comparison](../gemm/batch_invariant/goldens/). SM103 hardware execution
+remains unverified.
+
+### BF16 batch-invariant matmul (2026-11-23)
+
+On 2026-11-24, all 27 cases in the [batch-invariant test suite](../gemm/batch_invariant/README.md) passed on
+SM100, including 6 plan-selection cases and 14 FlashInfer integration cases.
+On SM100 (68 SMs), the [batch-invariant matmul tests](../gemm/batch_invariant/test_matmul_determinism.py) compared output
+bytes across repeated launches, row counts, row permutations and duplicates,
+and compact B layouts. It covered K16 tail padding and fixed split-K with a
+column bias. The two [batch-invariant baseline files](../gemm/batch_invariant/goldens/aa6120c0182e69f6) also match an
+independent FP64 reference rounded to BF16 on inputs with exact dyadic values.
+The backward compatibility case uses the batch-invariant forward output to form `dY`. On
+SM100, native cuDNN matmul plans computed `dX` and `dW` (`eng0_k24=0`) and
+a native ADD reduction computed `dBias` (`eng3_k2=0`). All three gradients
+passed their FP64 reference checks, including with FROST engines enabled.
+
+Run from `test/python` with the SM100 device selected:
+
+```sh
+CUBLAS_WORKSPACE_CONFIG=:4096:8 CUDNN_DETERMINISM_GOLDENS="$PWD/gemm/batch_invariant/goldens" \
+    python -m pytest -n0 -m L0 -q gemm/batch_invariant/test_matmul_determinism.py
+```
+
+The seven cases passed on the batch-invariant changes based on `2b98a25d`, with cuDNN
+9.29.0, CuTe DSL 4.8.1, PyTorch 2.15.0+cu132 and TVM-FFI 0.1.15.post2.
+The 2048 × 2048 × 2048 pipeline case ran in 256 blocks with four blocks per
+cluster and three refills per stage. All 3,000 warm launches and 3,000
+shared-memory-poisoned launches matched the independent reference bitwise.
+The unsafe control produced a mismatch in all 200 launches. SM103 and SM107
+remain unverified.
+
+### MoeEp.training_wgrad: replay, expert invariance and warm stress (2026-11-23)
+
+`MoeEp.training_wgrad` runs the vendored Rubin WGrad kernel. Each output tile is reduced by one CTA over its expert's
+whole padded segment, with no split-K and no atomics. Its L0 determinism cells are in
+`test/python/moe_ep/test_moe_ep_wgrad.py`. Synthetic operands are placed in the producer layout, and every check
+compares raw bytes.
+
+Two shapes are used:
+
+| Shape | Experts | dW1 / dW2 per expert | Token rows per expert | What it reaches |
+|---|---|---|---|---|
+| Small | 4 | 512 × 512 / 256 × 512 | 300, 0, 128, 129 | Partial and empty segments |
+| Multi-wave | 8 | 2048 × 2048 / 1024 × 2048 | 2048, 1500, 1024, 0, 1, 1793, 640, 2047 | Up to 16 K tiles of 128 rows. Each GEMM launches more 2-CTA clusters than one wave holds (512 thread blocks on 200 SMs) |
+
+The cells:
+
+| Cell | Shape | What it checks |
+|---|---|---|
+| `test_training_wgrad_replays_bitwise` (BF16, FP32) | small | Eight replays with fresh outputs under concurrent work give identical bytes. A separate tolerance check against an independent PyTorch MXFP8 reference |
+| `test_training_wgrad_replays_bitwise_across_waves` (BF16, FP32) | multi-wave | The same, plus that the operands are unchanged after the calls |
+| `test_training_wgrad_expert_results_do_not_depend_on_neighbors` | small | An expert's bytes are unchanged with new neighbors, after reordering, and when duplicated |
+| `test_training_wgrad_expert_results_do_not_depend_on_neighbors_across_waves` (BF16) | multi-wave | The same: new neighbors that move the expert's segment, reversed order, and duplication into every slot |
+| `test_training_wgrad_discrete_and_accumulate_replay_bitwise` | small | Replay for discrete destinations (BF16, overwrite), dense FP32 with `accumulate=True`, and discrete FP32 with `accumulate=True`. Every replay starts from the same destination value |
+| `test_training_wgrad_layouts_store_the_same_accumulator` | small | Every FP32 layout and storage form stores identical bytes |
+| `test_training_wgrad_warm_stress` | multi-wave, dense BF16 | `warm_stress.assert_warm_stress` against FE grouped WGrad (`cudnn.grouped_gemm_wgrad_wrapper_sm100`, 128 × 128 tiles), an independent kernel with byte-identical results. The A/B pipeline stages refill at least 1296 times per launch, with 2.56 thread blocks per SM |
+
+Results:
+
+| Item | Result |
+|---|---|
+| GPU | NVIDIA VR NVL72, cc 10.7, 200 SMs, driver 610.47.04 |
+| Container | `nvcr.io/nvidia/pytorch:26.05-py3`: PyTorch 2.12.0a0 (nv26.05), CUDA 13.2 |
+| CuTe DSL | public `nvidia-cutlass-dsl` 4.8.0 and 4.8.1 |
+| pytest | **44 passed**, 0 skipped, on each DSL. This is all of `test_moe_ep_wgrad.py` at L0 and L1 |
+| warm stress | On each DSL: the cold launches agree and equal the independent reference; warm 0 of 16384 launches wrong, poisoned 0 of 16384; per-launch rate below 0.0183 % (95 %) |
+| Positive control | The unsafe ring twin failed 200 of 200 launches (600 thread blocks, cluster 2), so the stress is validated on this GPU |
+
+No golden files are recorded. On SM90, SM100/103 and SM120 the WGrad path is declined by the capability check.
+
+Command, run from the cudnn-frontend checkout's `test/python`:
+
+```bash
+pytest moe_ep/test_moe_ep_wgrad.py -m "L0 or L1" -q -rs
+```
+
+### MoeEp forward and backward: no determinism suite (2026-11-23)
+
+`MoeEp.__call__`, `MoeEp.training_forward` and `MoeEp.training_backward`
+(the Rubin SM107 MXFP8 MegaMoE kernels behind `cudnn.moe_ep`) have no
+determinism suite. The status page lists them as unverified on SM107. The gap
+covers these kernel paths:
+
+- Forward: `scheduling="static"` (the default), `"atomic"` and
+  `"phase_interleave"`; `fc2_bulk_store` off, `"auto"` and explicit stage
+  counts; `mixed_cga`. Each combines with the `epi_warps`, `standalone_warps`
+  and `reuse_dispatch_warps` token-back modes.
+- Backward: the `dgrad_optimization` profiles `baseline`, `rolling` (M16
+  traversal, scaled FP8 conversion) and `ds3_ep4_pattern` (rank input dedup,
+  asynchronous token-in flags).
+
+Known order-dependent operations: training backward adds per-tile dprob
+partials with FP32 atomics, and inference does not fix the order of token
+communication.
+
+The functionality tests do some raw-byte checks, but none of them is a
+determinism cell. `test_moe_ep_forward.py::test_forward_kernel_tuning_inference_matches_reference_and_replays`
+and `test_moe_ep_backward.py::test_training_forward_kernel_tuning_does_not_accumulate_across_calls`
+check each tuned forward output against an independent reference, and against
+the default tuning's output bytes over repeated calls. These checks do not
+cover replay under concurrent work, batch invariance, warm stress or goldens,
+and no golden files are recorded.
+
 ### GH200 block-sparse attention and causal convolution goldens (2026-11-19)
 
 The SM90 blk64 block-sparse attention suite and the FP16 causal convolution
@@ -9711,3 +9831,60 @@ and four direct launches: two at the default tile, one with the (2, 2)
 cluster and one with the (128, 256) tile. Racecheck ran the two default-tile
 launches. SM103 and SM107 were not run, only compiled: ptxas 13.4.92 reports
 0 spills for the deterministic configurations, 26 on sm_100a and 24 on sm_107a.
+
+### Phase 1 SM100/SM103 loss-byte expectations — 2026-11-24
+
+Pipeline 85038338, job 569171688, reports `replay 2 loss: 1/4 bytes differ`
+for `test_replay[bf16-h32-tail-fprop-cutedsl]` on SM103 with cuDNN 9.28.1.4
+and CuTe DSL 4.8.0. The independent numerical reference passed before the
+byte comparison failed. The fused loss uses unordered FP32 atomic additions;
+its determinism status remains **Not guaranteed**.
+
+The test treats only this case and one-byte loss replay mismatch as an
+expected failure on SM103. On SM100, the H32 fused forward batch case also
+reports `packed slot 0 loss: 1/4 bytes differ` under CUDA 13.4. Restoring the
+old expectation handler reproduces that failure on the second isolated run.
+That case has a separate one-byte scalar-loss exception. Numerical,
+non-finite, gradient and other-case checks remain strict. No kernel,
+tolerance or golden changes.
+
+On SM100 with cuDNN 9.30.0.12, Torch 2.11.0+cu128 and CuTe DSL
+4.9.0a0+20261121230000.ecb3b50, the harness suite, eight expectation checks
+and H32 replay/batch cases report 37 passed, 1 skipped and 2 xfailed in
+31.45 s. The skip requires two CUDA devices; both xfails are known
+SM100 byte differences. Command from the repository root:
+
+```bash
+python -m pytest test/python/test_conftest_parallel.py \
+  test/python/simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
+  -k 'test_conftest_parallel or test_known_byte_failure_scope or bf16-h32-tail' -q --tb=short
+```
+
+Disabling the protocol lock and restoring the old SM103 expectation makes
+five regression checks fail. The same 13 checks pass with the changes.
+
+With Torch 2.14.0a0+b2c75dd062.nv26.09 / CUDA 13.4 and the same SM100,
+backend and DSL, both MoK suites pass with four workers sharing one GPU:
+37 passed, 1 skipped. The wider initial run exposed the SM100 loss-byte
+case above. After its scoped expectation change, the full harness and
+Phase 1 suites report 50 passed, 7 skipped and 11 xfailed in 58.40 s:
+
+```bash
+python -m pytest test/python/test_conftest_parallel.py \
+  test/python/simplified_sparse_attention/cutedsl/test_dense_indexer_kl_determinism.py \
+  -n 4 --dist loadfile -q -rsx --tb=short
+```
+
+The seven skips are two existing determinism exclusions, four missing
+runtime goldens and the two-device guard. The 12 expectation-policy checks
+run within this result. All xfails remain byte-comparison failures.
+
+Native SM103 pipeline 85191475 stopped before tests because Enroot pulled
+the private image anonymously and received HTTP 403. Pipelines 85192768
+(cuDNN 9.28.1.4 / CuTe DSL 4.8.0) and 85192784 (9.30.0.9 / 4.9.0a0)
+retry the affected suites with the public PyTorch 26.09 base image. Both
+4.8.0 jobs import the image, then fail before pytest: Enroot cannot mount
+the workspace (`Operation not permitted`), and `scontrol` cannot read
+`/etc/slurm/slurm.conf`. The 4.9.0a0 attempt fails at the same mount step.
+Native SM103 execution remains unverified. The version overrides differ
+from the default job names.
