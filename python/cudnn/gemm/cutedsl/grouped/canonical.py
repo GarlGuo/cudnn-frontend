@@ -204,12 +204,17 @@ def canonical_prob_fake(fake, canonical: bool):
 
 
 def kernel_facing_mx(tensor):
-    """Canonical (m, x) -> (m, x, 1) with the dense unit-L stride; rank 3 passes through."""
+    """Canonical (m, x) -> (m, x, 1) with the dense unit-L stride; rank 3 passes through.
+
+    The unit-L stride m * x is formed in 64 bits, as in the rank-3 fakes: m * x passes 2^31 elements at
+    realistic token counts, and a wrapped 32-bit stride would reach the TMA descriptor.
+    """
     if tensor is None or cute.rank(tensor) != 2:
         return tensor
     m, x = tensor.shape
     sm, sx = tensor.stride
-    return cute.make_tensor(tensor.iterator, cute.make_layout((m, x, 1), stride=(sm, sx, m * x)))
+    l_stride = m * x if cute.is_static(m) and cute.is_static(x) else cutlass.Int64(m) * x
+    return cute.make_tensor(tensor.iterator, cute.make_layout((m, x, 1), stride=(sm, sx, l_stride)))
 
 
 def kernel_facing_b(tensor, n_major=False):
