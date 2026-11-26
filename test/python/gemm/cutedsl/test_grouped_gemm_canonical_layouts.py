@@ -11,7 +11,8 @@ forms: A (sum_m, k) row-major, B (l, n, k) C-contiguous, SFA/SFB as dense
 C-contiguous buffers (physical atom shape or flat 1-D), prob (sum_m,) -- and
 requires identical results. Canonical calls return natural-shaped outputs.
 
-The last two tests cover canonical (m, x) operands whose m x x passes 2^31 elements.
+The last two tests cover canonical (m, x) operands whose m x x can pass 2^31 elements: one checks the unit-L stride
+type, the other runs operands past 2^31 elements.
 """
 
 import pytest
@@ -359,7 +360,7 @@ def _large_repeated_rows(rows, columns, generator, block=65536):
 @pytest.mark.L1
 @pytest.mark.parametrize("m,k,n", [(532480, 4096, 256), (532480, 256, 4096)], ids=["a_past_2g", "cd_past_2g"])
 def test_bf16_grouped_gemm_canonical_past_2g_elements(m, k, n):
-    """BF16 grouped GEMM with A (or C/D) past 2^31 elements: canonical matches legacy bitwise (about 13 GB)."""
+    """BF16 grouped GEMM with A (or C/D) past 2^31 elements: canonical matches legacy bitwise (needs about 16 GB free)."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100 is required")
     if torch.cuda.mem_get_info()[0] < 16 * 2**30:
