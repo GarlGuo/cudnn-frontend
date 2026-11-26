@@ -222,6 +222,14 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
     # Fixed pad size for user-side padding (decoupled from kernel tile size)
     FIX_PAD_SIZE = 256
 
+    # compact_sfa_sf_warp: per-thread register counts (producer warpgroup, epilogue warpgroup) set with setmaxnreg.  The
+    # 9-warp CTA puts 3 warps on SM sub-partition 0, so it launches with 168 registers per thread, which makes the
+    # epilogue spill (most with the h output).  After the prologue warps 4-7 (MMA, TMA, C load, scheduler) drop to 96
+    # and the epilogue warps 0-3 rise to 240; the SF warp 8 keeps 168.  The increase is served per sub-partition, so
+    # it must stay within what the producer warpgroup frees: epilogue + producer <= 2 * 168.  Measured on GB200:
+    # 240 + 96 runs and removes the spills; 256 hangs; 208 and 224 leave the epilogue at the launch count.
+    COMPACT_SFA_SETMAXNREG = (96, 240)
+
     @staticmethod
     def can_implement(
         ab_dtype: Type[cutlass.Numeric],
@@ -281,7 +289,6 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         use_pdl: bool = False,
         launch_pdl_dependents_at_entry: bool = False,
         compact_sfa_sf_warp: bool = False,
-        regcap_setmaxnreg: Optional[Tuple[int, int, int]] = None,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM dGLU kernel.
 
@@ -342,31 +349,6 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         )
         check_compact_sfa_options(compact_sfa_sf_warp, sf_vec_size, use_2cta_instrs, cluster_shape_mn)
         self.compact_sfa_sf_warp = compact_sfa_sf_warp
-        # Experimental (wip/dglu-regcap): (producer, epilogue, sf) per-thread registers via setmaxnreg on the 9-warp
-        # compact-SFA CTA, whose launch count is 168 (3 warps on SM sub-partition 0).  Warpgroup 1 (warps 4-7: MMA, TMA,
-        # C load, scheduler) drops to ``producer``, the SF warp 8 (alone in warpgroup 2) to ``sf`` (0: unchanged), and
-        # the epilogue warpgroup 0 rises to ``epilogue`` (SASS: USETMAXREG.TRY_ALLOC.CTAPOOL, retried until granted).
-        # Measured on GB200: (96, 240, 0) and (96, 240, 56) run, (96, 256, 56) hangs although the CTA total would cover
-        # it, i.e. the SF warp's decrease does not fund the epilogue (it is alone on sub-partition 0 / in a partial
-        # warpgroup).  So require epilogue - 168 <= 168 - producer (epilogue + producer <= 336).
-        self.regcap_setmaxnreg = None if regcap_setmaxnreg is None else tuple(int(x) for x in regcap_setmaxnreg)
-        if self.regcap_setmaxnreg is not None:
-            if not compact_sfa_sf_warp:
-                raise ValueError("regcap_setmaxnreg needs compact_sfa_sf_warp (the 9-warp CTA)")
-            prod, epi, sf = self.regcap_setmaxnreg
-            launch = 168
-            sf_eff = sf if sf else launch
-            for r in (prod, epi) + ((sf,) if sf else ()):
-                if r % 8 or not 24 <= r <= 256:
-                    raise ValueError(f"setmaxnreg counts are multiples of 8 in [24, 256], got {self.regcap_setmaxnreg}")
-            if prod > launch or epi < launch or (sf and sf > launch):
-                raise ValueError(f"regcap_setmaxnreg: producer / sf <= {launch} <= epilogue, got {self.regcap_setmaxnreg}")
-            if (epi - launch) * 128 > (launch - prod) * 128 + (launch - sf_eff) * 32:
-                raise ValueError(f"regcap_setmaxnreg: the per-CTA pool does not cover the epilogue increase {self.regcap_setmaxnreg}")
-            if epi + prod > 2 * launch:
-                raise ValueError(f"regcap_setmaxnreg: epilogue + producer must be <= {2 * launch} (SM sub-partitions 1-3), got {self.regcap_setmaxnreg}")
-            if (epi + prod + sf_eff) * 32 > 16384:
-                raise ValueError(f"regcap_setmaxnreg: SM sub-partition 0 (warps 0, 4, 8) exceeds 16384 registers {self.regcap_setmaxnreg}")
 
         self.glu_layout = validate_glu_layout(glu_layout)
         self.sf_vec_size = sf_vec_size
@@ -887,6 +869,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         self.generate_dprob = dprob is not None
         self.generate_h = h_tensor is not None
         h_tensor = kernel_facing_mx(h_tensor)
+        # The 9-warp compact-SFA CTA rebalances registers between its warpgroups (see COMPACT_SFA_SETMAXNREG).
+        self.compact_sfa_setmaxnreg = self.COMPACT_SFA_SETMAXNREG if self.compact_sfa_sf_warp else None
 
         # Check if input data types are compatible with MMA instruction
         if cutlass.const_expr(self.a_dtype != self.b_dtype):
@@ -2558,15 +2542,13 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
             cute.arch.nvvm.exit()
         k_tile_cnt = cute.ceil_div(cute.size(mB_nkl, mode=[1]), self.mma_tiler[2])
 
-        # regcap_setmaxnreg: rebalance the 168-register launch count between the warpgroups (see __init__).  Each
-        # setmaxnreg is executed by every warp of its warpgroup (.sync.aligned).  The decreases come here, the epilogue's
-        # increase at the top of its branch, so that ptxas compiles only the epilogue's code with the larger count.
-        if cutlass.const_expr(self.regcap_setmaxnreg is not None):
+        # Compact SFA: warpgroup 1 (warps 4-7) gives up registers for the epilogue warpgroup (see
+        # COMPACT_SFA_SETMAXNREG).  setmaxnreg is executed by every warp of its warpgroup.  The decrease comes here, the
+        # epilogue's increase at the top of its branch, so that ptxas compiles only the epilogue's code with the larger
+        # count.
+        if cutlass.const_expr(self.compact_sfa_setmaxnreg is not None):
             if warp_idx >= self.mma_warp_id and warp_idx < self.mma_warp_id + 4:
-                cute.arch.setmaxregister_decrease(self.regcap_setmaxnreg[0])
-            if cutlass.const_expr(self.regcap_setmaxnreg[2] != 0):
-                if warp_idx == self.sf_warp_id:
-                    cute.arch.setmaxregister_decrease(self.regcap_setmaxnreg[2])
+                cute.arch.setmaxregister_decrease(self.compact_sfa_setmaxnreg[0])
 
         #
         # Specialized Schedule warp (MoE Persistent Tile Scheduler)
@@ -3015,8 +2997,8 @@ class BlockScaledMoEGroupedGemmDgluDbiasKernel(StreamingInputSignalMixin, Compac
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
-            if cutlass.const_expr(self.regcap_setmaxnreg is not None):
-                cute.arch.setmaxregister_increase(self.regcap_setmaxnreg[1])
+            if cutlass.const_expr(self.compact_sfa_setmaxnreg is not None):
+                cute.arch.setmaxregister_increase(self.compact_sfa_setmaxnreg[1])
             #
             # Alloc tensor memory buffer
             #
