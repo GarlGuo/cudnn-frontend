@@ -597,6 +597,11 @@ class MoEStreamingInputBlockSignalTileScheduler:
             claim_idx_in_batch = claim_idx - first_claim_idx
             n_tile = claim_idx_in_batch // m_tile_count
             m_tile = first_m_tile + claim_idx_in_batch % m_tile_count
+            # Short side first (the stock dynamic scheduler's order within an expert): N tiles fastest when the batch has
+            # more M tiles than N tiles, else M tiles fastest.  Any order is safe: a batch holds only ready M tiles.
+            if n_tiles_per_m_tile < m_tile_count:
+                n_tile = claim_idx_in_batch % n_tiles_per_m_tile
+                m_tile = first_m_tile + claim_idx_in_batch // n_tiles_per_m_tile
             # A batch holds only ready M-tiles, so this returns at once.  It is here for its
             # acquire, which pairs the producer's release and makes the M-tile's rows visible.
             _spin_until_at_least(streaming_signal_ptr(dynamic_state.counter_ptr) + m_tile, 0)
