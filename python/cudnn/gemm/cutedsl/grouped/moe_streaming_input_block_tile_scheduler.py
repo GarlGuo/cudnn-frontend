@@ -523,46 +523,40 @@ class MoEStreamingInputBlockSignalTileScheduler:
         lane_ready_m_tile_count: Int32,
         lane_run_complete: Boolean,
     ) -> None:
-        """Publish the chosen expert's batch first, then, in lane order, every other lane's best expert whose ready run
-        is complete (ends the expert or fills the cap), and release them all at once."""
+        """Publish the chosen expert's batch first, then every other expert whose ready run is complete (ends the expert or
+        fills the cap), rescanned 32 experts at a time, and release them all at once.  Experiment: every complete run of the
+        scan, not one per lane."""
         assigned_claim_count_ptr = self._state_region_ptr("assigned_claim_count")
-        expert_last_batch_ptr = self._state_region_ptr("expert_last_batch")
+        local_expert_count = const_expr(self.params.local_expert_count)
         top_lane_candidate = Int32(cute.arch.WARP_SIZE)
         if lane_expert == expert:
             if lane_ready_m_tile_count > 0:
                 top_lane_candidate = Int32(lane_idx)
         top_lane = cute.arch.warp_redux_sync(top_lane_candidate, "min")
-        lane_m_tiles = Int32(0)
         if lane_idx == top_lane:
-            lane_m_tiles = m_tile_count
-        elif lane_run_complete:
-            if lane_expert != expert:
-                lane_m_tiles = lane_ready_m_tile_count
-        # Exclusive prefix of the other lanes' M tiles in lane order, after the chosen batch.
-        other_m_tiles = lane_m_tiles
-        if lane_idx == top_lane:
-            other_m_tiles = Int32(0)
-        prefix = other_m_tiles
-        for shift in cutlass.range_constexpr(5):
-            up = cute.arch.shuffle_sync_up(prefix, 1 << shift)
-            if lane_idx >= (1 << shift):
-                prefix = prefix + up
-        total_m_tiles = m_tile_count + cute.arch.warp_redux_sync(other_m_tiles, "add")
-        first_m_tile_order_in_opening = m_tile_count + prefix - other_m_tiles
-        if lane_idx == top_lane:
-            first_m_tile_order_in_opening = Int32(0)
-        if lane_m_tiles > 0:
-            batch_claim_idx = claim_idx + first_m_tile_order_in_opening * n_tiles_per_m_tile
-            expert_assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + lane_expert
-            already_assigned_m_tiles = cute.arch.load(expert_assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
-            first_m_tile = self._expert_first_m_tile(lane_expert) + already_assigned_m_tiles
-            cute.arch.store(expert_assigned_m_tiles_ptr.llvm_ptr, already_assigned_m_tiles + lane_m_tiles, sem="relaxed", scope="gpu")
-            cute.arch.store((expert_last_batch_ptr + lane_expert).llvm_ptr, batch_claim_idx + 1, sem="relaxed", scope="gpu")
-            # The batch takes the next ``lane_m_tiles`` M-tile orders: the same record in each.
-            first_m_tile_order = batch_claim_idx // n_tiles_per_m_tile
-            for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
-                if m_tile_offset < lane_m_tiles:
-                    self._set_expert_consecutive_m_batch_record(first_m_tile_order + m_tile_offset, (batch_claim_idx, first_m_tile, lane_m_tiles))
+            self._write_batch(claim_idx, n_tiles_per_m_tile, expert, Int32(0), m_tile_count)
+        total_m_tiles = m_tile_count
+        for round_first_expert in cutlass.range_constexpr(0, local_expert_count, cute.arch.WARP_SIZE):
+            scanned_expert = round_first_expert + lane_idx
+            ready_m_tile_count = self._expert_ready_m_tiles(scanned_expert)
+            lane_m_tiles = Int32(0)
+            if ready_m_tile_count > 0:
+                if scanned_expert != expert:
+                    assigned_m_tiles = cute.arch.load(
+                        (self._state_region_ptr("expert_assigned_m_tiles") + scanned_expert).llvm_ptr, Int32, sem="relaxed", scope="gpu"
+                    )
+                    run_end_m_tile = self._expert_first_m_tile(scanned_expert) + assigned_m_tiles + ready_m_tile_count
+                    if ready_m_tile_count == const_expr(EXPERT_BATCH_MAX_M_TILES) or run_end_m_tile >= self._expert_end_m_tile(scanned_expert):
+                        lane_m_tiles = ready_m_tile_count
+            # Inclusive prefix of this round's M tiles in lane order.
+            prefix = lane_m_tiles
+            for shift in cutlass.range_constexpr(5):
+                up = cute.arch.shuffle_sync_up(prefix, 1 << shift)
+                if lane_idx >= (1 << shift):
+                    prefix = prefix + up
+            if lane_m_tiles > 0:
+                self._write_batch(claim_idx, n_tiles_per_m_tile, scanned_expert, total_m_tiles + prefix - lane_m_tiles, lane_m_tiles)
+            total_m_tiles = total_m_tiles + cute.arch.warp_redux_sync(lane_m_tiles, "add")
         # bar.warp.sync orders every lane's stores above before the elected lane's release below.
         cute.arch.sync_warp()
         with cute.arch.elect_one():
@@ -572,6 +566,22 @@ class MoEStreamingInputBlockSignalTileScheduler:
         # ``assigned_claim_count`` is past ``claim_idx`` now, so this returns at once.  It is
         # here for its acquire: other lanes wrote the records, and every lane is about to read them.
         _spin_until_at_least(assigned_claim_count_ptr, claim_idx + 1)
+
+    @cute.jit
+    def _write_batch(self, claim_idx: Int32, n_tiles_per_m_tile: Int32, batch_expert: Int32, first_m_tile_order_in_opening: Int32,
+                     batch_m_tiles: Int32) -> None:
+        """Assign ``batch_m_tiles`` M tiles of ``batch_expert`` from its first unassigned one, at M-tile order
+        ``first_m_tile_order_in_opening`` of this opening (relaxed stores; the opening's release publishes them)."""
+        batch_claim_idx = claim_idx + first_m_tile_order_in_opening * n_tiles_per_m_tile
+        expert_assigned_m_tiles_ptr = self._state_region_ptr("expert_assigned_m_tiles") + batch_expert
+        already_assigned_m_tiles = cute.arch.load(expert_assigned_m_tiles_ptr.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+        first_m_tile = self._expert_first_m_tile(batch_expert) + already_assigned_m_tiles
+        cute.arch.store(expert_assigned_m_tiles_ptr.llvm_ptr, already_assigned_m_tiles + batch_m_tiles, sem="relaxed", scope="gpu")
+        cute.arch.store((self._state_region_ptr("expert_last_batch") + batch_expert).llvm_ptr, batch_claim_idx + 1, sem="relaxed", scope="gpu")
+        first_m_tile_order = batch_claim_idx // n_tiles_per_m_tile
+        for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
+            if m_tile_offset < batch_m_tiles:
+                self._set_expert_consecutive_m_batch_record(first_m_tile_order + m_tile_offset, (batch_claim_idx, first_m_tile, batch_m_tiles))
 
     @cute.jit
     def _claim_linear_tile_idx(self, n_tiles_per_m_tile: Int32, lane_idx: Int32) -> Int32:
