@@ -1,7 +1,9 @@
 #!/bin/bash
 # run_rubin.sh: lock-step MXFP8 wgrad A/B on one node, all GPUs.
 # Env: FE_PYTHON (required: <tree>/python), OUT (default ./lsw_out), BUDGET (s per round, default 600), REPS (10),
-#      MODES ("0 1": CLC, atomic counter), PASSES ("a b": rank positions forward, then reversed), PY (python), TORCHRUN.
+#      MODES ("0 1": CLC, atomic counter), PASSES ("a b": rank positions forward, then reversed), PY (python), TORCHRUN,
+#      ROUNDS (round indices to run, e.g. "0 1"; default all ceil(10 / GPUs) rounds), for splitting the run into jobs.
+# Jobs may write to separate OUT dirs; agg_rubin.py merges any number of them (pass every *.jsonl.r* file).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=${OUT:-$PWD/lsw_out}; mkdir -p "$OUT"
@@ -14,7 +16,7 @@ echo "GPUs $NG rounds $NR tree $FE_PYTHON $(git -C "$FE_PYTHON/.." rev-parse --s
 nvidia-smi --query-gpu=index,name,clocks.max.sm,power.limit --format=csv,noheader
 for mode in ${MODES:-0 1}; do
   for pass in ${PASSES:-a b}; do
-    for ((r = 0; r < NR; r++)); do
+    for r in ${ROUNDS:-$(seq 0 $((NR - 1)))}; do
       list=(); for ((i = 0; i < NG; i++)); do list+=("${SHAPES[$(( (r * NG + i) % NS ))]}"); done
       [ "$pass" = b ] && list=($(printf '%s\n' "${list[@]}" | tac))
       shapes=$(IFS=,; echo "${list[*]}")

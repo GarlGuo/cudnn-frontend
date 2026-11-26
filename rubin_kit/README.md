@@ -96,6 +96,15 @@ cd ../w_wgrad2/rubin_kit
 FE_PYTHON=$PWD/../python OUT=$PWD/lsw_out bash run_rubin.sh
 # quick check first (~5 min): BUDGET=60 REPS=3 MODES=0 PASSES=a FE_PYTHON=$PWD/../python OUT=$PWD/lsw_smoke bash run_rubin.sh
 ```
+Splitting into shorter jobs: each job runs every arm, interleaved, for the rounds it is given.
+- One MODES value and one PASSES value per job (4 jobs: MODES 0/1 x PASSES a/b). With 4 GPUs, one such job is
+  3 rounds x ~11 min at BUDGET=600. For jobs of 30 min or less, use BUDGET=480, or split further with ROUNDS
+  (e.g. ROUNDS="0 1" and ROUNDS="2").
+- Give each job its own OUT (or the same OUT; files are named per mode, pass and round).
+- Then merge all jobs in one table:
+  `python agg_rubin.py <job1_out>/*.jsonl.r* <job2_out>/*.jsonl.r* ... > tables.md`
+  Passes from all jobs are pooled per (mode, shape). The per-job tables.md that run_rubin.sh writes covers only that job.
+
 If FP8 conversion or E8M0 work on the GPU fails (the earlier NVRTC issue), add `LSW_CPU_INIT=1` (operands built on the
 CPU). `PY` / `TORCHRUN` override the python and torchrun binaries.
 
