@@ -3069,24 +3069,28 @@ def test_grouped_gemm_dglu_h_rejections(request, monkeypatch):
     with pytest.raises(ValueError, match="dswiglu"):
         _run_dglu_case(case, act_func="dgeglu", generate_h=True)
 
-    # The BF16 backend has no h output, in the class API or the wrapper.
+    # The BF16 backend writes h without scales (its activation output): column scales and a second activation request
+    # are rejected, in the class API and the wrapper.
     problem = make_grouped_gemm_dglu_bf16_problem(discrete=False, b_major="k")
-    with pytest.raises(ValueError, match="sample_h"):
-        cudnn.GroupedGemmDgluSm100(
-            sample_a=problem["a"],
-            sample_c=problem["c"],
-            sample_d_row=problem["c"],
-            sample_d_col=None,
-            sample_sfa=None,
-            sample_padded_offsets=problem["offsets"],
-            sample_alpha=problem["alpha"],
-            sample_beta=problem["beta"],
-            sample_prob=problem["prob"],
-            sample_dprob=problem["dprob"],
-            sample_b=problem["b"],
-            sample_h=tensors["h_tensor"],
-            sample_sfh_col=tensors["sfh_col_tensor"],
-        ).check_support()
+    bf16_h = torch.empty(problem["c"].shape[0], problem["c"].shape[1] // 2, 1, dtype=torch.bfloat16, device="cuda")
+    bf16_kwargs = dict(
+        sample_a=problem["a"],
+        sample_c=problem["c"],
+        sample_d_row=problem["c"],
+        sample_d_col=None,
+        sample_sfa=None,
+        sample_padded_offsets=problem["offsets"],
+        sample_alpha=problem["alpha"],
+        sample_beta=problem["beta"],
+        sample_prob=problem["prob"],
+        sample_dprob=problem["dprob"],
+        sample_b=problem["b"],
+        sample_h=bf16_h,
+    )
+    with pytest.raises(ValueError, match="sample_sfh_col"):
+        cudnn.GroupedGemmDgluSm100(**bf16_kwargs, sample_sfh_col=tensors["sfh_col_tensor"]).check_support()
+    with pytest.raises(ValueError, match="same BF16 output"):
+        cudnn.GroupedGemmDgluSm100(**bf16_kwargs, sample_activation=bf16_h).check_support()
     with pytest.raises(ValueError, match="generate_h"):
         cudnn.grouped_gemm_dglu_wrapper_sm100(
             a_tensor=problem["a"],
@@ -3100,6 +3104,7 @@ def test_grouped_gemm_dglu_h_rejections(request, monkeypatch):
             b_tensor=problem["b"],
             sfb_tensor=None,
             d_dtype=torch.bfloat16,
+            activation_tensor=bf16_h,
             generate_h=True,
         )
 

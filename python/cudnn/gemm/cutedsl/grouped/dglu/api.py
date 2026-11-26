@@ -265,7 +265,6 @@ class GroupedGemmDgluSm100(APIBase):
                     ("sf_fp8_dtype_override", kwargs["sf_fp8_dtype_override"]),
                     ("discrete_col_sfd", kwargs["discrete_col_sfd"] if kwargs["discrete_col_sfd"] else None),
                     ("epilogue_op", kwargs["epilogue_op"] if kwargs["epilogue_op"] not in (None, "none", "identity") else None),
-                    ("sample_h", kwargs["sample_h"]),
                     ("sample_sfh_col", kwargs["sample_sfh_col"]),
                 ),
                 block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
@@ -278,6 +277,12 @@ class GroupedGemmDgluSm100(APIBase):
                 self._value_error_if(
                     kwargs["use_single_group_runtime_offsets"],
                     "use_single_group_runtime_offsets is supported only by the block-scaled kernel",
+                )
+                # BF16 h: the forward activation prob * act(beta * gate) * (beta * up) in BF16, which the BF16 kernel
+                # writes as its activation output; it needs no column scales.
+                self._value_error_if(
+                    kwargs["sample_h"] is not None and kwargs["sample_activation"] is not None,
+                    "sample_h and sample_activation name the same BF16 output; give one",
                 )
                 self._implementation = GroupedGemmDgluBf16API(
                     sample_a=kwargs["sample_a"],
@@ -305,7 +310,7 @@ class GroupedGemmDgluSm100(APIBase):
                     glu_clamp_max=kwargs["glu_clamp_max"],
                     glu_clamp_min=kwargs["glu_clamp_min"],
                     round_dgrad_to_input_dtype=kwargs["round_dgrad_to_input_dtype"],
-                    sample_activation=kwargs["sample_activation"],
+                    sample_activation=kwargs["sample_activation"] if kwargs["sample_h"] is None else kwargs["sample_h"],
                     glu_layout=kwargs["glu_layout"],
                     _deterministic=kwargs["_deterministic"],
                 )
@@ -442,12 +447,15 @@ class GroupedGemmDgluSm100(APIBase):
                 ("sfd_col_tensor", sfd_col_tensor),
                 ("amax_tensor", amax_tensor),
                 ("norm_const_tensor", norm_const_tensor),
-                ("h_tensor", h_tensor),
                 ("sfh_col_tensor", sfh_col_tensor),
             )
             forbidden = [name for name, value in controls if value is not None]
             if forbidden:
                 raise ValueError(f"grouped_gemm_dglu_sm100: BF16 forbids scale control {forbidden[0]}")
+            if h_tensor is not None:
+                if activation_tensor is not None:
+                    raise ValueError("h_tensor and activation_tensor name the same BF16 output; give one")
+                activation_tensor = h_tensor
             self._implementation.execute(
                 a_tensor=a_tensor,
                 c_tensor=c_tensor,
@@ -1113,7 +1121,6 @@ def _normalize_dglu_call(
                 "epilogue_op",
                 call.epilogue_op if call.epilogue_op not in (None, "none", "identity") else None,
             ),
-            ("generate_h", call.generate_h or None),
         ),
         block_scaled_dtype_pairs=_block_scaled_dtype_pairs(),
     )
@@ -1138,7 +1145,9 @@ def _normalize_dglu_call(
         check_canonical_contiguous(call.a_tensor, call.b_tensor, call.prob_tensor)
     elif len(a_shape) == 2:
         raise ValueError("Canonical BF16 layouts require torch tensors")
-    if call.activation_tensor is not None:
+    if call.generate_h and call.activation_tensor is not None:
+        raise ValueError("generate_h allocates h, the BF16 activation output; pass generate_h or activation_tensor, not both")
+    if call.activation_tensor is not None or call.generate_h:
         if detect_framework(call.a_tensor) != "torch":
             raise ValueError("activation output currently requires torch tensors")
         if _convert_to_cutlass_data_type(call.c_tensor.dtype) != cutlass.BFloat16 or call.d_dtype != cutlass.BFloat16:
@@ -1250,11 +1259,28 @@ def _dglu_allocate_outputs(framework, valid_m, two_n, d_dtype, generate_dbias, n
 _dglu_wrapper_memo: dict = {}
 
 
+def _dglu_allocate_bf16_h(valid_m, n, a_tensor, current_stream):
+    """generate_h on the BF16 path: h (valid_m, n) BF16, the kernel's activation output, in A's rank convention."""
+    import torch
+
+    with _torch_stream_context(current_stream, a_tensor.device):
+        return torch.empty_strided(*row_major_layout(valid_m, n, a_tensor.ndim == 2), dtype=torch.bfloat16, device=a_tensor.device)
+
+
+def _dglu_bf16_h_outputs(call_generate_h, activation_tensor) -> dict:
+    """Result keys for the BF16 activation output: h_tensor (sfh_col_tensor None) with generate_h, else activation_tensor."""
+    if call_generate_h:
+        return {"h_tensor": activation_tensor, "sfh_col_tensor": None}
+    return {"activation_tensor": activation_tensor} if activation_tensor is not None else {}
+
+
 def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = None) -> TupleDict:
     framework = detect_framework(call.a_tensor)
     valid_m = get_shape(call.a_tensor)[0]
     n_weight = b_nkl(call.b_tensor, call.b_major)[0] if call.b_tensor is not None else call.n
     two_n = 2 * n_weight
+    if call.generate_h:
+        call = replace(call, activation_tensor=_dglu_allocate_bf16_h(valid_m, n_weight, call.a_tensor, call.current_stream))
     d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
         framework, valid_m, two_n, call.d_dtype, call.generate_dbias, call.num_experts, call.a_tensor, call.current_stream
     )
@@ -1384,7 +1410,7 @@ def _grouped_gemm_dglu_bf16_call(call: DgluCall, memo_key: Optional[tuple] = Non
         amax_tensor=None,
         sfd_row_tensor=None,
         sfd_col_tensor=None,
-        **({"activation_tensor": call.activation_tensor} if call.activation_tensor is not None else {}),
+        **_dglu_bf16_h_outputs(call.generate_h, call.activation_tensor),
     )
 
 
@@ -1440,8 +1466,10 @@ def grouped_gemm_dglu_wrapper_sm100(
     ``glu_layout="gate_then_up"`` consumes canonical C and returns canonical
     gate/up halves in D, dbias and both D scale buffers. It is independent of
     the natural-rank tensor convention advertised by ``supports_canonical_layouts``.
-    ``generate_h=True`` (block-scaled MXFP8 dSwiGLU, SM100/103) also returns ``h_tensor`` and
-    ``sfh_col_tensor``, the forward activation h column-quantized for the FC2 weight gradient.
+    ``generate_h=True`` also returns ``h_tensor``, the forward activation h = prob * act(beta * gate) * (beta * up)
+    that the FC2 weight gradient takes, and ``sfh_col_tensor``. Block-scaled MXFP8 dSwiGLU (SM100/103): h in D's FP8
+    dtype, column-quantized, with its E8M0 column scales. BF16 (dSwiGLU or dGeGLU, BF16 C/D, torch): h in BF16, the
+    kernel's activation output, and ``sfh_col_tensor`` None; ``activation_tensor`` is the caller-allocated form of it.
     """
     validate_glu_layout(glu_layout)
     if glu_layout == "gate_then_up":
@@ -1570,6 +1598,8 @@ def grouped_gemm_dglu_wrapper_sm100(
         d_row_tensor, dbias_tensor = _dglu_allocate_outputs(
             memo_framework, valid_m, two_n, memo_d_dtype, memo_generate_dbias, memo_experts, a_tensor, current_stream
         )
+        if generate_h:
+            activation_tensor = _dglu_allocate_bf16_h(valid_m, two_n // 2, a_tensor, current_stream)
         launch_stream = current_stream if current_stream is not None or memo_framework == "torch" else default_stream(memo_framework)
         with wrapper_workspace(memo_framework, api.scratch_workspace_bytes(), a_tensor.device, launch_stream) as workspace:
             api._implementation.execute(
@@ -1597,7 +1627,7 @@ def grouped_gemm_dglu_wrapper_sm100(
             amax_tensor=None,
             sfd_row_tensor=None,
             sfd_col_tensor=None,
-            **({"activation_tensor": activation_tensor} if activation_tensor is not None else {}),
+            **_dglu_bf16_h_outputs(generate_h, activation_tensor),
         )
 
     call = DgluCall(
