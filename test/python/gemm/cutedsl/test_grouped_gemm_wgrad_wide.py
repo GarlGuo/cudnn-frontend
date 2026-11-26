@@ -36,8 +36,8 @@ def require_sm100():
 
     if not torch.cuda.is_available() or not has_tcgen05(torch.cuda.get_device_capability()[0]):
         pytest.skip("Requires SM100+ for grouped GEMM wgrad")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("The wide wgrad is SM100/SM103 only")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("The wide wgrad is SM100/SM103/SM107 only")
 
 
 def _run(problem, output_mode, *, counter=False, tile=(256, 256), cluster=(2, 1)):

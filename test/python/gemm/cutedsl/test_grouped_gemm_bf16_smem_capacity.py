@@ -22,6 +22,7 @@ def bf16_kernels():
     from cudnn.gemm.cutedsl.grouped.glu.moe_grouped_gemm_glu_bias import MoEGroupedGemmGluBiasBf16Kernel
     from cudnn.gemm.cutedsl.grouped.unfused.moe_grouped_gemm import MoEGroupedGemmBf16Kernel
     from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad import MoEGroupedGemmWgradBF16Kernel
+    from cudnn.gemm.cutedsl.grouped.wgrad.moe_grouped_gemm_wgrad_wide import MoEGroupedGemmWgradWideBF16Kernel
 
     common = dict(acc_dtype=cutlass.Float32, use_2cta_instrs=True, mma_tiler_mn=(256, 256), cluster_shape_mn=(2, 1))
     return {
@@ -29,6 +30,7 @@ def bf16_kernels():
         "glu": (MoEGroupedGemmGluBiasBf16Kernel(**common, vectorized_f32=False, expert_cnt=2), "num_smem_capacity"),
         "dglu": (MoEGroupedGemmDgluDbiasBf16Kernel(**common, vectorized_f32=False, expert_cnt=2), "num_smem_capacity"),
         "wgrad": (MoEGroupedGemmWgradBF16Kernel(**common, expert_cnt=2), "smem_capacity"),
+        "wgrad_wide": (MoEGroupedGemmWgradWideBF16Kernel(expert_cnt=2), "smem_capacity"),
     }
 
 

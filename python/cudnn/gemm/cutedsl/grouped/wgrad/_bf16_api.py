@@ -308,12 +308,11 @@ class GroupedGemmWgradBf16API(APIBase):
 
     def _wide_applies(self) -> bool:
         """Whether the wide kernel (256 x 512 tiles per CTA pair, the same dW bits) replaces the stock one: when enabled,
-        at the default 2-CTA 256x256 tile on SM100/SM103 for dense output, Tensor2D input, no accumulation, 16-bit dW
-        and n % 512 == 0."""
+        at the default 2-CTA 256x256 tile on SM100/SM103/SM107 for dense output, Tensor2D input, no accumulation,
+        16-bit dW and n % 512 == 0."""
         m, n = self.wgrad_shape
         return (
             self._use_wide_tiles
-            and not self._is_rubin_kernel
             and self.weight_mode == MoEWeightMode.DENSE
             and self.input_order == WGradInputOrder.Tensor2D
             and not self.accumulate_on_output
