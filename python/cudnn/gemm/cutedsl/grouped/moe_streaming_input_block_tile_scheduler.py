@@ -88,6 +88,10 @@ from .moe_persistent_scheduler import (
 #: of weights they multiply.
 EXPERT_BATCH_MAX_M_TILES = 16
 
+#: Named barrier id of the batch opener's publish (one warp).  The signal kernels use ids 1-8; 15 is the last
+#: hardware id.
+OPENER_PUBLISH_BARRIER_ID = 15
+
 
 def _state_region_offsets(streaming_signal_capacity: int, local_expert_count: int) -> dict:
     """Int32 offset of each region of the scheduler state, and the total.  The reset is all zero; a batch record
@@ -565,8 +569,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
             for m_tile_offset in cutlass.range_constexpr(EXPERT_BATCH_MAX_M_TILES):
                 if m_tile_offset < lane_m_tiles:
                     self._set_expert_consecutive_m_batch_record(first_m_tile_order + m_tile_offset, (batch_claim_idx, first_m_tile, lane_m_tiles))
-        # bar.warp.sync orders every lane's stores above before the elected lane's release below.
-        cute.arch.sync_warp()
+        # A 32-thread named barrier (bar.sync, its own id) orders every lane's stores above before the elected lane's
+        # release below.  Experiment: replaces bar.warp.sync.
+        cute.arch.barrier(barrier_id=OPENER_PUBLISH_BARRIER_ID, number_of_threads=cute.arch.WARP_SIZE)
         with cute.arch.elect_one():
             # Published LAST, and that order is load-bearing: the release is what hands the
             # records to the claimers and ``expert_assigned_m_tiles[]`` to the next opener.
