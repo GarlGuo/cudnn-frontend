@@ -321,14 +321,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
         """Claim the cluster's next linear tile index and return its work tile, invalid past the last."""
         claimed_linear_tile_idx = self._broadcast_claimed_tile()
         work_tile_info = self._get_work_tile_for_linear_idx(claimed_linear_tile_idx)
-        # The broadcast value is consumed: a full warp per CTA arrives on the leader's empty barrier, each lane at an
-        # address computed from the slot word it read, so the read completes before the leader may refill the slot (Rule 11).
-        consume_then_arrive_on_peer(
-            self.cluster_pipeline.sync_object_empty.get_barrier(self._dynamic_state.consumer_state.index),
-            0,
-            claimed_linear_tile_idx,
-            self.release_zero,
-        )
+        # Experiment: a plain arrive on the leader's empty barrier (a full warp per CTA), with no address dependence on the
+        # slot word read above (replaces the consume-then-arrive slot release).
+        self.cluster_pipeline.sync_object_empty.arrive(self._dynamic_state.consumer_state.index, 0)
         self._dynamic_state.consumer_state.advance()
         return work_tile_info
 
