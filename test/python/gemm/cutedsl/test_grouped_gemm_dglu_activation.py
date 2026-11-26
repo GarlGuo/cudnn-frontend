@@ -590,8 +590,8 @@ def test_dswiglu_activation_is_bitwise_forward_glu_output(discrete, vector_f32, 
     """h equals the forward GLU D byte for byte when C holds the forward pre-activation."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10 or cutedsl_too_old(cutedsl_state()[1]):
         pytest.skip("requires Blackwell and CuTe DSL>=4.7.0")
-    if glu_layout == "gate_then_up" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("gate_then_up requires SM100/103")
+    if glu_layout == "gate_then_up" and torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("gate_then_up requires SM100/103/107")
     torch.manual_seed(467)
     m, k, k2 = 1280, 128, 256
     ends = [256, 256, 768, 1024]  # an empty expert and capacity past the final offset

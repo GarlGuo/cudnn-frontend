@@ -194,7 +194,8 @@ class MoEGroupedGemmWgradBF16Kernel:
         self.tmem_alloc_sync_bar_id = 2
         self.tmem_dealloc_sync_bar_id = 3
 
-        self.smem_capacity = get_smem_capacity_in_bytes("sm_100")
+        # The compile target's shared memory: 232448 B on SM100/103, 334848 B on SM107 (more A/B stages).
+        self.smem_capacity = get_smem_capacity_in_bytes()
         self.num_tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
     # ------------------------------------------------------------------
