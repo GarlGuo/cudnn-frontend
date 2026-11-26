@@ -1,0 +1,8 @@
+{
+ "host_min_avail_gb": 64,
+ "memcheck": 3,
+ "perf": 2,
+ "racecheck": 2,
+ "synccheck": 2,
+ "test": 8
+}
