@@ -74,6 +74,31 @@ class CompactSfaSfWarpMixin:
             fence_acquire_sync_restrict_shared_cluster_cluster()
 
     @cute.jit
+    def compact_sfa_full_try_wait(self, ab_pipeline, state):
+        """``compact_sfa_handshake == "merged"``, MMA leader: peek a stage's full barrier with a relaxed ``.cluster``
+        try_wait (no acquire, no L1 invalidation); ``compact_sfa_full_wait`` supplies the acquire."""
+        return mbarrier_try_wait_parity_relaxed_cluster(ab_pipeline.sync_object_full.get_barrier(state.index), state.phase)
+
+    @cute.jit
+    def compact_sfa_full_wait(self, ab_pipeline, state, peeked) -> None:
+        """``compact_sfa_handshake == "merged"``, MMA leader: the stage's ONE full wait, in place of the pipeline's
+        ``consumer_wait`` (try_wait, acquire.cta) plus ``compact_sfa_acquire`` (a second relaxed ``.cluster`` poll and the
+        fence).  Poll the full barrier relaxed at ``.cluster`` until its phase completes (skipped when the peek saw it),
+        then ``fence.acquire.sync_restrict::shared::cluster.cluster``.  The phase completes only after (a) both CTAs' SF
+        warps' arrives, each a release pattern (``fence.release.sync_restrict::shared::cta.cluster`` + relaxed
+        ``.cluster`` arrive), and (b) the TMA's complete_tx, which has release semantics at ``.cluster`` scope.  A relaxed
+        ``.cluster`` read that observes the completed phase followed by the acquire fence is an acquire pattern at
+        ``.cluster`` scope, so it synchronizes with both; the sync_restrict acquire covers ``.shared::cluster`` objects,
+        which hold every operand the MMA warp's tcgen05.cp / tcgen05.mma read (sA, sB, sSFA, sSFB of both CTAs).  The
+        acquire.cta of the stock wait is subsumed (``.shared::cta`` is a subset of ``.shared::cluster``, cta scope of
+        cluster scope)."""
+        full_barrier = ab_pipeline.sync_object_full.get_barrier(state.index)
+        ready = peeked
+        while not ready:
+            ready = mbarrier_try_wait_parity_relaxed_cluster(full_barrier, state.phase)
+        fence_acquire_sync_restrict_shared_cluster_cluster()
+
+    @cute.jit
     def compact_sfa_sf_warp_loop(self, compact_sfa_words, sSFA, mA_mkl, padded_offsets, sInfo, tile_info_pipeline, ab_pipeline, leader_cta, lane_idx, zero):
         """Per tile and K tile: wait for the stage, store this CTA's SF atom from the compact rows, release it to the
         leader's full barrier.  Lane l owns rows l + 32 r (r < 4) of the CTA's 128 rows; a row's word of a K tile is its

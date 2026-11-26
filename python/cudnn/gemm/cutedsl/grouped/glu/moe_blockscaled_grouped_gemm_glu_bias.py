@@ -327,6 +327,7 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         compact_sfa_sf_warp: bool = False,
         reset_scheduler_counter_on_exit: bool = False,
         compact_sfa_handshake: str = "full",
+        single_batch_opening: bool = False,
     ):
         """Initializes the configuration for a Blackwell blockscaled grouped GEMM GLU kernel.
 
@@ -398,8 +399,11 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
         self.reset_scheduler_counter_on_exit = reset_scheduler_counter_on_exit
         # Diagnostic: "full" (default, the sync_restrict handoff), "noacq" (no MMA-side re-wait + acquire fence),
         # "light" (EPC main's handoff: plain arrive, no MMA-side acquire, no fence before the SF stores).
-        assert compact_sfa_handshake in ("full", "noacq", "light")
+        assert compact_sfa_handshake in ("full", "noacq", "light", "merged")
+        assert compact_sfa_handshake == "full" or compact_sfa_sf_warp
         self.compact_sfa_handshake = compact_sfa_handshake
+        # Experiment (attribution only): the signal scheduler opens one batch per opening.
+        self.streaming_single_batch_opening = single_batch_opening
 
         self.glu_layout = validate_glu_layout(glu_layout)
         self.sf_vec_size = sf_vec_size
@@ -2484,7 +2488,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
                 ab_consumer_state.reset_count()
                 peek_ab_full_status = cutlass.Boolean(1)
                 if ab_consumer_state.count < k_tile_cnt and is_leader_cta:
-                    peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
+                    if cutlass.const_expr(self.compact_sfa_handshake == "merged"):
+                        peek_ab_full_status = self.compact_sfa_full_try_wait(ab_pipeline, ab_consumer_state)
+                    else:
+                        peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
 
                 # Peek (try_wait) Acc buffer empty for k_tile = 0
                 acd_producer_state.reset_count()
@@ -2545,9 +2552,12 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
                         if cutlass.const_expr(self.use_sfb_reorder_warp):
                             ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
                             _wait_sfb_cluster(sfb_pair_barrier_base + ab_consumer_state.index, ab_consumer_state.phase)
+                        elif cutlass.const_expr(self.compact_sfa_handshake == "merged"):
+                            self.compact_sfa_full_wait(ab_pipeline, ab_consumer_state, peek_ab_full_status)
                         else:
                             ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
-                        self.compact_sfa_acquire(ab_pipeline, ab_consumer_state)
+                        if cutlass.const_expr(self.compact_sfa_handshake != "merged"):
+                            self.compact_sfa_acquire(ab_pipeline, ab_consumer_state)
                         if cutlass.const_expr(self.glu_layout == "gate_then_up" and not self.use_2cta_instrs):
                             self.interleave_sfb_in_place(sSFB, ab_consumer_state.index, lane_idx)
 
@@ -2577,7 +2587,10 @@ class BlockScaledMoEGroupedGemmGluBiasKernel(StreamingInputSignalMixin, CompactS
                         ab_consumer_state_next = ab_consumer_state.clone()
                         ab_consumer_state_next.advance()
                         if ab_consumer_state_next.count < k_tile_cnt:
-                            peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state_next)
+                            if cutlass.const_expr(self.compact_sfa_handshake == "merged"):
+                                peek_ab_full_status = self.compact_sfa_full_try_wait(ab_pipeline, ab_consumer_state_next)
+                            else:
+                                peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state_next)
 
                         for kblock_idx in cutlass.range(num_kblocks, unroll_full=True):
                             kblock_coord = (

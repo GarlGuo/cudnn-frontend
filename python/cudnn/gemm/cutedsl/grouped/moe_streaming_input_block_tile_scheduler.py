@@ -146,12 +146,15 @@ class MoEInputBlockSignalSchedulerParams:
         expert_shape: Tuple[int | Int32, int | Int32, int | Int32],
         cta_tile_shape_mnk: Tuple[int, int, int],
         cluster_shape_mn: Tuple[int, int],
+        single_batch_opening: bool = False,
     ):
         # Whatever the caller passed, keep as-is: a Python int stays trace-time and is
         # never serialized, so expressions over it fold instead of costing a register.
         self.local_expert_count, self.intermediate, self.hidden = expert_shape
         self.cta_tile_shape_mnk = cta_tile_shape_mnk
         self.cluster_shape_mn = cluster_shape_mn
+        # Experiment (attribution only): an opening publishes only the chosen batch, not the other lanes' complete runs.
+        self.single_batch_opening = single_batch_opening
 
     @property
     def cluster_tile_m(self) -> int:
@@ -183,6 +186,7 @@ class MoEInputBlockSignalSchedulerParams:
             expert_shape=rebuilt,
             cta_tile_shape_mnk=self.cta_tile_shape_mnk,
             cluster_shape_mn=self.cluster_shape_mn,
+            single_batch_opening=self.single_batch_opening,
         )
 
 
@@ -520,8 +524,9 @@ class MoEStreamingInputBlockSignalTileScheduler:
         if lane_idx == top_lane:
             lane_m_tiles = m_tile_count
         elif lane_run_complete:
-            if lane_expert != expert:
-                lane_m_tiles = lane_ready_m_tile_count
+            if const_expr(not self.params.single_batch_opening):
+                if lane_expert != expert:
+                    lane_m_tiles = lane_ready_m_tile_count
         # Exclusive prefix of the other lanes' M tiles in lane order, after the chosen batch.
         other_m_tiles = lane_m_tiles
         if lane_idx == top_lane:
@@ -715,7 +720,12 @@ class StreamingInputSignalMixin:
     def make_streaming_input_sched_params(self, expert_shape, cta_tile_shape_mnk, cluster_shape_mn, use_dynamic_sched: bool):
         """The scheduler parameters: the signal scheduler's, or the stock 2Dx3D ones."""
         if self.use_streaming_signal_sched:
-            return MoEInputBlockSignalSchedulerParams(expert_shape=expert_shape, cta_tile_shape_mnk=cta_tile_shape_mnk, cluster_shape_mn=cluster_shape_mn)
+            return MoEInputBlockSignalSchedulerParams(
+                expert_shape=expert_shape,
+                cta_tile_shape_mnk=cta_tile_shape_mnk,
+                cluster_shape_mn=cluster_shape_mn,
+                single_batch_opening=getattr(self, "streaming_single_batch_opening", False),
+            )
         return MoESchedulerParams(
             scenario="2Dx3D",
             expert_shape=expert_shape,
