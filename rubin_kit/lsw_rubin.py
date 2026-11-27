@@ -22,6 +22,7 @@ vs stock_sm100 (expected 0); dense vs stock (a different MMA K, so bits may diff
 the max |diff| / max |stock|).
 Shape: T * top_k * ep / E rows per local expert (balanced), padded to 256; K-major FP8 A/B, random E8M0 scales, BF16 dW.
 """
+
 import argparse, json, os, sys, time, types
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -117,8 +118,23 @@ def main():
     flush = torch.empty(512 * 1024 * 1024, dtype=torch.uint8, device=dev)
     counter = os.environ.get("WAB_COUNTER", "0") == "1"
     a_stages = Reuse.a_stages_for(rows, el) if hasattr(Reuse, "a_stages_for") else None
-    emit(dict(kind="shape", rows=rows, per_expert=per, experts=el, H=H, I=I, clusters=clusters, counter=counter, capability=list(cap),
-              rubin=rubin, arms=names, reuse_a_stages=a_stages, sms=torch.cuda.get_device_properties(0).multi_processor_count))
+    emit(
+        dict(
+            kind="shape",
+            rows=rows,
+            per_expert=per,
+            experts=el,
+            H=H,
+            I=I,
+            clusters=clusters,
+            counter=counter,
+            capability=list(cap),
+            rubin=rubin,
+            arms=names,
+            reuse_a_stages=a_stages,
+            sms=torch.cuda.get_device_properties(0).multi_processor_count,
+        )
+    )
 
     def t(x, align=16):
         return from_dlpack(x, assumed_align=align)
@@ -137,15 +153,41 @@ def main():
         cols = -(-(rows // 32) // 4) * 4
         sfa, sfb = e8m0(m, cols), e8m0(n, cols)
         epc = Reuse.can_implement(m, n, ab_bits=8, c_bits=16, has_global_scale=False, tokens=rows, experts=el)
-        emit(dict(kind="rule", gemm=gname, m=m, n=n, epc_reuse=bool(epc), refined_reuse=bool(epc and n // 256 > Reuse.n_group_for(n)),
-                  n_group=Reuse.n_group_for(n)))
+        # The library's rule (wip/wgrad-areuse-v3 and later): Reuse.prefer_over_dense.
+        lib = (
+            Reuse.prefer_over_dense(m, n, ab_bits=8, c_bits=16, has_global_scale=False, tokens=rows, experts=el)
+            if hasattr(Reuse, "prefer_over_dense")
+            else None
+        )
+        emit(
+            dict(
+                kind="rule",
+                gemm=gname,
+                m=m,
+                n=n,
+                epc_reuse=bool(epc),
+                refined_reuse=bool(epc and n // 256 > Reuse.n_group_for(n)),
+                lib_reuse=lib,
+                n_group=Reuse.n_group_for(n),
+            )
+        )
         outs, shared = {}, None
         for arm in names:
             cls = classes[arm]
             kw = dict(a_stages=a_stages) if (cls is Reuse and a_stages is not None) else {}
             try:
-                kernel = cls(sf_vec_size=32, acc_dtype=cutlass.Float32, use_2cta_instrs=True, mma_tiler_mn=(256, 256), cluster_shape_mn=(2, 1),
-                             expert_cnt=el, weight_mode=MoEWeightMode.DENSE, input_order=WGradInputOrder.Tensor2D, atomic_counter_claim=counter, **kw)
+                kernel = cls(
+                    sf_vec_size=32,
+                    acc_dtype=cutlass.Float32,
+                    use_2cta_instrs=True,
+                    mma_tiler_mn=(256, 256),
+                    cluster_shape_mn=(2, 1),
+                    expert_cnt=el,
+                    weight_mode=MoEWeightMode.DENSE,
+                    input_order=WGradInputOrder.Tensor2D,
+                    atomic_counter_claim=counter,
+                    **kw,
+                )
                 o = torch.full((el, m, n), float("nan"), device=dev, dtype=torch.bfloat16)
                 ws = torch.zeros(max(kernel.get_workspace_bytes(), 256), device=dev, dtype=torch.uint8)
                 kargs = [t(a), t(b), t(sfa), t(sfb), t(o), t(offsets, 4), t(ws, 128)]

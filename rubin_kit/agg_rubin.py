@@ -2,8 +2,10 @@
 """Tables from lsw_rubin.py output: python agg_rubin.py <files with one JSON record per line (optionally "KP "-prefixed)>
 Cell = median over passes of the per-pass ratio (95% CI: bootstrap over passes). "auto_<rule>_<fallback>" (2.a+2.b): reuse
 where the rule picks it, else the fallback arm; EPC rule = ReuseRubin.can_implement, refined rule also needs more than one
-work unit per M tile (n / 256 > n_group). Per mode two tables: Rubin-native (dense_rubin = 2.a, reuse = 2.a + 2.b, same
+work unit per M tile (n / 256 > n_group), library rule ("lib") = ReuseRubin.prefer_over_dense of the tree under test (at
+least 3 work units per M tile). Per mode two tables: Rubin-native (dense_rubin = 2.a, reuse = 2.a + 2.b, same
 K64 MMA) and continuity with the earlier runs (the SM100 arms dense and stock_sm100)."""
+
 import sys, json, math, random, statistics as st, collections
 
 MORDER = ["deepseek_v3", "qwen35_122b", "qwen35_397b", "glm53_flash", "qwen38_2p4t"]
@@ -46,7 +48,7 @@ def boot(v, n=1000):
 def t(p, k, g, arm):
     if arm.startswith("auto"):
         _, rule, fb = arm.split("_", 2)  # auto_<epc|ref>_<fallback arm>
-        pick = rules[(*k, g)]["epc_reuse" if rule == "epc" else "refined_reuse"]
+        pick = rules[(*k, g)][{"epc": "epc_reuse", "ref": "refined_reuse", "lib": "lib_reuse"}[rule]]
         return p[f"{g}_reuse"] if pick else p[f"{g}_{fb}"]
     return p[f"{g}_{arm}"]
 
@@ -71,13 +73,38 @@ shapes = sorted({(m, e) for (_, m, e) in passes}, key=lambda s: (s[1], MORDER.in
 arms_avail = set(next(iter(passes.values()))[0]) if passes else set()
 has = lambda a: f"dW1_{a}" in arms_avail
 TABLES = [
-    ("Rubin-native: 2.a (dense_rubin) and 2.a + 2.b (reuse), K64 MMA",
-     [("dense_rubin", "stock"), ("reuse", "stock"), ("reuse", "dense_rubin"), ("auto_epc_dense_rubin", "dense_rubin"),
-      ("auto_ref_dense_rubin", "dense_rubin"), ("auto_epc_dense_rubin", "stock"), ("auto_ref_dense_rubin", "stock"), ("stock2", "stock")]),
-    ("continuity: SM100 arms (dense = SM100 2.a forced, K32 MMA)",
-     [("dense", "stock"), ("reuse", "dense"), ("auto_epc_stock", "stock"), ("auto_ref_stock", "stock"), ("auto_epc_dense", "dense"),
-      ("auto_ref_dense", "dense"), ("stock_sm100", "stock"), ("dense_rubin", "dense")]),
+    (
+        "Rubin-native: 2.a (dense_rubin) and 2.a + 2.b (reuse), K64 MMA",
+        [
+            ("dense_rubin", "stock"),
+            ("reuse", "stock"),
+            ("reuse", "dense_rubin"),
+            ("auto_epc_dense_rubin", "dense_rubin"),
+            ("auto_ref_dense_rubin", "dense_rubin"),
+            ("auto_lib_dense_rubin", "dense_rubin"),
+            ("auto_epc_dense_rubin", "stock"),
+            ("auto_ref_dense_rubin", "stock"),
+            ("auto_lib_dense_rubin", "stock"),
+            ("stock2", "stock"),
+        ],
+    ),
+    (
+        "continuity: SM100 arms (dense = SM100 2.a forced, K32 MMA)",
+        [
+            ("dense", "stock"),
+            ("reuse", "dense"),
+            ("auto_epc_stock", "stock"),
+            ("auto_ref_stock", "stock"),
+            ("auto_epc_dense", "dense"),
+            ("auto_ref_dense", "dense"),
+            ("stock_sm100", "stock"),
+            ("dense_rubin", "dense"),
+        ],
+    ),
 ]
+
+
+has_lib = any(r.get("lib_reuse") is not None for r in rules.values())
 
 
 def arm_of(a):
@@ -87,27 +114,38 @@ def arm_of(a):
 for c in sorted({c for (c, _, _) in passes}):
     for title, cols in TABLES:
         cols = [(x, y) for x, y in cols if all(has(arm_of(a)) for a in (x, y)) and (not x.startswith("auto") or has("reuse"))]
+        cols = [(x, y) for x, y in cols if not x.startswith("auto_lib") or has_lib]
         if not cols:
             continue
         print(f"\n### {'atomic counter' if c else 'CLC'}: {title}\n")
-        print("| Model | EP | GEMM | rows/expert (A stages) | EPC rule | refined | stock (us) | " + " | ".join(f"{x} / {y}" for x, y in cols) + " | passes (GPUs) |")
-        print("|" + " --- |" * (7 + len(cols) + 1))
+        print(
+            "| Model | EP | GEMM | rows/expert (A stages) | EPC rule | refined | library | stock (us) | "
+            + " | ".join(f"{x} / {y}" for x, y in cols)
+            + " | passes (GPUs) |"
+        )
+        print("|" + " --- |" * (8 + len(cols) + 1))
         agg = collections.defaultdict(list)
         for g in ("dW1", "dW2", "layer"):
             for k in shapes:
                 if g == "layer":
                     ru = "/".join("R" if rules[(*k, h)]["epc_reuse"] else "-" for h in ("dW1", "dW2"))
                     rf = "/".join("R" if rules[(*k, h)]["refined_reuse"] else "-" for h in ("dW1", "dW2"))
+                    lb = "/".join("R" if rules[(*k, h)].get("lib_reuse") else "-" for h in ("dW1", "dW2"))
                 else:
                     ru = "reuse" if rules[(*k, g)]["epc_reuse"] else "-"
                     rf = "reuse" if rules[(*k, g)]["refined_reuse"] else "-"
+                    lb = "reuse" if rules[(*k, g)].get("lib_reuse") else "-"
                 cells = []
                 for x, y in cols:
                     r, ci, uy, n = ratio(c, k, g, x, y)
                     agg[(g, x, y)].append(r)
                     cells.append(f"{r:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]")
                 uy = ratio(c, k, g, "stock", "stock")[2]
-                print(f"| {k[0]} | {k[1]} | {'dW1 + dW2' if g == 'layer' else g} | {per[k][0]} ({per[k][1]}) | {ru} | {rf} | {uy:.1f} | " + " | ".join(cells) + f" | {n} ({len(meta[(c, *k)])}) |")
+                print(
+                    f"| {k[0]} | {k[1]} | {'dW1 + dW2' if g == 'layer' else g} | {per[k][0]} ({per[k][1]}) | {ru} | {rf} | {lb if has_lib else "n/a"} | {uy:.1f} | "
+                    + " | ".join(cells)
+                    + f" | {n} ({len(meta[(c, *k)])}) |"
+                )
         print("\n| Geomean | " + " | ".join(f"{x} / {y}" for x, y in cols) + " |")
         print("|" + " --- |" * (len(cols) + 1))
         for g in ("dW1", "dW2", "layer"):

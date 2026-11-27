@@ -9,6 +9,39 @@ K tile and Rubin TMEM plan, without A reuse. It is ReuseRubin minus the reuse, s
 alone at the same MMA. Expected bits: dense_rubin = stock = reuse (0 differing bytes). The kit branch now contains it
 (merge of `wip/wgrad-dense-rubin` into the kit).
 
+Update 2026-11-27 (kit v4): the library now picks the kernels on Rubin. Branch `wip/wgrad-rubin-kit` = the kit
+merged with `wip/wgrad-areuse-v3` (the code under test), plus this kit commit. What is new for Rubin:
+- `_select_kernel` on SM107 picks `BlockScaledMoEGroupedGemmWgradDenseRubinKernel` (Rubin 2.a) under the 2.a conditions
+  (MXFP8 E8M0 vec32, fp32 accumulation, dense output, Tensor2D, no accumulate, 2-CTA 256x256 tiles in a (2, 1) cluster,
+  16-bit dW, m and n multiples of 256, no global scales); otherwise the Rubin wgrad as before.
+- Within those conditions it picks `BlockScaledMoEGroupedGemmWgradReuseRubinKernel` (2.b) only when the mean tokens per
+  expert are at most 5 x 256 = 1280 and dW has at least 3 work units of N tiles per M tile (`prefer_over_dense`), with
+  `a_stages_for` A stages. At the 20 benchmark GEMMs that is dW1 at EP4 (all 5 models) and at EP8 for qwen35_397b and
+  qwen38_2p4t; every dW2 gets 2.a.
+- Tests were folded: `test_grouped_gemm_wgrad_reuse.py` and `test_grouped_gemm_wgrad_reuse_rubin.py` are gone, their
+  cases are in `test_grouped_gemm_wgrad.py`.
+
+### v4 runs (in this order; total about 30 min of one node)
+
+From the kit worktree root (`W`), with that tree's `python/` on PYTHONPATH for pytest as before:
+```
+cd $W/test/python
+# 1. wgrad L0 + L1 (about 10 min). Expected on Rubin: the SM100-only global-descriptor / A-reuse cases skip; the Rubin
+#    cases run: test_rubin_global_descriptor_wgrad_matches_rubin_stock (10), test_rubin_reuse_wgrad_matches_rubin_stock
+#    (16), test_rubin_api_picks_wgrad_variants (2), the host-side selection tests (4), and the PDL file's Rubin picks.
+python -m pytest -q -rs -m "L0 or L1" gemm/cutedsl/test_grouped_gemm_wgrad.py gemm/cutedsl/test_grouped_gemm_wgrad_atomic_counter.py \
+  gemm/cutedsl/test_grouped_gemm_wgrad_pdl.py gemm/cutedsl/test_grouped_gemm_wgrad_empty.py gemm/cutedsl/test_wgrad_tensormap_acquire.py
+# 2. API-level selection at the 20 benchmark GEMMs, CLC and counter, one GPU (84 s on GB200; peak about 20 GB of GPU memory; needs apache-tvm-ffi like the tests):
+#    the public wrapper picks the expected kernel, and its dW equals the Rubin wgrad's byte for byte.
+cd $W && CUDA_VISIBLE_DEVICES=0 FE_PYTHON=$W/python python rubin_kit/api_check.py --out api_check.jsonl | tee api_check.log
+#    expect: "device ... (10, 7) type rubin dense BlockScaledMoEGroupedGemmWgradDenseRubinKernel reuse ...ReuseRubinKernel",
+#    40 "API OK" lines for the GEMMs and 10 for the thresholds, then "SUMMARY ok 50 fail 0".
+# 3. Optional, only if the per-GEMM table for the library rule is wanted: the lock-step run as in v3 (section 2), e.g.
+#    LSW_ARMS=stock,dense_rubin,reuse,stock2 MODES="0 1" PASSES=a BUDGET=300; the tables now carry a "library" column and
+#    auto_lib_dense_rubin columns.
+```
+Reply with: pytest summary line(s) and any failure, the api_check SUMMARY line and any "API FAIL" lines.
+
 ## Code
 
 Fork https://github.com/GarlGuo/cudnn-frontend.git, branch `wip/wgrad-dense-rubin` (`wip/wgrad-areuse-v2` + the Rubin
