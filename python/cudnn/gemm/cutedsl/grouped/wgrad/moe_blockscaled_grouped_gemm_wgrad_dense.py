@@ -13,7 +13,7 @@ cluster, but:
     - the epilogue stores per warp: each warp converts its 32 accumulator rows to the output type and stores them
       in 32 x 64 boxes through its own shared memory buffer, with no barrier between the four epilogue warps.
 
-An expert whose token count is not a multiple of the 128-token K tile reads its last K tile of A and B through
+An expert whose token count is not a multiple of the K tile (128 tokens) reads its last K tile of A and B through
 per-expert descriptors that the load warp builds into the workspace, so the bounds match the stock kernel's for
 every input.
 
@@ -46,7 +46,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
 
     Takes the parameters of ``BlockScaledMoEGroupedGemmWgradKernel``; see ``can_implement`` for the configurations.
     The workspace layout is the stock kernel's: per-expert descriptor slots (only the A and B slots of experts
-    whose token count is not a multiple of 128 are written), then the atomic-counter-claim counter.
+    whose token count is not a multiple of the K tile are written), then the atomic-counter-claim counter.
     """
 
     K_TILE = 128
@@ -619,8 +619,7 @@ class BlockScaledMoEGroupedGemmWgradDenseKernel(BlockScaledMoEGroupedGemmWgradKe
                 if cutlass.const_expr(sf_k_atoms > 1):
                     k_atoms = (tokens_i + 127) // 128
                 sfa_first_row = (
-                    cutlass.Int32((cutlass.Int64(hidden) * cutlass.Int64(token_offset)) // (self.sf_vec_size * 16))
-                    + work_tile_info.tile_m_idx * k_atoms * 32
+                    cutlass.Int32((cutlass.Int64(hidden) * cutlass.Int64(token_offset)) // (self.sf_vec_size * 16)) + work_tile_info.tile_m_idx * k_atoms * 32
                 )
                 sfb_first_row = (
                     cutlass.Int32((cutlass.Int64(intermediate) * cutlass.Int64(token_offset)) // (self.sf_vec_size * 16)) + tile_n * 2 * k_atoms * 32

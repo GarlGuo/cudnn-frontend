@@ -4,10 +4,8 @@
 """
 Rubin (SM107) MXFP8 wgrad from global descriptors: ``BlockScaledMoEGroupedGemmWgradDenseKernel`` (global A / B / SF
 descriptors, no helper kernel, per-warp dW stores, no A reuse) on the Rubin kernel's K64 MMA, 256-token K tile and
-disjoint TMEM plan, so dW is meant to be the Rubin kernel's bit for bit. It is the A-reuse Rubin kernel
-(``moe_blockscaled_grouped_gemm_wgrad_reuse_rubin``) without the reuse.
-
-Not run on Rubin hardware yet, and not picked by the wgrad API.
+disjoint TMEM plan, so dW is the Rubin kernel's bit for bit. The wgrad API picks it on SM107 under the same conditions
+as the global-descriptor kernel on SM100/SM103.
 """
 
 from .moe_blockscaled_grouped_gemm_wgrad_dense import BlockScaledMoEGroupedGemmWgradDenseKernel

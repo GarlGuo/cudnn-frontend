@@ -338,7 +338,7 @@ def test_counter_claim_slot_warm_stress(monkeypatch, precision):
     if precision == "mxfp8":
         from cudnn.gemm.cutedsl.grouped.wgrad.moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel as Reuse
 
-        if op._implementation._select_kernel() is Reuse:
+        if issubclass(op._implementation._select_kernel(), Reuse):
             tiles //= Reuse.n_group_for(N)  # the A-reuse kernel claims work units of n_group N tiles
     reference = {"wgrad": expected.clone(), "counter": torch.tensor([tiles + clusters], dtype=torch.int32, device="cuda").view(torch.uint8)}
     assert_bitwise({"wgrad": output}, {"wgrad": reference["wgrad"]}, "cold counter launch vs CLC")

@@ -32,6 +32,25 @@ def _get_rubin_kernel():
     return BlockScaledMoEGroupedGemmWgradRubinKernel
 
 
+def _dense_output_variants(rubin: bool):
+    """(global-descriptor, A-reuse) MXFP8 wgrad kernels for dense output: the SM100/SM103 pair, or the Rubin one."""
+    if rubin:
+        from .moe_blockscaled_grouped_gemm_wgrad_dense_rubin import BlockScaledMoEGroupedGemmWgradDenseRubinKernel
+        from .moe_blockscaled_grouped_gemm_wgrad_reuse_rubin import BlockScaledMoEGroupedGemmWgradReuseRubinKernel
+
+        return BlockScaledMoEGroupedGemmWgradDenseRubinKernel, BlockScaledMoEGroupedGemmWgradReuseRubinKernel
+    return BlockScaledMoEGroupedGemmWgradDenseKernel, BlockScaledMoEGroupedGemmWgradReuseKernel
+
+
+def dense_output_token_class(tokens: int, experts: int, rubin: bool) -> int:
+    """The part of the dense-output MXFP8 kernel choice that depends on the token count, which is dynamic in the compiled
+    kernel: 0 when the experts are not short on average for the A-reuse variant, else its A stages for them."""
+    reuse = _dense_output_variants(rubin)[1]
+    if not reuse.short_experts(tokens, experts):
+        return 0
+    return reuse.a_stages_for(tokens, experts)
+
+
 def _is_supported_rubin_quantization(ab_dtype: torch.dtype, sf_dtype: torch.dtype, sf_vec_size: int) -> bool:
     import torch
 
@@ -359,7 +378,11 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
         if self._compiled_kernel is not None:
             return
 
-        kernel = self._select_kernel()(
+        kernel_class = self._select_kernel()
+        options = {}
+        if hasattr(kernel_class, "a_stages_for"):
+            options["a_stages"] = kernel_class.a_stages_for(self.a_desc.shape[1], self.expert_cnt)
+        kernel = kernel_class(
             sf_vec_size=self.sf_vec_size,
             acc_dtype=_convert_to_cutlass_data_type(self.acc_dtype),
             use_2cta_instrs=self.use_2cta_instrs,
@@ -373,6 +396,7 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             atomic_counter_claim=self.atomic_counter_claim,
             use_pdl=self.use_pdl,
             launch_pdl_dependents_at_entry=self.launch_pdl_dependents_at_entry,
+            **options,
         )
 
         hardware_info = cutlass.utils.HardwareInfo()
@@ -393,13 +417,13 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             del self.sample_b_tensor
 
     def _select_kernel(self):
-        """The stock kernel, or on SM100/SM103 one of its variants with the same dW bits where it applies: the
-        A-reuse variant when the sample's experts are short on average (mean tokens per expert within its A ring,
-        computed from the token extent of A and the expert count) and dW has more than one N tile per work unit,
-        else the global-descriptor variant."""
+        """The stock kernel, or one of its variants with the same dW bits where it applies (``_dense_output_variants``):
+        the A-reuse variant when ``prefer_over_dense`` holds for the sample (short experts on average, from the token
+        extent of A and the expert count, and at least 3 work units of N tiles per M tile), else the global-descriptor
+        variant. SM100/SM103 and SM107 (Rubin) each have their own pair."""
         import torch
 
-        if self._is_rubin_kernel or self.weight_mode != MoEWeightMode.DENSE:
+        if self.weight_mode != MoEWeightMode.DENSE:
             return self._kernel
         m, n = self.a_desc.shape[0], self.b_desc.shape[1]
         c_bits = self.wgrad_dtype.itemsize * 8
@@ -422,11 +446,10 @@ class GroupedGemmWgradBlockScaledAPI(APIBase):
             )
             and BlockScaledMoEGroupedGemmWgradDenseKernel.can_implement(m, n, ab_bits=8, c_bits=c_bits, has_global_scale=has_global_scale)
         ):
-            if BlockScaledMoEGroupedGemmWgradReuseKernel.can_implement(
-                m, n, ab_bits=8, c_bits=c_bits, has_global_scale=has_global_scale, tokens=self.a_desc.shape[1], experts=self.expert_cnt
-            ):
-                return BlockScaledMoEGroupedGemmWgradReuseKernel
-            return BlockScaledMoEGroupedGemmWgradDenseKernel
+            dense, reuse = _dense_output_variants(self._is_rubin_kernel)
+            if reuse.prefer_over_dense(m, n, ab_bits=8, c_bits=c_bits, has_global_scale=has_global_scale, tokens=self.a_desc.shape[1], experts=self.expert_cnt):
+                return reuse
+            return dense
         return self._kernel
 
     def _compile_dense(self, kernel, max_active_clusters, fake_stream) -> None:

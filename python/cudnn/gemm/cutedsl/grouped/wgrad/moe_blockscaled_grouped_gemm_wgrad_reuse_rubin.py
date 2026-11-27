@@ -4,9 +4,8 @@
 """
 Rubin (SM107) MXFP8 wgrad for short experts: ``BlockScaledMoEGroupedGemmWgradReuseKernel`` (A kept in shared memory
 across the N tiles of a work unit, global A / B / SF descriptors, per-warp dW stores) on the Rubin kernel's K64 MMA,
-256-token K tile and disjoint TMEM plan, so dW is meant to be the Rubin kernel's bit for bit.
-
-Not compiled or run on Rubin hardware yet, and not picked by the wgrad API.
+256-token K tile and disjoint TMEM plan, so dW is the Rubin kernel's bit for bit. The wgrad API picks it on SM107 where
+``prefer_over_dense`` holds, with ``a_stages_for`` A stages.
 """
 
 from .moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel

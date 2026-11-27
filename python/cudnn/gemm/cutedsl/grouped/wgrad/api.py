@@ -84,8 +84,8 @@ from ._blockscaled_api import (
     GroupedGemmWgradBlockScaledAPI,
     _get_rubin_kernel,
     _is_supported_rubin_quantization,
+    dense_output_token_class,
 )
-from .moe_blockscaled_grouped_gemm_wgrad_reuse import BlockScaledMoEGroupedGemmWgradReuseKernel
 
 _BLOCK_SCALED_JAX_ERROR = (
     "the block-scaled wgrad class API is torch-only; for JAX MXFP8 pass sfa_tensor/sfb_tensor to "
@@ -477,7 +477,9 @@ def grouped_gemm_wgrad_wrapper_sm100(
         # The token count is dynamic in the compiled kernel, but the block-scaled dense kernel choice depends on the
         # mean tokens per expert (see GroupedGemmWgradBlockScaledAPI._select_kernel), so short and long experts
         # get separate entries.
-        backend is GroupedGemmBackend.BLOCK_SCALED and output_mode == "dense" and BlockScaledMoEGroupedGemmWgradReuseKernel.short_experts(tokens_sum, expert_cnt),
+        backend is GroupedGemmBackend.BLOCK_SCALED
+        and output_mode == "dense"
+        and dense_output_token_class(tokens_sum, expert_cnt, get_device_type() == "rubin"),
     )
     op = _cache_of_GroupedGemmWgradSm100Objects.get(cache_key)
     if op is None:

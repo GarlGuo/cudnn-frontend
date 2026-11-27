@@ -49,6 +49,7 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
     MAX_N_GROUP = 4  # N tiles per work unit, at most
     L2_PREFETCH_UNITS = 1  # units ahead the load warp prefetches into L2
     A_STAGES = 6  # default A / SFA ring depth
+    MIN_UNITS_PER_M_TILE = 3  # work units per M tile for the wgrad API to pick this kernel (``prefer_over_dense``)
 
     def __init__(self, *args, a_stages: int = A_STAGES, **kwargs):
         super().__init__(*args, **kwargs)
@@ -82,6 +83,24 @@ class BlockScaledMoEGroupedGemmWgradReuseKernel(BlockScaledMoEGroupedGemmWgradDe
             and cls.n_group_for(n, cls.MAX_N_GROUP) > 1
             and cls.short_experts(tokens, experts, a_stages)
         )
+
+    @classmethod
+    def units_per_m_tile(cls, n: int) -> int:
+        """Work units per (expert, M tile) for dW's N."""
+        return n // 256 // cls.n_group_for(n, cls.MAX_N_GROUP)
+
+    @classmethod
+    def prefer_over_dense(cls, m: int, n: int, ab_bits: int, c_bits: int, has_global_scale: bool, tokens: int, experts: int) -> bool:
+        """Where the wgrad API picks this kernel over the global-descriptor one: ``can_implement``, and at least
+        ``MIN_UNITS_PER_M_TILE`` work units per M tile. Measured on SM100 and SM107, A reuse was clearly faster than the
+        global-descriptor kernel only for short experts with 3 or more units per M tile; with 1 or 2 units it was at best
+        marginally faster, and sometimes slower."""
+        return cls.can_implement(m, n, ab_bits, c_bits, has_global_scale, tokens, experts) and cls.units_per_m_tile(n) >= cls.MIN_UNITS_PER_M_TILE
+
+    @classmethod
+    def a_stages_for(cls, tokens: int, experts: int) -> int:
+        """A stages the wgrad API builds this kernel with for ``tokens`` over ``experts``: the default ring depth."""
+        return cls.A_STAGES
 
     def _setup_attributes(self) -> None:
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
