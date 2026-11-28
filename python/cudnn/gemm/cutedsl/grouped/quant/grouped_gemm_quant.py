@@ -471,6 +471,14 @@ class BlockScaledMoEGroupedGemmQuantKernel:
         epi_bytes = d_bytes + amax_bytes + bias_bytes
         num_ab_stage = (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes + sinfo_bytes)) // ab_bytes_per_stage
 
+        # Without SFD, a second D stage lets a subtile's TMA store drain while the next subtile is computed, instead of
+        # every epilogue warp waiting on each store; at short K the epilogue sets the pace. Take it when it costs no A/B
+        # stage.
+        if not generate_sfd:
+            epi_bytes_two_d = epi_bytes + d_bytes_per_stage
+            if (num_smem_capacity // occupancy - (mbar_helpers_bytes + epi_bytes_two_d + sinfo_bytes)) // ab_bytes_per_stage == num_ab_stage:
+                num_d_stage = 2
+
         return num_acc_stage, num_ab_stage, num_d_stage, num_tile_stage, num_bias_stage
 
     # ------------------------------------------------------------------
